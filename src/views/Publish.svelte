@@ -259,7 +259,7 @@
     const asType = asReleaseType(config?.curseforge.release_type ?? 'release')
     const consequences = [
       toCurseforge
-        ? `Upload "${client.displayName}" (${client.fileName}) and its server pack "${server.displayName}" (${server.fileName}) to CurseForge as ${asType}${config?.curseforge.manual_release ? ', held until you release it' : ''}.`
+        ? `Upload "${client.displayName}" (${client.fileName}) and its server pack "${server.displayName}" (${server.fileName}), which downloads its mods on first start, to CurseForge as ${asType}${config?.curseforge.manual_release ? ', held until you release it' : ''}.`
         : null,
       toCurseforge && curseforgeShipped.length
         ? `Include ${curseforgeShipped.length === 1 ? 'a jar' : `${curseforgeShipped.length} jars`} CurseForge doesn't host inside the client pack: ${curseforgeShipped.map(describe).join(', ')}.`

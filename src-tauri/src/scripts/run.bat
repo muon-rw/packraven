@@ -26,6 +26,7 @@ del "%GRAALVM_DIR%.zip"
 set "JAVA=%GRAALVM_DIR%\bin\java.exe"
 
 :install
+{{DOWNLOAD}}
 {{INSTALL}}
 :run
 echo Starting the server on %JAVA%

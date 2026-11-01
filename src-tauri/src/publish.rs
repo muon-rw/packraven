@@ -310,7 +310,7 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
 
     let curseforge = match client_zip {
         Some(client_zip) => {
-            export::server_pack(&pack, &sides, &version, &out_dir, &data_dir, &log).await?;
+            export::server_pack(&pack, &sides, &version, export::ServerMods::DownloadedOnStart, &out_dir, &data_dir, &log).await?;
             let server_zip = export::zip_server_pack(&pack, &version, &out_dir, &log).await?;
             Some(upload_to_curseforge(&pack, (&client_zip, client_names.clone()), (&server_zip, server_names), &notes, &log).await?)
         }

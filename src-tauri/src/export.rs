@@ -28,6 +28,18 @@ const RUN_BAT: &str = include_str!("scripts/run.bat");
 const RUN_SH: &str = include_str!("scripts/run.sh");
 const INSTALL_BAT: &str = include_str!("scripts/install.bat");
 const INSTALL_SH: &str = include_str!("scripts/install.sh");
+const DOWNLOAD_BAT: &str = include_str!("scripts/download.bat");
+const DOWNLOAD_SH: &str = include_str!("scripts/download.sh");
+const DOWNLOADER_JAR: &[u8] = include_bytes!("scripts/downloader/packraven-downloader.jar");
+const DOWNLOADER: &str = "packraven-downloader.jar";
+const DOWNLOAD_LIST: &str = "packraven-downloads.txt";
+
+/// How a server pack gets the mod files packraven can download from CurseForge or Modrinth.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ServerMods {
+    Bundled,
+    DownloadedOnStart,
+}
 
 fn globs(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
@@ -494,14 +506,17 @@ pub async fn test_server_plan(pack: &Pack, sides: &[ModSide], version: &str, jav
             plan.insert(relative, Planned::Copy(entry.into_path()));
         }
     }
-    plan.extend(pack_server_files(pack, sides, version, log).await?);
+    plan.extend(pack_server_files(pack, sides, version, ServerMods::Bundled, log).await?);
     Ok(plan)
 }
 
 // The Minecraft EULA doesn't let us redistribute vanilla's server, so release server packs carry the
 // loader's installer (or Fabric's server launcher) instead, and that downloads it from Mojang on first start.
-async fn release_server_plan(pack: &Pack, sides: &[ModSide], version: &str, data_dir: &Path, log: &Log) -> Result<FilePlan> {
-    let mut plan = pack_server_files(pack, sides, version, log).await?;
+async fn release_server_plan(pack: &Pack, sides: &[ModSide], version: &str, mods: ServerMods, data_dir: &Path, log: &Log) -> Result<FilePlan> {
+    let mut plan = pack_server_files(pack, sides, version, mods, log).await?;
+    if mods == ServerMods::DownloadedOnStart {
+        plan.insert(DOWNLOADER.into(), Planned::Copy(downloader_jar(data_dir)?));
+    }
     let loader = pack.lock.mod_loader()?;
     let folder = data_dir.join(loader.name().to_lowercase());
     match forge_installer_url(pack.lock.minecraft()?, &loader) {
@@ -517,7 +532,27 @@ async fn release_server_plan(pack: &Pack, sides: &[ModSide], version: &str, data
     Ok(plan)
 }
 
-async fn pack_server_files(pack: &Pack, sides: &[ModSide], version: &str, log: &Log) -> Result<FilePlan> {
+fn downloader_jar(data_dir: &Path) -> Result<PathBuf> {
+    let path = data_dir.join(DOWNLOADER);
+    if std::fs::read(&path).ok().as_deref() != Some(DOWNLOADER_JAR) {
+        std::fs::create_dir_all(data_dir)?;
+        std::fs::write(&path, DOWNLOADER_JAR)?;
+    }
+    Ok(path)
+}
+
+// Our downloader runs on whatever Java the server has, so we hand it URLs exactly as they go on the
+// wire. edge.forgecdn.net only redirects to mediafilez.forgecdn.net, which serves every file without
+// an API key, even when the author turned off third-party distribution.
+fn server_download_url(entry: &LockEntry) -> Option<String> {
+    let mut url = reqwest::Url::parse(entry.download_url()?).ok()?;
+    if url.host_str() == Some("edge.forgecdn.net") {
+        url.set_host(Some("mediafilez.forgecdn.net")).ok()?;
+    }
+    Some(url.to_string()).filter(|url| url.starts_with("https://") && !url.contains(['\t', '\n']))
+}
+
+async fn pack_server_files(pack: &Pack, sides: &[ModSide], version: &str, mods: ServerMods, log: &Log) -> Result<FilePlan> {
     let mut plan = FilePlan::new();
     let client_only: HashSet<&str> = sides.iter().filter(|m| m.side == Side::Client).map(|m| m.path.as_str()).collect();
     let server_files: Vec<&LockEntry> = pack
@@ -528,8 +563,18 @@ async fn pack_server_files(pack: &Pack, sides: &[ModSide], version: &str, log: &
         .filter(|e| e.path.starts_with("mods/") || e.path.starts_with("datapacks/"))
         .collect();
     log.info(format!("Including {} server files ({} client-only skipped)", server_files.len(), client_only.len()));
+    let mut download_list = String::new();
     for entry in &server_files {
-        plan.insert(entry.path.clone(), Planned::Copy(ensure_cached(pack, entry).await?));
+        match server_download_url(entry).filter(|_| mods == ServerMods::DownloadedOnStart) {
+            Some(url) => download_list.push_str(&format!("{}\t{}\t{url}\t{}\n", entry.sha1, entry.size, entry.path)),
+            None => {
+                plan.insert(entry.path.clone(), Planned::Copy(ensure_cached(pack, entry).await?));
+            }
+        }
+    }
+    if mods == ServerMods::DownloadedOnStart {
+        log.info(format!("The server downloads {} of them on first start", download_list.lines().count()));
+        plan.insert(DOWNLOAD_LIST.into(), Planned::Write(download_list));
     }
 
     let overrides = override_files(pack, &pack.config.server.exclude)?;
@@ -553,9 +598,10 @@ async fn pack_server_files(pack: &Pack, sides: &[ModSide], version: &str, log: &
     // PATH, and Fabric's installer writes none.
     let graalvm = server_graalvm(pack)?;
     let args = &pack.config.server.args;
-    let run_bat = start_script(RUN_BAT, &install_step(pack, true)?, &loader_launch(pack, true)?, graalvm.as_deref(), &script_args(args, true)).replace('\n', "\r\n");
+    let download = |step: &'static str| if mods == ServerMods::DownloadedOnStart { step } else { "" };
+    let run_bat = start_script(RUN_BAT, download(DOWNLOAD_BAT), &install_step(pack, true)?, &loader_launch(pack, true)?, graalvm.as_deref(), &script_args(args, true)).replace('\n', "\r\n");
     plan.insert("run.bat".into(), Planned::Write(run_bat));
-    plan.insert("run.sh".into(), Planned::Write(start_script(RUN_SH, &install_step(pack, false)?, &loader_launch(pack, false)?, graalvm.as_deref(), &script_args(args, false))));
+    plan.insert("run.sh".into(), Planned::Write(start_script(RUN_SH, download(DOWNLOAD_SH), &install_step(pack, false)?, &loader_launch(pack, false)?, graalvm.as_deref(), &script_args(args, false))));
     Ok(plan)
 }
 
@@ -657,8 +703,9 @@ fn graalvm_url_prefix(version: &str) -> String {
     }
 }
 
-fn start_script(template: &str, install: &str, launch: &str, graalvm: Option<&str>, args: &str) -> String {
+fn start_script(template: &str, download: &str, install: &str, launch: &str, graalvm: Option<&str>, args: &str) -> String {
     template
+        .replace("{{DOWNLOAD}}", download)
         .replace("{{INSTALL}}", install)
         .replace("\r\n", "\n")
         .replace("{{GRAALVM}}", graalvm.unwrap_or_default())
@@ -667,9 +714,9 @@ fn start_script(template: &str, install: &str, launch: &str, graalvm: Option<&st
         .replace("{{ARGS}}", args)
 }
 
-pub async fn server_pack(pack: &Pack, sides: &[ModSide], version: &str, out_dir: &Path, data_dir: &Path, log: &Log) -> Result<PathBuf> {
+pub async fn server_pack(pack: &Pack, sides: &[ModSide], version: &str, mods: ServerMods, out_dir: &Path, data_dir: &Path, log: &Log) -> Result<PathBuf> {
     let dir = out_dir.join("server");
-    let plan = release_server_plan(pack, sides, version, data_dir, log).await?;
+    let plan = release_server_plan(pack, sides, version, mods, data_dir, log).await?;
     log.info(mirror(&dir, &plan, &[], false)?.to_string());
     Ok(dir)
 }
@@ -892,8 +939,38 @@ mod tests {
         assert!(bat.contains(r#""%JAVA%" -jar "neoforge-21.1.259-installer.jar" --installServer .install"#), "{bat}");
         let sh = install_step(&pack, false).unwrap();
         assert!(sh.contains(r#"if [ ! -f "libraries/net/neoforged/neoforge/21.1.259/unix_args.txt" ]"#), "{sh}");
-        let script = start_script(RUN_SH, &sh, &loader_launch(&pack, false).unwrap(), None, "");
+        let script = start_script(RUN_SH, "", &sh, &loader_launch(&pack, false).unwrap(), None, "");
         assert!(!script.contains("{{"), "{script}");
+    }
+
+    #[test]
+    fn slim_server_packs_download_mods_before_installing_the_loader() {
+        let pack = loader_pack("1.21.1", "neoforge-21.1.259");
+        for (template, download, windows) in [(RUN_BAT, DOWNLOAD_BAT, true), (RUN_SH, DOWNLOAD_SH, false)] {
+            let script = start_script(template, download, &install_step(&pack, windows).unwrap(), &loader_launch(&pack, windows).unwrap(), None, "");
+            let downloads = script.find(DOWNLOADER).expect(&script);
+            assert!(downloads < script.find("--installServer").unwrap(), "{script}");
+        }
+    }
+
+    #[test]
+    fn server_downloads_skip_the_key_only_curseforge_host() {
+        let curseforge = |url: &str| LockEntry::curseforge("mods/a.jar".into(), "abc".into(), 1, crate::pack::CurseforgeFile { project_id: 1, file_id: 2, url: url.into() });
+        let edge = curseforge("https://edge.forgecdn.net/files/7053/458/DnT-desert-temple-overhaul-v2.1%20%5bFabric%5d.jar");
+        assert_eq!(server_download_url(&edge).as_deref(), Some("https://mediafilez.forgecdn.net/files/7053/458/DnT-desert-temple-overhaul-v2.1%20%5bFabric%5d.jar"));
+        assert_eq!(server_download_url(&curseforge("https://edge.forgecdn.net/files/1/2/a b.jar")).as_deref(), Some("https://mediafilez.forgecdn.net/files/1/2/a%20b.jar"));
+        assert_eq!(server_download_url(&curseforge("")), None);
+        let modrinth = LockEntry { path: "mods/sodium.jar".into(), sha1: "sodium-sha1".into(), size: 1, curseforge: None, modrinth: Some(modrinth_file("sodium")) };
+        assert_eq!(server_download_url(&modrinth).as_deref(), modrinth.download_url());
+    }
+
+    #[test]
+    fn downloader_jar_is_built_from_the_current_source() {
+        let mut jar = zip::ZipArchive::new(std::io::Cursor::new(DOWNLOADER_JAR)).unwrap();
+        let mut shipped = String::new();
+        std::io::Read::read_to_string(&mut jar.by_name("PackravenDownloader.java").unwrap(), &mut shipped).unwrap();
+        let source = include_str!("scripts/downloader/PackravenDownloader.java");
+        assert!(shipped.replace("\r\n", "\n") == source.replace("\r\n", "\n"), "the downloader jar is stale; run npm run build:downloader");
     }
 
     #[test]

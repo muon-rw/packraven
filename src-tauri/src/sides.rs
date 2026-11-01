@@ -211,6 +211,8 @@ pub async fn classify(pack: &Pack, cache: &mut MetadataCache) -> Result<Vec<ModS
                 (Side::Client, "Marked client-only".to_string(), Override::Client)
             } else if config.keep.iter().any(|key| entry.has_key(key)) {
                 (Side::Both, "Kept on the server".to_string(), Override::Keep)
+            } else if mistagged_client_only(entry) {
+                (Side::Both, "Kept on the server by packraven: server mods need it, despite its client-only tags".to_string(), Override::Auto)
             } else {
                 (detected, reason, Override::Auto)
             };
@@ -221,6 +223,14 @@ pub async fn classify(pack: &Pack, cache: &mut MetadataCache) -> Result<Vec<ModS
         .collect();
     result.sort_by_key(|m| m.name.to_lowercase());
     Ok(result)
+}
+
+// Both platforms tag these client-only, but server-side mods depend on them and they load fine on a
+// dedicated server. Enderscape 3 requires Trim Patcher on both sides.
+fn mistagged_client_only(entry: &LockEntry) -> bool {
+    const CURSEFORGE: [u64; 1] = [1_414_986];
+    const MODRINTH: [&str; 1] = ["bNK1MS7o"];
+    entry.curseforge_project().is_some_and(|id| CURSEFORGE.contains(&id)) || entry.modrinth.as_ref().is_some_and(|f| MODRINTH.contains(&f.project_id.as_str()))
 }
 
 fn detect(metadata: &SideMetadata) -> (Side, String) {

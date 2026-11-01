@@ -433,8 +433,7 @@
           </div>
         </div>
         <p class="hint" id="test-memory-hint">
-          These stay in the test loop. The test client gets the client memory as its Java heap size, such as 8G or 8192M. For the memory, Java and flags
-          that ship in the server pack, open <button type="button" class="link" onclick={() => ((serverView.tab = 'startup'), onserver())}>Server, Startup</button>.
+          These are for testing launches only. The memory setting is for the Client only, you can type values like 8G or 8192M. For server pack memory, Java and flags, open <button type="button" class="link" onclick={() => ((serverView.tab = 'startup'), onserver())}>Server, Startup</button>.
         </p>
         {#if javaDefault}
           <JavaPicker

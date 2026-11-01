@@ -680,7 +680,7 @@ async fn build_server(state_data: (PathBuf, PathBuf, PathBuf), pack: &Pack, log:
     let (data_dir, pack_data, cache_path) = state_data;
     let version = pack.version().unwrap_or_else(|| "dev".into());
     let sides = classify_cached(&cache_path, pack).await?;
-    export::server_pack(pack, &sides, &version, &pack_data.join("builds").join(&version), &data_dir, log).await
+    export::server_pack(pack, &sides, &version, export::ServerMods::Bundled, &pack_data.join("builds").join(&version), &data_dir, log).await
 }
 
 #[tauri::command]

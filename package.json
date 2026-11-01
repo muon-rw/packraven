@@ -12,6 +12,7 @@
     "shots": "playwright test --project=shots",
     "tauri": "tauri",
     "release": "node scripts/release.mjs",
+    "build:downloader": "node scripts/build-downloader.mjs",
     "test:live": "cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored --nocapture"
   },
   "devDependencies": {

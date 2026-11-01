@@ -2,6 +2,10 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+### [Unreleased]
+### Added
+- Download script style for serverpack mods (WIP)
+
 ## [0.3.4] - 2026-10-31
 ### Added
 - Twin matching (modrinth equivalents of curseforge files) now offers a fallback option to ship same-named but hash-mismatched versions to each platform export, if packraven couldn't produce an exact match

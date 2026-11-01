@@ -222,7 +222,7 @@
     <Notice tone="error">
       <p>
         The test server stopped on its own{job('server').message ? ` (${job('server').message?.replace(/^Exited/, 'exited')})` : ''}. Its log is below.
-        If a mod crashed it, <button class="link" onclick={() => ((serverView.tab = 'mods'), onserver())}>leave it off the server</button>.
+        If a mod crashed it, <button class="link" onclick={() => ((serverView.tab = 'mods'), (serverView.filter = 'all'), onserver())}>leave it off the server</button>.
       </p>
     </Notice>
   {/if}
@@ -262,7 +262,7 @@
       </form>
       <p class="hint muted" id="console-hint">
         {serverRunning ? 'Send commands to the server console. Use Stop to save and shut down, or Kill to end the process without saving.' : 'You can send commands once the server is running.'}
-        Server crashing due to a mod? <button class="link" onclick={() => ((serverView.tab = 'mods'), onserver())}>Leave it off the server</button>.
+        Server crashing due to a mod? <button class="link" onclick={() => ((serverView.tab = 'mods'), (serverView.filter = 'all'), onserver())}>Leave it off the server</button>.
       </p>
     </div>
 

@@ -761,7 +761,7 @@ mod tests {
     }
 
     fn side(path: &str, side: Side) -> ModSide {
-        ModSide { path: path.into(), key: None, name: path.into(), url: None, side, reason: String::new(), r#override: crate::sides::Override::Auto }
+        ModSide { path: path.into(), key: None, name: path.into(), url: None, side, reason: String::new(), r#override: crate::sides::Override::Auto, required_by: Vec::new() }
     }
 
     #[test]

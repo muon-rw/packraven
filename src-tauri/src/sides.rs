@@ -5,6 +5,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::links::Skew;
+use crate::mod_manifest::{self, ModManifest};
 use crate::pack::{LockEntry, ModKey, Pack};
 use crate::{curseforge, modrinth};
 
@@ -15,6 +16,18 @@ pub struct MetadataCache {
     names: HashMap<ModKey, ProjectName>,
     #[serde(default)]
     skews: HashMap<String, CheckedSkew>,
+    #[serde(default)]
+    manifests: HashMap<String, ReadManifest>,
+}
+
+// Bump this when mod_manifest reads something an older read didn't, so we read every jar again.
+const MANIFEST_FORMAT: u32 = 2;
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ReadManifest {
+    format: u32,
+    manifest: ModManifest,
 }
 
 // Authors upload new versions all the time, so we look again after a day.
@@ -90,6 +103,15 @@ pub struct ModSide {
     pub side: Side,
     pub reason: String,
     pub r#override: Override,
+    // The server mods that require this one, so the view can name them all and flag the ones you excluded.
+    pub required_by: Vec<String>,
+}
+
+impl ModSide {
+    /// Returns whether you excluded a mod that server mods require, which keeps the server from starting.
+    pub fn breaks_server(&self) -> bool {
+        self.side == Side::Client && !self.required_by.is_empty()
+    }
 }
 
 impl MetadataCache {
@@ -163,6 +185,17 @@ impl MetadataCache {
         self.names.get(key).cloned().unwrap_or(ProjectName { name: format!("Project {id}"), url: None, authors: None, logo: None, license: None })
     }
 
+    // A jar we can't read counts as requiring nothing, so it keeps whatever its tags say. We don't
+    // remember that, since the jar may just not be downloaded yet.
+    fn manifest(&mut self, pack_dir: &Path, entry: &LockEntry) -> ModManifest {
+        if let Some(read) = self.manifests.get(&entry.sha1).filter(|read| read.format == MANIFEST_FORMAT) {
+            return read.manifest.clone();
+        }
+        let Ok(manifest) = mod_manifest::read(&pack_dir.join(&entry.path)) else { return ModManifest::default() };
+        self.manifests.insert(entry.sha1.clone(), ReadManifest { format: MANIFEST_FORMAT, manifest: manifest.clone() });
+        manifest
+    }
+
     async fn ensure_sides(&mut self, entries: &[&LockEntry]) -> Result<()> {
         let missing: Vec<&LockEntry> = entries.iter().copied().filter(|e| !self.sides.contains_key(&e.sha1)).collect();
         if missing.is_empty() {
@@ -201,36 +234,109 @@ pub async fn classify(pack: &Pack, cache: &mut MetadataCache) -> Result<Vec<ModS
     let entries: Vec<&LockEntry> = pack.lock.files.iter().filter(|e| is_server_candidate(e)).collect();
     cache.ensure_sides(&entries).await?;
     cache.ensure_names(&entries.iter().filter_map(|e| e.key()).collect::<Vec<_>>()).await?;
+    Ok(classify_known(pack, cache))
+}
+
+/// Classifies with only what the cache already knows, treating a mod with no cached tags as running on both sides.
+pub fn classify_known(pack: &Pack, cache: &mut MetadataCache) -> Vec<ModSide> {
+    let entries: Vec<&LockEntry> = pack.lock.files.iter().filter(|e| is_server_candidate(e)).collect();
+    let manifests: Vec<ModManifest> = entries.iter().map(|entry| cache.manifest(&pack.dir, entry)).collect();
     let config = &pack.config.server;
     let mut result: Vec<ModSide> = entries
-        .into_iter()
-        .map(|entry| {
+        .iter()
+        .zip(&manifests)
+        .map(|(&entry, manifest)| {
             let metadata = cache.sides.get(&entry.sha1).cloned().unwrap_or_default();
-            let (detected, reason) = detect(&metadata);
+            let (detected, reason) = match detect(&metadata) {
+                (Side::Client, reason) => (Side::Client, reason),
+                _ if manifest.client_only => (Side::Client, "fabric.mod.json: client only".to_string()),
+                detected => detected,
+            };
             let (side, reason, r#override) = if config.client_only.iter().any(|key| entry.has_key(key)) {
                 (Side::Client, "Marked client-only".to_string(), Override::Client)
             } else if config.keep.iter().any(|key| entry.has_key(key)) {
                 (Side::Both, "Kept on the server".to_string(), Override::Keep)
-            } else if mistagged_client_only(entry) {
-                (Side::Both, "Kept on the server by packraven: server mods need it, despite its client-only tags".to_string(), Override::Auto)
             } else {
                 (detected, reason, Override::Auto)
             };
             let key = entry.key();
             let name = key.as_ref().map_or_else(|| ProjectName::of_file(&entry.path), |key| cache.name(key));
-            ModSide { path: entry.path.clone(), key: key.map(|k| k.to_string()), name: name.name, url: name.url, side, reason, r#override }
+            ModSide { path: entry.path.clone(), key: key.map(|k| k.to_string()), name: name.name, url: name.url, side, reason, r#override, required_by: Vec::new() }
         })
         .collect();
+    keep_required_dependencies(&mut result, &manifests);
     result.sort_by_key(|m| m.name.to_lowercase());
-    Ok(result)
+    result
 }
 
-// Both platforms tag these client-only, but server-side mods depend on them and they load fine on a
-// dedicated server. Enderscape 3 requires Trim Patcher on both sides.
-fn mistagged_client_only(entry: &LockEntry) -> bool {
-    const CURSEFORGE: [u64; 1] = [1_414_986];
-    const MODRINTH: [&str; 1] = ["bNK1MS7o"];
-    entry.curseforge_project().is_some_and(|id| CURSEFORGE.contains(&id)) || entry.modrinth.as_ref().is_some_and(|f| MODRINTH.contains(&f.project_id.as_str()))
+// Platform tags often call a library client-only when server mods need it, and Fabric won't start
+// a server that's missing a required dependency, even one whose own jar says it's client-only
+// (Fabric then just doesn't load that one). So we ship whatever a server mod requires.
+fn keep_required_dependencies(mods: &mut [ModSide], manifests: &[ModManifest]) {
+    let mut provider: HashMap<&str, usize> = HashMap::new();
+    for (index, manifest) in manifests.iter().enumerate() {
+        for id in &manifest.ids {
+            provider.entry(id).or_insert(index);
+        }
+    }
+    let excluded_by_you = |m: &ModSide| matches!(m.r#override, Override::Client);
+    let mut pulled = vec![false; mods.len()];
+    loop {
+        let kept: Vec<usize> = (0..mods.len()).filter(|&i| mods[i].side != Side::Client).collect();
+        let on_server: std::collections::HashSet<&str> = kept.iter().flat_map(|&i| manifests[i].ids.iter().chain(&manifests[i].bundled_ids)).map(String::as_str).collect();
+        let missing: Vec<usize> = kept
+            .iter()
+            .flat_map(|&i| &manifests[i].requires)
+            .filter(|id| !on_server.contains(id.as_str()))
+            .filter_map(|id| provider.get(id.as_str()).copied())
+            .filter(|&j| !excluded_by_you(&mods[j]))
+            .collect();
+        if missing.is_empty() {
+            break;
+        }
+        for j in missing {
+            mods[j].side = Side::Both;
+            pulled[j] = true;
+        }
+    }
+    let mut required_by: Vec<Vec<usize>> = vec![Vec::new(); mods.len()];
+    for i in (0..mods.len()).filter(|&i| mods[i].side != Side::Client) {
+        for j in manifests[i].requires.iter().filter_map(|id| provider.get(id.as_str()).copied()) {
+            if j != i && (pulled[j] || excluded_by_you(&mods[j])) && !required_by[j].contains(&i) {
+                required_by[j].push(i);
+            }
+        }
+    }
+    for (j, requirers) in required_by.into_iter().enumerate().filter(|(_, r)| !r.is_empty()) {
+        let mut names: Vec<String> = requirers.iter().map(|&i| mods[i].name.clone()).collect();
+        names.sort_by_key(|name| name.to_lowercase());
+        let verb = if names.len() == 1 { "requires" } else { "require" };
+        // Fabric and (Neo)Forge both refuse to start without a required dependency.
+        mods[j].reason = if pulled[j] {
+            format!("{} ({})", required_by_text(&names), mods[j].reason)
+        } else {
+            format!("Marked client-only, but {} {verb} it, so the server won't start", list(&names))
+        };
+        mods[j].required_by = names;
+    }
+}
+
+fn required_by_text(names: &[String]) -> String {
+    match names.len() {
+        1 => format!("Required by {}, which is needed on the server", names[0]),
+        2 | 3 => format!("Required by {}, which are needed on the server", list(names)),
+        _ => format!("Required by {}", list(names)),
+    }
+}
+
+pub fn list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [a, b, c] => format!("{a}, {b} and {c}"),
+        [a, b, rest @ ..] => format!("{a}, {b} and {} other server mods", rest.len()),
+    }
 }
 
 fn detect(metadata: &SideMetadata) -> (Side, String) {
@@ -247,5 +353,54 @@ fn detect(metadata: &SideMetadata) -> (Side, String) {
         (false, true) => (Side::Server, "CurseForge: tagged Server only".into()),
         (true, true) => (Side::Both, "CurseForge: tagged Client and Server".into()),
         (false, false) => (Side::Both, "No side metadata".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn side(name: &str, side: Side, r#override: Override) -> ModSide {
+        ModSide { path: format!("mods/{name}.jar"), key: None, name: name.to_string(), url: None, side, reason: "tags".into(), r#override, required_by: Vec::new() }
+    }
+
+    fn manifest(ids: &[&str], bundled: &[&str], requires: &[&str]) -> ModManifest {
+        let strings = |list: &[&str]| list.iter().map(|s| s.to_string()).collect();
+        ModManifest { ids: strings(ids), bundled_ids: strings(bundled), requires: strings(requires), client_only: false }
+    }
+
+    #[test]
+    fn server_mods_keep_their_client_tagged_dependencies_and_theirs() {
+        let mut mods = [side("Chipped", Side::Both, Override::Auto), side("Athena", Side::Client, Override::Auto), side("Mod Menu", Side::Client, Override::Auto), side("Zoomify", Side::Client, Override::Auto)];
+        let manifests = [manifest(&["chipped"], &[], &["athena", "minecraft"]), manifest(&["athena"], &[], &["modmenu"]), manifest(&["modmenu"], &[], &[]), manifest(&["zoomify"], &[], &["modmenu"])];
+        keep_required_dependencies(&mut mods, &manifests);
+        assert!(mods[..3].iter().all(|m| m.side == Side::Both));
+        assert_eq!(mods[1].reason, "Required by Chipped, which is needed on the server (tags)");
+        assert_eq!(mods[1].required_by, ["Chipped"]);
+        assert_eq!(mods[2].reason, "Required by Athena, which is needed on the server (tags)");
+        assert!(mods[3].side == Side::Client && mods[3].reason == "tags");
+    }
+
+    #[test]
+    fn bundled_libraries_satisfy_server_mods() {
+        let mut mods = [side("Enderscape", Side::Both, Override::Auto), side("MixinExtras", Side::Client, Override::Auto)];
+        keep_required_dependencies(&mut mods, &[manifest(&["enderscape"], &["mixinextras"], &["mixinextras"]), manifest(&["mixinextras"], &[], &[])]);
+        assert!(mods[1].side == Side::Client);
+    }
+
+    #[test]
+    fn your_exclusion_wins_but_warns() {
+        let mut mods = [side("Simply Swords", Side::Both, Override::Auto), side("Simply Bows", Side::Both, Override::Keep), side("s_lib", Side::Client, Override::Client)];
+        keep_required_dependencies(&mut mods, &[manifest(&["simplyswords"], &[], &["s_lib"]), manifest(&["simplybows"], &[], &["s_lib"]), manifest(&["s_lib"], &[], &[])]);
+        assert!(mods[2].side == Side::Client);
+        assert_eq!(mods[2].reason, "Marked client-only, but Simply Bows and Simply Swords require it, so the server won't start");
+        assert!(mods[2].breaks_server());
+    }
+
+    #[test]
+    fn many_requirers_get_counted() {
+        let names = ["A", "B", "C", "D", "E"].map(String::from);
+        assert_eq!(required_by_text(&names[..3]), "Required by A, B and C, which are needed on the server");
+        assert_eq!(required_by_text(&names), "Required by A, B and 3 other server mods");
     }
 }

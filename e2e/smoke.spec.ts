@@ -965,3 +965,74 @@ test("packraven's changelog opens in a modal and concatenates skipped versions",
   await updates.getByRole('button', { name: "What's new" }).click()
   await expect(page.getByRole('dialog', { name: "What's new in packraven 0.2.0" })).toBeVisible()
 })
+
+test("a failed publish in one pack stays with that pack after you switch", async ({ page }) => {
+  await openApp(page, 'publish', 'ready')
+  await page.evaluate(() => {
+    const emit = (globalThis as unknown as { __mockEmit: (event: string, payload: unknown) => void }).__mockEmit
+    emit('job-state', { job: 'publish', state: 'running', message: null })
+    emit('job-state', { job: 'publish', state: 'failed', message: 'CurseForge rejected the upload (500 Internal Server Error)' })
+  })
+  const failure = page.getByText('CurseForge rejected the upload (500 Internal Server Error)')
+  await expect(failure).toBeVisible()
+
+  const rail = page.getByRole('navigation', { name: 'Pack' })
+  const switchTo = async (name: string) => {
+    await page.getByRole('button', { name: /Raven's High Fantasy|Otherworld/ }).first().click()
+    await page.getByRole('menuitemradio', { name: new RegExp(name) }).click()
+    await expect(page.getByRole('heading', { level: 1, name })).toBeVisible()
+    await rail.getByRole('button', { name: /^Publish/ }).click()
+    await expect(page.getByRole('heading', { level: 2, name: 'Publish', exact: true })).toBeVisible()
+  }
+  await switchTo('Otherworld')
+  await expect(failure).toHaveCount(0)
+  await switchTo("Raven's High Fantasy")
+  await expect(failure).toBeVisible()
+})
+
+test('a server pack that failed to upload can be uploaded again from Publish', async ({ page }) => {
+  page.on('dialog', (dialog) => dialog.accept())
+  await page.goto('/?view=publish&scenario=ready&serverpackfails')
+  const publish = page.locator('.go .primary')
+  await expect(publish).toBeEnabled({ timeout: 10000 })
+  await publish.click()
+  const notice = page.locator('.notice', { hasText: "but its server pack isn't" })
+  await expect(notice).toBeVisible()
+  await expect(notice.getByRole('button', { name: 'Show server pack' })).toBeVisible()
+  await expect(notice.getByRole('button', { name: "Open CurseForge's upload page" })).toBeVisible()
+
+  await notice.getByRole('button', { name: 'Upload it again' }).click()
+  await expect(page.getByText(/is on CurseForge and Modrinth\./)).toBeVisible()
+  await expect(page.getByText("but its server pack isn't")).toHaveCount(0)
+})
+
+test('a release packraven left unfinished can be finished from Publish', async ({ page }) => {
+  const dialogs: string[] = []
+  page.on('dialog', (dialog) => {
+    dialogs.push(dialog.message())
+    dialog.accept()
+  })
+  await openApp(page, 'publish', 'dirty')
+  const notice = page.locator('.notice', { has: page.getByRole('heading', { name: /we didn't finish publishing it/ }) })
+  const left = notice.getByRole('list', { name: /^Left to do for/ })
+  await expect(left.getByRole('listitem')).toHaveCount(3)
+  await expect(left).toContainText('Upload the server pack to CurseForge, after building it again')
+  await expect(notice).toContainText('Your mods changed since')
+  // The manual route stays folded away until you ask for it.
+  await expect(notice.getByRole('button', { name: "Open CurseForge's upload page" })).toBeHidden()
+
+  await notice.getByRole('button', { name: /^Finish publishing/ }).click()
+  await expect(page.getByText(/^Finished publishing/)).toBeVisible()
+  await expect(notice).toHaveCount(0)
+  expect(dialogs[0]).toContain('Build the server pack again from the pack as it is now')
+  expect(dialogs[0]).toContain("won't match what's already on CurseForge")
+})
+
+test('a server pack you uploaded yourself stops being offered for upload', async ({ page }) => {
+  await openApp(page, 'publish', 'dirty')
+  const notice = page.locator('.notice', { has: page.getByRole('heading', { name: /we didn't finish publishing it/ }) })
+  await notice.getByText('Upload the server pack yourself').click()
+  await notice.getByRole('button', { name: 'I uploaded it' }).click()
+  await expect(notice.getByRole('list', { name: /^Left to do for/ })).not.toContainText('server pack')
+  await expect(notice.getByRole('heading', { name: /we didn't finish publishing it/ })).toBeFocused()
+})

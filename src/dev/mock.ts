@@ -2,7 +2,7 @@
 // We load data from src/dev/fixtures.json when present (gitignored; you generate it from a real instance),
 // and otherwise from the committed demo-fixtures.json, a snapshot of a real pack.
 import demoFixtures from './demo-fixtures.json'
-import type { Platform, ReleaseStatus } from '../lib/api'
+import type { PendingStep, Platform, ReleaseStatus, ServerPackUpload } from '../lib/api'
 
 // Add `?scenario=` to the URL to put the pack in one of the states we review the UI in.
 const scenarios = {
@@ -77,6 +77,10 @@ const pack = {
   added: true,
 }
 
+// A second pack you can switch to. The mock serves the first pack's data for it under its own name.
+const otherPack = { ...pack, dir: 'C:/Instances/Otherworld', name: 'Otherworld', remote: 'https://github.com/muon-rw/Otherworld.git' }
+let activePack = pack.dir
+
 const config = {
   author: 'muon-rw',
   curseforge: { project_id: scenario === 'empty' ? 0 : 1234567, release_type: 'beta', manual_release: false, allowed_override_jars: [] as string[], exclude: [] as string[] },
@@ -101,14 +105,36 @@ const config = {
 }
 
 const modrinthRelease = (version: string) => ({ status: 'Listed', url: `https://modrinth.com/project/ravens-high-fantasy/version/${version}` })
-// The newest release missed Modrinth in the dirty scenario, so Releases offers to upload it.
+const zipStem = (version: string) => `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-${version}`
+// packraven rebuilds a server pack CurseForge turned down as too large before it tries again.
+const tooLarge = "CurseForge's upload API turned down the 1.29 GB file as too large"
+const unsentServerPack = (version: string, fileId: number, error = tooLarge, packChanged = false): ServerPackUpload => ({
+  zip: `C:/Users/you/AppData/Roaming/dev.muon.packraven/packs/ravens-high-fantasy/builds/${version}/${zipStem(version)}-server.zip`,
+  uploadPage: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}/create-additional-file`,
+  displayName: `Server Pack ${version}`,
+  fileName: `${zipStem(version)}-server.zip`,
+  error,
+  retryable: true,
+  rebuild: error === tooLarge,
+  packChanged,
+  tag: `v${version}`,
+})
+// Add `serverpackfails` to the URL to have a mock publish fail its server pack upload.
+const serverPackFails = new URLSearchParams(location.search).has('serverpackfails')
+// The newest release missed Modrinth and its server pack in the dirty scenario, so Releases offers to upload them.
 const releases: ReleaseStatus[] = scenario === 'empty' ? [] : [
-  { version: '0.1.0', publishedAt: '2026-10-03T18:20:00Z', announce: true, announcedAt: '2026-10-03T19:02:00Z', displayName: `${pack.name} 0.1.0`, releaseType: 'beta', modrinth: modrinthRelease('0.1.0'), modrinthMissing: null,
+  { version: '0.1.0', publishedAt: '2026-10-03T18:20:00Z', announce: true, announcedAt: '2026-10-03T19:02:00Z', displayName: `${pack.name} 0.1.0`, releaseType: 'beta', modrinth: modrinthRelease('0.1.0'), modrinthMissing: null, serverPackMissing: null,
     curseforge: { projectId: 1234567, fileId: 7001001, status: 'Approved', serverStatus: 'Approved', serverPackLinked: true } },
   { version: fx.version === '0.1.0' ? '0.1.1' : fx.version, publishedAt: '2026-10-12T21:40:00Z', announce: true, announcedAt: null,
     displayName: `${pack.name} 0.1.1`, releaseType: 'beta', modrinth: scenario === 'dirty' ? null : modrinthRelease('0.1.1'), modrinthMissing: scenario === 'dirty' ? `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-0.1.1.mrpack` : null,
-    curseforge: { projectId: 1234567, fileId: 7105511, status: 'Under review', serverStatus: 'Under review', serverPackLinked: null } },
+    serverPackMissing: scenario === 'dirty' ? unsentServerPack('0.1.1', 7105511, tooLarge, true) : null,
+    curseforge: { projectId: 1234567, fileId: 7105511, status: 'Under review', serverStatus: scenario === 'dirty' ? 'Not uploaded' : 'Under review', serverPackLinked: null } },
 ]
+
+// In the dirty scenario the newest release also stopped before its commit, tag and push, and the mods changed since.
+const unfinishedSteps = new Map<string, { pending: PendingStep[]; packChanged: boolean }>(
+  scenario === 'dirty' ? [[releases[1].version, { pending: [{ step: 'tag', message: `Release ${releases[1].version}` }, { step: 'push' }], packChanged: true }]] : [],
+)
 
 // Files a platform doesn't host, which a dual pack has to ship there or keep off it.
 type MockSkew = { link: { projectId: string; title: string; url: string; evidence: 'sameFiles' | 'sameSource' | 'sameAuthor' }; shared: { fileId: number; version: string; newer: boolean; identical: boolean } | null; modrinthNewest: string | null; modrinthNewer: boolean; newestOnCurseforge: boolean; modrinthBuild: { version: string; differences: string[] } | null }
@@ -212,14 +238,27 @@ function renderChangelog() {
   return `${notes.trimEnd()}${notes.trim() ? '\n\n' : ''}## Mod changes\n${sections}`
 }
 
-const serverSides =
+const serverSides: { path: string; key: string | null; name: string; url: string | null; side: string; reason: string; override: string; requiredBy: string[] }[] =
   scenario === 'empty'
     ? []
     : [
-        { path: 'mods/sodium-neoforge-0.6.15.jar', key: 'cf:394468', name: 'Sodium', url: 'https://www.curseforge.com/minecraft/mc-mods/sodium', side: 'client', reason: 'Modrinth lists it as client-only', override: 'auto' },
-        { path: 'mods/iris-neoforge-1.8.1.jar', key: 'cf:455508', name: 'Iris Shaders', url: 'https://www.curseforge.com/minecraft/mc-mods/irisshaders', side: 'client', reason: 'Modrinth lists it as client-only', override: 'auto' },
-        { path: 'mods/shouldersurfing-neoforge-4.5.0.jar', key: 'cf:243190', name: 'Shoulder Surfing Reloaded', url: null, side: 'both', reason: 'CurseForge lists it for both sides', override: 'client' },
-        { path: 'mods/Apotheosis-1.21.1-8.1.2.jar', key: 'cf:313970', name: 'Apotheosis', url: null, side: 'both', reason: 'CurseForge lists it for both sides', override: 'auto' },
+        { path: 'mods/sodium-neoforge-0.6.15.jar', key: 'cf:394468', name: 'Sodium', url: 'https://www.curseforge.com/minecraft/mc-mods/sodium', side: 'client', reason: 'Modrinth: server unsupported', override: 'auto', requiredBy: [] },
+        { path: 'mods/iris-neoforge-1.8.1.jar', key: 'cf:455508', name: 'Iris Shaders', url: 'https://www.curseforge.com/minecraft/mc-mods/irisshaders', side: 'client', reason: 'Modrinth: server unsupported', override: 'auto', requiredBy: [] },
+        { path: 'mods/shouldersurfing-neoforge-4.5.0.jar', key: 'cf:243190', name: 'Shoulder Surfing Reloaded', url: null, side: 'client', reason: 'Marked client-only', override: 'client', requiredBy: [] },
+        { path: 'mods/Apotheosis-1.21.1-8.1.2.jar', key: 'cf:313970', name: 'Apotheosis', url: null, side: 'both', reason: 'CurseForge: tagged Client and Server', override: 'auto', requiredBy: [] },
+        { path: 'mods/athena-neoforge-1.21-4.0.2.jar', key: 'cf:841890', name: 'Athena', url: null, side: 'both', reason: 'Required by Chipped, which is needed on the server (Modrinth: server unsupported)', override: 'auto', requiredBy: ['Chipped'] },
+        { path: 'mods/chipped-neoforge-1.21.1-4.0.2.jar', key: 'cf:456956', name: 'Chipped', url: null, side: 'both', reason: 'Modrinth: runs on both', override: 'auto', requiredBy: [] },
+        {
+          path: 'mods/sliblib-neoforge-1.21.1-3.0.1.jar',
+          key: 'cf:1173405',
+          name: 'S-Lib',
+          url: null,
+          side: 'both',
+          reason: 'Required by Mutant Skeleton Armor Tweaks, Quests & Teams Fixes and 2 other server mods (Modrinth: server unsupported)',
+          override: 'auto',
+          requiredBy: ['Mutant Skeleton Armor Tweaks', 'Quests & Teams Fixes', 'Simply Bows', 'Simply Swords'],
+        },
+        { path: 'mods/simplytooltips-neoforge-1.21.1-0.1.5.jar', key: 'cf:1035547', name: 'Simply Tooltips', url: null, side: 'client', reason: "Marked client-only, but Simply Bows and Simply Swords require it, so the server won't start", override: 'client', requiredBy: ['Simply Bows', 'Simply Swords'] },
       ]
 
 // A logo drawn inline, so the view never waits on CurseForge's image CDN.
@@ -906,12 +945,13 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     if (files.length) lastReplace = { label, before }
     return { label, files, replaced, missed, undoable: true }
   },
-  list_packs: () => (scenario === 'nopack' ? { active: null, packs: [], instancesRoot: 'C:/Instances' } : { active: pack.dir, packs: [pack], instancesRoot: 'C:/Instances' }),
+  list_packs: () => (scenario === 'nopack' ? { active: null, packs: [], instancesRoot: 'C:/Instances' } : { active: activePack, packs: [pack, otherPack], instancesRoot: 'C:/Instances' }),
+  switch_pack: (a) => (activePack = String(a.dir)),
   resync_mod_list: () => null,
   overview: () => {
     if (scenario === 'newerlock') throw "A newer version of packraven wrote this pack's mods.lock.json. Update packraven in App settings, then try again."
     return {
-      name: pack.name,
+      name: activePack === otherPack.dir ? otherPack.name : pack.name,
       version: bcc.version,
       bccInstalled: bcc.installed,
       minecraft: fx.minecraft,
@@ -923,6 +963,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       notOnModrinth: notOn('modrinth').map((path) => candidateView('modrinth', path)),
       modrinthError: null,
       releasesMissingModrinth: releases.filter((r) => r.modrinthMissing).length,
+      releasesMissingServerPack: releases.filter((r) => r.serverPackMissing).length,
       modListError: null,
       watchError: null,
       branch: 'master',
@@ -1020,6 +1061,12 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     conflicts: [{ name: 'sodium-neoforge-0.6.13.jar', mine: 'sodium-neoforge-0.6.14.jar', theirs: 'sodium-neoforge-0.6.15.jar' }],
   }),
   get_pack_config: () => config,
+  // The real backend reclassifies every mod; the mock only settles the one you changed.
+  set_side_override: (a) => {
+    const mod = serverSides.find((m) => m.key === a.key)
+    if (!mod || a.mode === 'auto') return
+    Object.assign(mod, a.mode === 'keep' ? { side: 'both', reason: 'Kept on the server', override: 'keep' } : { side: 'client', reason: 'Marked client-only', override: 'client' })
+  },
   save_pack_config: (a) => Object.assign(config, a.config),
   get_server_icon: () => (serverIcon === 'pending' ? (serverIcon = mockServerIcon()) : serverIcon),
   set_server_icon: () => (serverIcon = mockServerIcon()),
@@ -1181,6 +1228,12 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   },
   build_modrinth_export: () =>
     mockJob('modrinth-export', ['Modrinth pack: 391 Modrinth files, 4 override files'], `C:/Users/you/AppData/Roaming/dev.muon.packraven/builds/${bcc.version ?? 'dev'}/pack.mrpack`, () => {}),
+  upload_release_server_pack: (a) =>
+    mockJob('publish', ['Uploading the server pack', 'Uploaded the server pack as file 7300001'], `Uploaded the ${a.version} server pack to CurseForge as file 7300001`, () => {
+      const release = releases.find((r) => r.version === a.version)!
+      release.serverPackMissing = null
+      release.curseforge = { ...release.curseforge!, serverStatus: 'Not public yet' }
+    }),
   upload_release_to_modrinth: (a) =>
     mockJob('publish', ['Uploading the pack to Modrinth', 'Uploaded Modrinth version'], `Uploaded ${a.version} to Modrinth`, () => {
       const release = releases.find((r) => r.version === a.version)!
@@ -1207,7 +1260,61 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     else usingModrinthBuild.delete(String(a.path))
   },
   modrinth_project_title: (a) => (String(a.id) === 'ravens-high-fantasy' ? "Raven's High Fantasy" : null),
-  published_to: (a) => (releases.some((r) => r.version === a.version) ? { curseforge: true, modrinth: !!releases.find((r) => r.version === a.version)!.modrinth } : null),
+  unfinished_releases: () =>
+    [...releases]
+      .reverse()
+      .filter((r) => r.serverPackMissing || r.modrinthMissing || unfinishedSteps.has(r.version))
+      .map((r) => ({
+        version: r.version,
+        displayName: r.displayName,
+        serverPackMissing: r.serverPackMissing,
+        modrinthMissing: r.modrinthMissing,
+        modrinthError: r.modrinthMissing ? 'Modrinth rejected the upload (502 Bad Gateway)' : null,
+        pending: unfinishedSteps.get(r.version)?.pending ?? [],
+        packChanged: unfinishedSteps.get(r.version)?.packChanged ?? false,
+      })),
+  mark_server_pack_uploaded: (a) => {
+    const release = releases.find((r) => r.version === a.version)!
+    release.serverPackMissing = null
+    release.curseforge = { ...release.curseforge!, serverStatus: 'Uploaded by you' }
+  },
+  finish_release: (a) =>
+    mockJob('publish', ['Uploading the server pack', 'Uploaded the server pack as file 7300001', `Committed "Release ${a.version}" and tagged v${a.version}`, 'Pushed the release commit and tag'], `Finished publishing ${a.version}`, () => {
+      const release = releases.find((r) => r.version === a.version)!
+      if (release.serverPackMissing) release.curseforge = { ...release.curseforge!, serverStatus: 'Not public yet' }
+      if (release.modrinthMissing) release.modrinth = modrinthRelease(String(a.version))
+      release.serverPackMissing = null
+      release.modrinthMissing = null
+      unfinishedSteps.delete(String(a.version))
+    }),
+  published_to: (a) => {
+    const release = releases.find((r) => r.version === a.version)
+    return release ? { curseforge: !!release.curseforge, modrinth: !!release.modrinth, serverPackMissing: release.serverPackMissing, modrinthError: null } : null
+  },
+  publish: (a) => {
+    const version = (a.options as { version: string }).version
+    const fileId = 7200000 + releases.length
+    const serverLine = serverPackFails ? "Couldn't upload the server pack" : `Uploaded the server pack as file ${fileId + 1}`
+    mockJob(
+      'publish',
+      ['Uploading the client pack', `Uploaded the client pack as file ${fileId}`, 'Uploading the server pack', serverLine, `Committed "Release ${version}" and tagged v${version}`],
+      serverPackFails ? `Published ${version}: CurseForge file ${fileId}, without its server pack.` : `Published ${version}: CurseForge file ${fileId}, server pack ${fileId + 1}.`,
+      () => {
+        releases.push({
+          version,
+          publishedAt: new Date().toISOString(),
+          announce: true,
+          announcedAt: null,
+          displayName: `${pack.name} ${version}`,
+          releaseType: config.curseforge.release_type,
+          modrinth: config.modrinth.project_id ? modrinthRelease(version) : null,
+          modrinthMissing: null,
+          serverPackMissing: serverPackFails ? unsentServerPack(version, fileId, 'CurseForge rejected the upload (502 Bad Gateway)') : null,
+          curseforge: { projectId: 1234567, fileId, status: 'Not public yet', serverStatus: serverPackFails ? 'Not uploaded' : 'Not public yet', serverPackLinked: null },
+        })
+      },
+    )
+  },
   discover_instances: () => [pack, { ...pack, dir: 'C:/Instances/Shared Pack', name: 'Shared Pack', addonCount: 0, hasGit: false, hasLock: false, remote: null, added: false }],
   server_sides: () => serverSides,
   installed_mods: () => ({

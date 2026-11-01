@@ -4,6 +4,8 @@
   import { ask } from '@tauri-apps/plugin-dialog'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { api, errorText, type ReleaseStatus } from '../lib/api'
+  import ServerPackSteps from '../components/ServerPackSteps.svelte'
+  import Notice from '../components/Notice.svelte'
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import { asReleaseType } from '../lib/format'
 
@@ -69,13 +71,14 @@
     const { curseforge, modrinth } = release
     return [
       curseforge && statusTone(curseforge.status) !== 'ok' ? `CurseForge still lists the file as "${curseforge.status}"` : null,
+      release.serverPackMissing ? "its server pack isn't on CurseForge yet" : null,
       release.modrinthMissing ? "it isn't on Modrinth yet" : null,
       modrinth && statusTone(modrinth.status) !== 'ok' ? `Modrinth lists it as "${modrinth.status}"` : null,
     ].filter((reason) => reason !== null)
   }
 
   function approved(release: ReleaseStatus) {
-    return (!release.curseforge || statusTone(release.curseforge.status) === 'ok') && !release.modrinthMissing && (!release.modrinth || statusTone(release.modrinth.status) === 'ok')
+    return holdups(release).length === 0
   }
 
   async function loadReleases() {
@@ -131,8 +134,9 @@
   function discordState(release: ReleaseStatus) {
     if (release.announcedAt) return `Announced ${new Date(release.announcedAt).toLocaleDateString()}`
     if (release.announce) {
-      const waiting = [release.curseforge && 'CurseForge approves it', release.modrinthMissing && "it's on Modrinth"].filter(Boolean)
-      return waiting.length ? `packraven posts this once ${waiting.join(' and ')}` : 'packraven posts this within a few minutes'
+      const curseforge = release.serverPackMissing ? 'CurseForge approves it and has its server pack' : 'CurseForge approves it'
+      const waiting = [release.curseforge && curseforge, release.modrinthMissing && "it's on Modrinth"].filter(Boolean)
+      return waiting.length ? `packraven posts this once ${waiting.join(', and ')}` : 'packraven posts this within a few minutes'
     }
     return 'Not announced'
   }
@@ -188,7 +192,8 @@
                     <dd><span class="chip {statusTone(curseforge.status)}">{curseforge.status}</span></dd>
                     <dt>Server pack</dt>
                     <dd>
-                      <span class="chip {statusTone(curseforge.serverStatus)}">{curseforge.serverStatus}</span>
+                      <!-- A missing server pack waits on you, not on CurseForge's review. -->
+                      <span class="chip {release.serverPackMissing ? 'fail' : statusTone(curseforge.serverStatus)}">{curseforge.serverStatus}</span>
                       {#if curseforge.serverPackLinked === false}<span class="chip pending">Not linked as the server pack</span>{/if}
                     </dd>
                   </dl>
@@ -234,6 +239,18 @@
               </div>
             </td>
           </tr>
+          {#if release.serverPackMissing}
+            <tr class="follow-up">
+              <td colspan={2 + (showCurseforge ? 1 : 0) + (showModrinth ? 1 : 0)}>
+                <section class="server-upload" aria-labelledby="server-upload-{release.version}">
+                  <Notice tone="warn" live={false}>
+                    <h3 id="server-upload-{release.version}">Upload the {release.version} server pack</h3>
+                    <ServerPackSteps upload={release.serverPackMissing} version={release.version} clientName={release.displayName ?? release.version} onmarked={loadReleases} />
+                  </Notice>
+                </section>
+              </td>
+            </tr>
+          {/if}
         {/each}
       </tbody>
     </table>
@@ -281,6 +298,7 @@
   /* In a narrow pane the table scrolls sideways on its own, so the rest of the view keeps its width. */
   .scroll {
     overflow-x: auto;
+    container-type: inline-size;
   }
 
   table {
@@ -330,6 +348,23 @@
 
   .statuses dd {
     margin: 0;
+  }
+
+  /* The steps span the row under their release, so the table keeps its columns narrow. */
+  .follow-up td {
+    border-top: 0;
+    padding-top: 0;
+  }
+
+  /* Sticky to the scroll area's left edge, and no wider than it, so the steps stay in view while the table scrolls sideways. */
+  .server-upload {
+    position: sticky;
+    left: 0;
+    max-width: min(80ch, 100cqi);
+  }
+
+  .server-upload h3 {
+    font-size: var(--step-0);
   }
 
   .modrinth {

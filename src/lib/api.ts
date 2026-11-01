@@ -195,6 +195,7 @@ export interface Overview {
   notOnModrinth: OverrideCandidate[]
   modrinthError: string | null
   releasesMissingModrinth: number
+  releasesMissingServerPack: number
   modListError: string | null
   watchError: string | null
   branch: string | null
@@ -319,6 +320,7 @@ export interface ModSide {
   side: Side
   reason: string
   override: Override
+  requiredBy: string[]
 }
 
 export interface ReleaseStatus {
@@ -332,6 +334,48 @@ export interface ReleaseStatus {
   modrinth: { status: string; url: string } | null
   // The Modrinth pack packraven would upload, when the pack is on Modrinth but this release isn't yet.
   modrinthMissing: string | null
+  serverPackMissing: ServerPackUpload | null
+}
+
+// What you need to upload a release's server pack yourself, after packraven's upload failed.
+export interface ServerPackUpload {
+  // The zip packraven built, if it's still in the builds folder.
+  zip: string | null
+  uploadPage: string
+  displayName: string | null
+  fileName: string | null
+  error: string | null
+  // Whether packraven can try the upload again.
+  retryable: boolean
+  // Whether a retry builds the server pack again first, because the zip is gone or was too large.
+  rebuild: boolean
+  // Whether the mods changed since the release shipped, so a rebuilt server pack wouldn't match it.
+  packChanged: boolean
+  // The release's tag, which you check out to rebuild a server pack that's gone from the builds folder.
+  tag: string
+}
+
+// A release CurseForge or Modrinth is still missing a pack for, read from what packraven recorded.
+export interface UnfinishedRelease {
+  version: string
+  displayName: string | null
+  serverPackMissing: ServerPackUpload | null
+  // The Modrinth pack packraven built but couldn't upload.
+  modrinthMissing: string | null
+  modrinthError: string | null
+  // The steps after the uploads that packraven hasn't done yet, in order.
+  pending: PendingStep[]
+  // Whether the mods changed since the release shipped, so tagging it now would record a different mod list.
+  packChanged: boolean
+}
+
+export type PendingStep = { step: 'tag'; message: string } | { step: 'push' }
+
+export interface PublishedTo {
+  curseforge: boolean
+  modrinth: boolean
+  serverPackMissing: ServerPackUpload | null
+  modrinthError: string | null
 }
 
 export type OverrideChoice = 'ship' | 'leaveOut'
@@ -704,13 +748,17 @@ export const api = {
   buildClientExport: () => invoke<void>('build_client_export'),
   buildModrinthExport: () => invoke<void>('build_modrinth_export'),
   uploadReleaseToModrinth: (version: string) => invoke<void>('upload_release_to_modrinth', { version }),
+  uploadReleaseServerPack: (version: string) => invoke<void>('upload_release_server_pack', { version }),
+  finishRelease: (version: string) => invoke<void>('finish_release', { version }),
+  markServerPackUploaded: (version: string) => invoke<void>('mark_server_pack_uploaded', { version }),
   setOverrideChoice: (platform: Platform, paths: string[], choice: OverrideChoice | null) => invoke<void>('set_override_choice', { platform, paths, choice }),
   overrideChoices: (platform: Platform) => invoke<OverrideChoices>('override_choices', { platform }),
   lookUpOverrideCandidates: () => invoke<void>('look_up_override_candidates'),
   setModrinthAuthor: (author: string, allowed: boolean) => invoke<void>('set_modrinth_author', { author, allowed }),
   useModrinthBuild: (path: string, using: boolean) => invoke<void>('use_modrinth_build', { path, using }),
   modrinthProjectTitle: (id: string) => invoke<string | null>('modrinth_project_title', { id }),
-  publishedTo: (version: string) => invoke<{ curseforge: boolean; modrinth: boolean } | null>('published_to', { version }),
+  publishedTo: (version: string) => invoke<PublishedTo | null>('published_to', { version }),
+  unfinishedReleases: () => invoke<UnfinishedRelease[]>('unfinished_releases'),
   buildServerPack: () => invoke<void>('build_server_pack'),
   startTest: (recopyAll: boolean, connect: boolean) => invoke<void>('start_test', { recopyAll, connect }),
   startClient: (join: boolean) => invoke<void>('start_client', { join }),

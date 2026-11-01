@@ -2,9 +2,21 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-### [Unreleased]
+## [0.4.0]
+
 ### Added
-- Download script style for serverpack mods (WIP)
+- Tracking for publishing completion state. packraven will offer to finish mid-completion publishes if it detects something is missing. 
+- When a server pack upload fails, packraven will finish the rest of the publish then offer to reupload or open CurseForge's upload page and show you the server pack zip.
+- Publish and Releases will keep flagging a release that's missing its server pack or Modrinth upload, so you can come back and finish it any time.
+- Publishing now stops before uploading anything if the client or server pack is over CurseForge's 1 GB upload limit.
+- Server packs now download their mods from CurseForge and Modrinth on first start, instead of uploading several hundred MB of jars.
+- **WARNING**: *The mods downloader has not been confirmed to be approved by CurseForge's file processor. Server packs might get flagged for manual review.*
+
+### Changed
+- Made packraven's built-in server mod exclusions more reliable, and tested against several large modpacks. You should now need far fewer manual overrides.
+
+### Fixed
+- A publish error from one pack no longer shows in Publish after you switch to another pack.
 
 ## [0.3.4] - 2026-10-31
 ### Added

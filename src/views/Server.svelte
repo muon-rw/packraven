@@ -3,7 +3,7 @@
   import ServerProperties from '../components/ServerProperties.svelte'
   import ServerStartup from '../components/ServerStartup.svelte'
   import ServerLaunch from '../components/ServerLaunch.svelte'
-  import { onMount } from 'svelte'
+  import { onMount, tick } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { api, errorText, type ModSide, type Overview, type Override, type PackConfig } from '../lib/api'
   import { serverPack } from '../lib/jobs.svelte'
@@ -14,7 +14,6 @@
 
   let { overview }: { overview: Overview | null } = $props()
 
-  type Filter = 'excluded' | 'all' | 'overridden'
   type Tab = typeof serverView.tab
   type Settings = Pick<PackConfig['server'], 'memory' | 'jvm_args' | 'args' | 'graalvm' | 'properties'>
 
@@ -27,17 +26,26 @@
   let mods: ModSide[] = $state([])
   let loadError: string | null = $state(null)
   let loading = $state(true)
-  let filter: Filter = $state('excluded')
   let search = $state('')
+  // Names the other mods an override flipped, so a reload doesn't change rows behind your back.
+  let changeNote = $state('')
+  // The row you just changed stays in view until you pick another filter, so it doesn't vanish under your cursor.
+  let pinned = $state<string | null>(null)
 
+  // Quick override changes each start a reload, so we only take the latest one's result.
+  let loads = 0
   async function load() {
+    const id = ++loads
     loading = true
     try {
-      mods = await api.serverSides()
+      const fresh = await api.serverSides()
+      if (id !== loads) return
+      mods = fresh
+      loadError = null
     } catch (error) {
-      loadError = `Couldn't read mod sides: ${errorText(error)}`
+      if (id === loads) loadError = `Couldn't read mod sides: ${errorText(error)}`
     } finally {
-      loading = false
+      if (id === loads) loading = false
     }
   }
 
@@ -103,33 +111,59 @@
     document.getElementById(`server-tab-${serverView.tab}`)?.focus()
   }
 
-  // Exclude and Keep fix the side outright, so we only reload the tags for Automatic.
-  async function setOverride(mod: ModSide, select: HTMLSelectElement) {
-    const mode = select.value as Override
+  // We reload every row, since excluding or keeping a mod also decides whether its dependencies go on the server.
+  async function setOverride(mod: ModSide, mode: Override, select?: HTMLSelectElement) {
+    if (mod.key === null) return
+    changeNote = ''
     try {
-      if (mod.key === null) return
       await trackSave(api.setSideOverride(mod.key, mode))
       markChanged()
     } catch (error) {
-      select.value = mod.override
+      if (select) select.value = mod.override
       loadError = `Couldn't change the override for ${mod.name}: ${errorText(error)}`
       return
     }
-    if (mode === 'auto') return load()
-    mods = mods.map((m) =>
-      m.path === mod.path
-        ? { ...m, override: mode, side: mode === 'client' ? 'client' : 'both', reason: mode === 'client' ? 'You excluded it' : 'You kept it on the server' }
-        : m,
-    )
+    const wasExcluded = new Map(mods.map((m) => [m.path, m.side === 'client']))
+    pinned = mod.path
+    await load()
+    changeNote = flippedNote(mod.name, mods.filter((m) => m.path !== mod.path && wasExcluded.has(m.path) && wasExcluded.get(m.path) !== (m.side === 'client')))
   }
 
+  // The notice and its button go away once the conflict is fixed, so we move focus to the mod's own row.
+  async function keepFromNotice(mod: ModSide) {
+    await setOverride(mod, 'keep')
+    await tick()
+    document.querySelector<HTMLSelectElement>(`select[data-path="${CSS.escape(mod.path)}"]`)?.focus()
+  }
+
+  function list(names: string[]) {
+    return names.length < 2 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`
+  }
+
+  function flippedNote(changed: string, flipped: ModSide[]) {
+    const on = flipped.filter((m) => m.side !== 'client').map((m) => m.name)
+    const off = flipped.filter((m) => m.side === 'client').map((m) => m.name)
+    const parts = [
+      on.length ? `${list(on)} ${on.length === 1 ? 'is' : 'are'} now on the server` : '',
+      off.length ? `${list(off)} ${off.length === 1 ? 'is' : 'are'} now off ${on.length ? 'it' : 'the server'}` : '',
+    ].filter(Boolean)
+    return parts.length ? `Because of your change to ${changed}, ${parts.join(', and ')}.` : ''
+  }
+
+  function setFilter(next: typeof serverView.filter) {
+    serverView.filter = next
+    pinned = null
+  }
+
+  const breaksServer = (m: ModSide) => m.side === 'client' && m.requiredBy.length > 0
+  let conflicts = $derived(mods.filter(breaksServer))
   let excludedCount = $derived(mods.filter((m) => m.side === 'client').length)
+  // A crash log names the jar more often than the project, so search matches both.
+  let matching = $derived(mods.filter((m) => !search || [m.name, m.path].some((text) => text.toLowerCase().includes(search.toLowerCase()))))
   let visible = $derived(
-    mods.filter((m) => {
-      if (filter === 'excluded' && m.side !== 'client') return false
-      if (filter === 'overridden' && m.override === 'auto') return false
-      return !search || m.name.toLowerCase().includes(search.toLowerCase())
-    }),
+    matching
+      .filter((m) => m.path === pinned || (serverView.filter === 'excluded' ? m.side === 'client' : serverView.filter === 'overridden' ? m.override !== 'auto' : true))
+      .sort((a, b) => Number(breaksServer(b)) - Number(breaksServer(a))),
   )
 
   let searchField = $state<HTMLInputElement>()
@@ -161,8 +195,8 @@
         {:else if !mods.length}
           This pack has no mods yet.
         {:else}
-          {mods.length} {mods.length === 1 ? 'mod' : 'mods'}. {excludedCount || 'none'} excluded from the server as client-only, based on their
-          CurseForge and Modrinth tags. Override that here; these choices will be used in test runs and Publish to make server packs.
+          {mods.length} {mods.length === 1 ? 'mod' : 'mods'}, {excludedCount || 'none'} excluded from the server. We decide from their CurseForge and Modrinth tags and
+          their own metadata, and we always keep a mod that a server mod requires. Change any mod below; test runs and Publish build server packs from these choices.
         {/if}
       </p>
     </div>
@@ -227,16 +261,30 @@
     </Notice>
   {/if}
 
+  {#each conflicts as mod (mod.path)}
+    <Notice tone="warn">
+      <p>You excluded {mod.name}, but {list(mod.requiredBy)} {mod.requiredBy.length === 1 ? 'requires' : 'require'} it, so the server won't start.</p>
+      <p><button onclick={() => keepFromNotice(mod)}>Keep {mod.name} on the server</button></p>
+    </Notice>
+  {/each}
+
   <div class="tools">
     <div class="filters" role="group" aria-label="Show">
       {#each [['excluded', 'Excluded'], ['overridden', 'Overridden'], ['all', 'All mods']] as const as [id, label] (id)}
-        <button aria-pressed={filter === id} class:on={filter === id} onclick={() => (filter = id)}>{label}</button>
+        <button aria-pressed={serverView.filter === id} class:on={serverView.filter === id} onclick={() => setFilter(id)}>{label}</button>
       {/each}
     </div>
+    <p class="note" role="status">{changeNote}</p>
   </div>
 
   {#snippet sideChip(mod: ModSide)}
-    <span class="chip {mod.side === 'client' ? 'change' : 'ok'}">{mod.side === 'client' ? 'Excluded' : mod.side === 'server' ? 'Included, server-side' : 'Included'}</span>
+    <span class="chip {breaksServer(mod) ? 'fail' : mod.side === 'client' ? 'change' : 'ok'}">{mod.side === 'client' ? 'Excluded' : mod.side === 'server' ? 'Included, server-side' : 'Included'}</span>
+  {/snippet}
+
+  <!-- Past three requirers the reason counts the rest, so we name them all on hover and to screen readers. -->
+  {#snippet why(mod: ModSide)}
+    {@const all = mod.requiredBy.length > 3 ? `Required by ${list(mod.requiredBy)}` : undefined}
+    <span class:muted={!breaksServer(mod)} title={all}><span aria-hidden={all ? 'true' : undefined}>{mod.reason}</span>{#if all}<span class="visually-hidden">{all}</span>{/if}</span>
   {/snippet}
 
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
@@ -261,12 +309,19 @@
               <td>
                 {#if mod.url}<a href={mod.url} onclick={(e) => { e.preventDefault(); openUrl(mod.url!) }}>{mod.name}</a>{:else}{mod.name}{/if}
                 <div class="file muted">{mod.path.slice(5)}</div>
-                <div class="folded">{@render sideChip(mod)} <span class="muted">{mod.reason}</span></div>
+                <div class="folded">{@render sideChip(mod)} {@render why(mod)}</div>
               </td>
               <td class="side">{@render sideChip(mod)}</td>
-              <td class="why muted">{mod.reason}</td>
+              <td class="why">{@render why(mod)}</td>
               <td>
-                <select value={mod.override} onchange={(e) => setOverride(mod, e.currentTarget)} aria-label="Override for {mod.name}">
+                <select
+                  value={mod.override}
+                  data-path={mod.path}
+                  onchange={(e) => setOverride(mod, e.currentTarget.value as Override, e.currentTarget)}
+                  disabled={mod.key === null}
+                  title={mod.key === null ? "We can only override mods we matched on CurseForge or Modrinth" : undefined}
+                  aria-label="Override for {mod.name}"
+                >
                   <option value="auto">Automatic</option>
                   <option value="client">Exclude</option>
                   <option value="keep">Keep on server</option>
@@ -276,12 +331,15 @@
           {:else}
             <tr>
               <td colspan="4" class="muted">
-                {#if search}
+                {#if search && matching.length}
+                  No {serverView.filter === 'excluded' ? 'excluded' : 'overridden'} mods match "{search}".
+                  <button class="link" onclick={() => setFilter('all')}>{matching.length === 1 ? 'Show the 1 mod that does' : `Show the ${matching.length} mods that do`}</button>
+                {:else if search}
                   No mods match "{search}". <button class="link" onclick={() => (search = '')}>Clear the search</button>
-                {:else if filter === 'excluded'}
+                {:else if serverView.filter === 'excluded'}
                   packraven isn't leaving any mods off the server.
-                {:else if filter === 'overridden'}
-                  You haven't overridden any mods. Every mod uses its CurseForge and Modrinth tags.
+                {:else if serverView.filter === 'overridden'}
+                  You haven't overridden any mods, so packraven decides them all.
                 {:else}
                   This pack has no mods yet.
                 {/if}
@@ -320,8 +378,14 @@
     gap: 4px;
   }
 
+  /* Atkinson's characters run narrower than the 0 that ch measures, so 60ch keeps lines near 85 characters. */
   .title p {
-    max-width: 68ch;
+    max-width: 60ch;
+  }
+
+  .note {
+    color: var(--muted);
+    font-size: var(--step--1);
   }
 
   .save {

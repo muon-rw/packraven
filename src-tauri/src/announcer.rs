@@ -25,10 +25,10 @@ async fn check(app: &AppHandle) {
         let pack_data = pack_data_dir(&state.data_dir(), pack);
         let releases_path = pack_data.join("releases.json");
         let opened = Pack::open(pack).ok();
-        for release in publish::load_releases(&releases_path).into_iter().filter(|r| r.announce && r.announced_at.is_none()) {
-            // A release still waiting for its Modrinth upload isn't out everywhere yet.
+        for mut release in publish::load_releases(&releases_path).into_iter().filter(|r| r.announce && r.announced_at.is_none()) {
+            // A release still waiting for its Modrinth upload or its server pack isn't out everywhere yet.
             let awaiting_modrinth = opened.as_ref().is_some_and(|opened| publish::awaiting_modrinth(opened, &pack_data, &release).is_some());
-            if awaiting_modrinth || !discord::is_approved(&release).await {
+            if awaiting_modrinth || !publish::link_server_pack(&releases_path, &mut release).await || !discord::is_approved(&release).await {
                 continue;
             }
             match discord::announce(pack, &releases_path, &release.version, &webhook).await {

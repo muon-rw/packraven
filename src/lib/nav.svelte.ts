@@ -11,7 +11,7 @@ export function revealAnchor(id: string, frames = 60) {
   target.focus({ preventScroll: true })
 }
 
-export const serverView = $state({ tab: 'mods' as 'mods' | 'properties' | 'startup' })
+export const serverView = $state({ tab: 'mods' as 'mods' | 'properties' | 'startup', filter: 'excluded' as 'excluded' | 'overridden' | 'all' })
 
 export function showDiff(path: string) {
   nav.diffPath = path

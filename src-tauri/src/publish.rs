@@ -30,9 +30,25 @@ pub struct Release {
     pub curseforge: Option<CurseforgeRelease>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modrinth: Option<ModrinthRelease>,
+    /// Why the Modrinth upload failed, kept until a later upload succeeds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modrinth_error: Option<String>,
     pub published_at: String,
     pub announce: bool,
     pub announced_at: Option<String>,
+    /// The steps after the uploads that haven't happened yet, in order. Releases from before we kept these have none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pending: Vec<PendingStep>,
+    /// Identifies the mods that shipped, so finishing the release later can tell you the pack changed since.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mods_digest: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase", tag = "step")]
+pub enum PendingStep {
+    Tag { message: String },
+    Push,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -40,7 +56,50 @@ pub struct Release {
 pub struct CurseforgeRelease {
     pub project_id: u64,
     pub file_id: u64,
-    pub server_file_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_file_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsent_server_pack: Option<UnsentServerPack>,
+    /// You uploaded the server pack yourself. CurseForge only links it once the client pack is public, so until
+    /// then we know of no server file, but mustn't offer to upload it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_pack_uploaded_by_you: bool,
+}
+
+impl CurseforgeRelease {
+    /// Returns whether the server pack still needs uploading, as far as we know.
+    pub fn awaits_server_pack(&self) -> bool {
+        self.server_file_id.is_none() && !self.server_pack_uploaded_by_you
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UnsentServerPack {
+    pub names: UploadNames,
+    pub error: String,
+    #[serde(default)]
+    pub too_large: bool,
+}
+
+/// What you need to upload a release's server pack yourself, after packraven's upload failed.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerPackUpload {
+    /// The zip packraven built, if it's still in the builds folder.
+    pub zip: Option<PathBuf>,
+    pub upload_page: String,
+    pub display_name: Option<String>,
+    pub file_name: Option<String>,
+    pub error: Option<String>,
+    /// Whether packraven can try the upload again.
+    pub retryable: bool,
+    /// Whether a retry builds the server pack again first, because the zip is gone or was too large.
+    pub rebuild: bool,
+    /// Whether the mods changed since the release shipped, so a rebuilt server pack wouldn't match it.
+    pub pack_changed: bool,
+    /// The release's tag, which you check out to rebuild a server pack that's gone from the builds folder.
+    pub tag: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -59,6 +118,8 @@ struct StoredRelease {
     release_type: Option<String>,
     curseforge: Option<CurseforgeRelease>,
     modrinth: Option<ModrinthRelease>,
+    #[serde(default)]
+    modrinth_error: Option<String>,
     project_id: Option<u64>,
     file_id: Option<u64>,
     server_file_id: Option<u64>,
@@ -67,12 +128,16 @@ struct StoredRelease {
     announce: bool,
     #[serde(default)]
     announced_at: Option<String>,
+    #[serde(default)]
+    pending: Vec<PendingStep>,
+    #[serde(default)]
+    mods_digest: Option<String>,
 }
 
 impl From<StoredRelease> for Release {
     fn from(stored: StoredRelease) -> Self {
         let legacy = match (stored.project_id, stored.file_id) {
-            (Some(project_id), Some(file_id)) => Some(CurseforgeRelease { project_id, file_id, server_file_id: stored.server_file_id.unwrap_or_default() }),
+            (Some(project_id), Some(file_id)) => Some(CurseforgeRelease { project_id, file_id, server_file_id: stored.server_file_id, unsent_server_pack: None, server_pack_uploaded_by_you: false }),
             _ => None,
         };
         Self {
@@ -81,9 +146,12 @@ impl From<StoredRelease> for Release {
             release_type: stored.release_type,
             curseforge: stored.curseforge.or(legacy),
             modrinth: stored.modrinth,
+            modrinth_error: stored.modrinth_error,
             published_at: stored.published_at,
             announce: stored.announce,
             announced_at: stored.announced_at,
+            pending: stored.pending,
+            mods_digest: stored.mods_digest,
         }
     }
 }
@@ -144,7 +212,7 @@ fn upload_names(title: &str, overrides: &UploadNames, defaults: UploadNames, ver
     Ok(UploadNames { display_name, file_name })
 }
 
-pub fn preflight_warnings(pack: &Pack) -> Vec<String> {
+pub fn preflight_warnings(pack: &Pack, cache: &mut MetadataCache) -> Vec<String> {
     let disabled: Vec<&str> = pack.lock.files.iter().filter_map(|e| e.path.strip_suffix(".disabled")?.split_once('/').map(|(_, name)| name)).collect();
     let mut warnings = match disabled[..] {
         [] => vec![],
@@ -153,6 +221,11 @@ pub fn preflight_warnings(pack: &Pack) -> Vec<String> {
     };
     if pack.version().is_some() && !pack.has_bcc() {
         warnings.push("Better Compatibility Checker isn't in the mods folder, so the pack won't show its version in game.".into());
+    }
+    // We only know the tags we've cached, which is every mod once you've opened Server.
+    for m in sides::classify_known(pack, cache).iter().filter(|m| m.breaks_server()) {
+        let verb = if m.required_by.len() == 1 { "requires" } else { "require" };
+        warnings.push(format!("{} is left off the server, but {} {verb} it, so the server pack won't start. Keep it on the server in Server.", m.name, sides::list(&m.required_by)));
     }
     warnings
 }
@@ -292,6 +365,9 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
     if !problems.is_empty() {
         bail!("{}", problems.join("\n"));
     }
+    if load_releases(&pack_data.join("releases.json")).iter().any(|r| r.version == version) {
+        bail!("You already published {version}. Finish it from Publish if it's unfinished, or change the version.");
+    }
     let pack = Pack::open(&pack.dir)?;
     let client_names = upload_names("client pack", &options.client, default_client_names(&pack), &version)?;
     let server_names = upload_names("server pack", &options.server, default_server_names(&pack), &version)?;
@@ -308,104 +384,313 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
     let modrinth_pack = pack.config.targets_modrinth().then(|| export::modrinth_export(&pack, &sides, &cache, &version, &out_dir, &log)).transpose()?;
     let notes = changelog::render(&changelog::read_notes(&pack), &diff);
 
-    let curseforge = match client_zip {
-        Some(client_zip) => {
-            export::server_pack(&pack, &sides, &version, export::ServerMods::DownloadedOnStart, &out_dir, &data_dir, &log).await?;
-            let server_zip = export::zip_server_pack(&pack, &version, &out_dir, &log).await?;
-            Some(upload_to_curseforge(&pack, (&client_zip, client_names.clone()), (&server_zip, server_names), &notes, &log).await?)
-        }
-        None => None,
+    let message = Some(options.message.trim()).filter(|m| !m.is_empty()).map_or_else(|| format!("Release {version}"), String::from);
+    let releases_path = pack_data.join("releases.json");
+    let release_type = pack.config.curseforge.release_type.clone();
+    let mut release = Release {
+        version: version.clone(),
+        display_name: Some(client_names.display_name.clone()),
+        release_type: Some(release_type.clone()),
+        curseforge: None,
+        modrinth: None,
+        // If packraven stops before the Modrinth upload, finishing the release offers it like a failed one.
+        modrinth_error: modrinth_pack.as_ref().map(|_| STOPPED_EARLY.to_string()),
+        published_at: chrono::Utc::now().to_rfc3339(),
+        announce,
+        announced_at: None,
+        pending: [Some(PendingStep::Tag { message }), options.push.then_some(PendingStep::Push)].into_iter().flatten().collect(),
+        mods_digest: Some(mods_digest(&pack)),
     };
-    // A CurseForge release already happened by now, so a failed Modrinth upload mustn't keep us from recording it.
-    let (modrinth, modrinth_failure) = match &modrinth_pack {
-        Some(path) => match upload_to_modrinth(&pack, &version, path, &client_names.display_name, &pack.config.curseforge.release_type, &notes, &log).await {
-            Ok(release) => (Some(release), None),
-            Err(error) if curseforge.is_some() => (None, Some(error)),
+
+    if let Some(client_zip) = client_zip {
+        export::server_pack(&pack, &sides, &version, export::ServerMods::DownloadedOnStart, &out_dir, &data_dir, &log).await?;
+        let server_zip = export::zip_server_pack(&pack, &version, &out_dir, &log).await?;
+        curseforge::check_upload_size(&client_zip, "client pack")?;
+        curseforge::check_upload_size(&server_zip, "server pack")?;
+        let file_id = upload_client_pack(&pack, &client_zip, client_names.clone(), &notes, &log).await?;
+        // We record the release the moment CurseForge has it, so a publish that stops later leaves a release to
+        // finish rather than one we'd upload twice.
+        let unsent = UnsentServerPack { names: server_names.clone(), error: STOPPED_EARLY.into(), too_large: false };
+        let mut curseforge = CurseforgeRelease { project_id: pack.config.curseforge.project_id, file_id, server_file_id: None, unsent_server_pack: Some(unsent), server_pack_uploaded_by_you: false };
+        release.curseforge = Some(curseforge.clone());
+        record(&pack, &releases_path, &release, &notes, &baseline_path)?;
+        if let Err(error) = upload_server_pack(&mut curseforge, &server_zip, server_names, &notes, &release_type, &log).await {
+            log.stream("err", &format!("Couldn't upload the server pack: {error:#}"));
+        }
+        release.curseforge = Some(curseforge);
+        save_release(&releases_path, &release)?;
+    }
+    let server_failure = release.curseforge.as_ref().and_then(|c| c.unsent_server_pack.as_ref()).map(|unsent| unsent.error.clone());
+    // A CurseForge release already happened by now, so a failed Modrinth upload mustn't keep us from finishing it.
+    let modrinth_failure = match &modrinth_pack {
+        Some(path) => match upload_to_modrinth(&pack, &version, path, &client_names.display_name, &release_type, &notes, &log).await {
+            Ok(uploaded) => {
+                release.modrinth = Some(uploaded);
+                release.modrinth_error = None;
+                None
+            }
+            Err(error) if release.curseforge.is_some() => {
+                release.modrinth_error = Some(format!("{error:#}"));
+                Some(error)
+            }
             Err(error) => return Err(error),
         },
-        None => (None, None),
+        None => None,
     };
+    if release.curseforge.is_some() {
+        save_release(&releases_path, &release)?;
+    } else {
+        record(&pack, &releases_path, &release, &notes, &baseline_path)?;
+    }
     let summary = [
-        curseforge.as_ref().map(|c| format!("CurseForge file {}, server pack {}", c.file_id, c.server_file_id)),
-        modrinth.as_ref().map(|m| format!("Modrinth version {}", m.version_id)),
+        release.curseforge.as_ref().map(|c| match c.server_file_id {
+            Some(server_file_id) => format!("CurseForge file {}, server pack {server_file_id}", c.file_id),
+            None => format!("CurseForge file {}, without its server pack", c.file_id),
+        }),
+        release.modrinth.as_ref().map(|m| format!("Modrinth version {}", m.version_id)),
     ]
     .into_iter()
     .flatten()
     .collect::<Vec<_>>()
     .join("; ");
 
-    let releases_path = pack_data.join("releases.json");
-    let mut releases = load_releases(&releases_path);
-    let display_name = Some(client_names.display_name.clone());
-    let release_type = Some(pack.config.curseforge.release_type.clone());
-    releases.push(Release { version: version.clone(), display_name, release_type, curseforge, modrinth, published_at: chrono::Utc::now().to_rfc3339(), announce, announced_at: None });
-    save_releases(&releases_path, &releases)?;
-
-    let archive = pack.dir.join(CHANGELOG_ARCHIVE);
-    std::fs::create_dir_all(&archive)?;
-    std::fs::write(archive.join(format!("{version}.md")), &notes)?;
-    changelog::write_notes(&pack, "")?;
-    let _ = std::fs::remove_file(&baseline_path);
-    // packraven built the packs from disk, so we commit everything, and the tag records what shipped.
-    git::run(&pack.dir, &["add", "-A"])?;
-    let message = Some(options.message.trim()).filter(|m| !m.is_empty()).map_or_else(|| format!("Release {version}"), String::from);
-    let tag = release_tag(&version);
-    for command in [&["commit", "--allow-empty", "-m", &message][..], &["tag", "-a", &tag, "-m", &message]] {
-        let mut args = identity.config_args();
-        args.extend(command.iter().map(|a| a.to_string()));
-        git::run(&pack.dir, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
-    }
-    log.info(format!("Committed \"{message}\" and tagged {tag}"));
-    if options.push {
-        crate::gitops::push(&pack.dir, &log)
-            .await
-            .with_context(|| format!("packraven published {version} and tagged {}, but couldn't push. Once you've fixed this, push from Git", release_tag(&version)))?;
-        log.info("Pushed the release commit and tag");
-    }
-    // The release happened, so the job succeeds, and Publish finds the missing Modrinth upload from releases.json.
-    Ok(match modrinth_failure {
-        Some(error) => format!("Published {version}: {summary}. The Modrinth upload failed, so upload it again from Releases: {error:#}"),
-        None => format!("Published {version}: {summary}"),
-    })
+    run_pending(&pack, &identity, &releases_path, &mut release, &log).await?;
+    // The release happened, so the job succeeds, and Publish finds the missing uploads from releases.json.
+    let server_failure = server_failure.map(|error| format!(" The server pack upload failed, so upload it yourself as an additional file on CurseForge: {error}"));
+    let modrinth_failure = modrinth_failure.map(|error| format!(" The Modrinth upload failed, so upload it again from Releases: {error:#}"));
+    Ok(format!("Published {version}: {summary}.{}{}", server_failure.unwrap_or_default(), modrinth_failure.unwrap_or_default()))
 }
 
-async fn upload_to_curseforge(pack: &Pack, (client_zip, client): (&Path, UploadNames), (server_zip, server): (&Path, UploadNames), notes: &str, log: &Log) -> Result<CurseforgeRelease> {
-    let project_id = pack.config.curseforge.project_id;
+// Shown for an upload packraven never got to, as when the app closed mid-publish.
+const STOPPED_EARLY: &str = "packraven stopped before it finished this upload";
+
+fn save_release(releases_path: &Path, release: &Release) -> Result<()> {
+    let mut releases = load_releases(releases_path);
+    match releases.iter_mut().find(|r| r.version == release.version) {
+        Some(stored) => *stored = release.clone(),
+        None => releases.push(release.clone()),
+    }
+    save_releases(releases_path, &releases)
+}
+
+// Recording a release also archives its notes and clears changelog.md for the next one.
+fn record(pack: &Pack, releases_path: &Path, release: &Release, notes: &str, baseline_path: &Path) -> Result<()> {
+    save_release(releases_path, release)?;
+    let archive = pack.dir.join(CHANGELOG_ARCHIVE);
+    std::fs::create_dir_all(&archive)?;
+    std::fs::write(archive.join(format!("{}.md", release.version)), notes)?;
+    changelog::write_notes(pack, "")?;
+    let _ = std::fs::remove_file(baseline_path);
+    Ok(())
+}
+
+/// Returns a digest of the jars and files the pack ships, which ignores lockfile changes that don't change a file.
+pub fn mods_digest(pack: &Pack) -> String {
+    use sha1::{Digest, Sha1};
+    let mut files: Vec<(&str, &str)> = pack.lock.files.iter().map(|e| (e.path.as_str(), e.sha1.as_str())).collect();
+    files.sort_unstable();
+    let mut hasher = Sha1::new();
+    for (path, sha1) in files {
+        hasher.update(format!("{path}\t{sha1}\n"));
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Returns whether the pack's mods changed since the release shipped. Releases from before we kept a digest never count as changed.
+pub fn changed_since(pack: &Pack, release: &Release) -> bool {
+    release.mods_digest.as_ref().is_some_and(|digest| *digest != mods_digest(pack))
+}
+
+// We save after each step, so a step that fails stays pending and finishing the release picks up from it.
+async fn run_pending(pack: &Pack, identity: &Identity, releases_path: &Path, release: &mut Release, log: &Log) -> Result<()> {
+    let tag = release_tag(&release.version);
+    while let Some(step) = release.pending.first().cloned() {
+        match step {
+            // A publish that stopped right after tagging left the tag, so we don't commit a second time.
+            PendingStep::Tag { .. } if tag_exists(pack, &release.version) => log.info(format!("{tag} already exists, so packraven left it as it is")),
+            // packraven built the packs from disk, so we commit everything, and the tag records what shipped.
+            PendingStep::Tag { message } => {
+                git::run(&pack.dir, &["add", "-A"])?;
+                for command in [&["commit", "--allow-empty", "-m", &message][..], &["tag", "-a", &tag, "-m", &message]] {
+                    let mut args = identity.config_args();
+                    args.extend(command.iter().map(|a| a.to_string()));
+                    git::run(&pack.dir, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+                }
+                log.info(format!("Committed \"{message}\" and tagged {tag}"));
+            }
+            PendingStep::Push => {
+                crate::gitops::push(&pack.dir, log)
+                    .await
+                    .with_context(|| format!("packraven published {} and tagged {tag}, but couldn't push. Once you've fixed this, finish the release from Publish", release.version))?;
+                log.info("Pushed the release commit and tag");
+            }
+        }
+        release.pending.remove(0);
+        save_release(releases_path, release)?;
+    }
+    Ok(())
+}
+
+async fn upload_client_pack(pack: &Pack, zip: &Path, names: UploadNames, notes: &str, log: &Log) -> Result<u64> {
     let game_versions = curseforge::game_version_ids(pack.lock.minecraft()?, pack.lock.mod_loader()?.name()).await?;
-    let release_type = pack.config.curseforge.release_type.clone();
-    log.info(format!("Uploading {} as {}", client_zip.display(), client.file_name));
+    log.info(format!("Uploading {} as {}", zip.display(), names.file_name));
     let file_id = curseforge::upload(
-        project_id,
-        client_zip,
-        client.file_name,
+        pack.config.curseforge.project_id,
+        zip,
+        names.file_name,
         json!({
             "changelog": notes,
             "changelogType": "markdown",
-            "displayName": client.display_name,
+            "displayName": names.display_name,
             "gameVersions": game_versions,
-            "releaseType": release_type,
+            "releaseType": pack.config.curseforge.release_type,
             "isMarkedForManualRelease": pack.config.curseforge.manual_release,
         }),
     )
     .await?;
     log.info(format!("Uploaded the client pack as file {file_id}"));
-    log.info(format!("Uploading {} as {}", server_zip.display(), server.file_name));
-    let server_file_id = curseforge::upload(
-        project_id,
-        server_zip,
-        server.file_name,
-        json!({
-            "changelog": notes,
-            "changelogType": "markdown",
-            "displayName": server.display_name,
-            "parentFileID": file_id,
-            "releaseType": release_type,
-        }),
-    )
-    .await
-    .context("packraven uploaded the client pack, but the server pack upload failed; upload the server pack as an additional file on CurseForge")?;
-    log.info(format!("Uploaded the server pack as file {server_file_id}"));
-    Ok(CurseforgeRelease { project_id, file_id, server_file_id })
+    Ok(file_id)
+}
+
+// Either way the outcome goes on the release: the server file, or why it isn't there.
+async fn upload_server_pack(curseforge: &mut CurseforgeRelease, zip: &Path, names: UploadNames, notes: &str, release_type: &str, log: &Log) -> Result<u64> {
+    log.info(format!("Uploading {} as {}", zip.display(), names.file_name));
+    let metadata = json!({
+        "changelog": notes,
+        "changelogType": "markdown",
+        "displayName": names.display_name,
+        "parentFileID": curseforge.file_id,
+        "releaseType": release_type,
+    });
+    match curseforge::upload(curseforge.project_id, zip, names.file_name.clone(), metadata).await {
+        Ok(server_file_id) => {
+            log.info(format!("Uploaded the server pack as file {server_file_id}"));
+            curseforge.server_file_id = Some(server_file_id);
+            curseforge.unsent_server_pack = None;
+            Ok(server_file_id)
+        }
+        Err(error) => {
+            let too_large = error.downcast_ref::<curseforge::UploadTooLarge>().is_some();
+            curseforge.unsent_server_pack = Some(UnsentServerPack { names, error: format!("{error:#}"), too_large });
+            Err(error)
+        }
+    }
+}
+
+/// Returns what you need to upload a release's server pack yourself, when CurseForge has the client
+/// pack but packraven doesn't know of a server pack for it.
+pub fn awaiting_server_pack(pack: Option<&Pack>, pack_data: &Path, release: &Release) -> Option<ServerPackUpload> {
+    let curseforge = release.curseforge.as_ref().filter(|c| c.awaits_server_pack())?;
+    let unsent = curseforge.unsent_server_pack.as_ref();
+    let zip = pack.map(|pack| server_zip(pack, pack_data, &release.version)).filter(|zip| zip.exists());
+    Some(ServerPackUpload {
+        retryable: pack.is_some(),
+        rebuild: zip.is_none() || unsent.is_some_and(|u| u.too_large),
+        pack_changed: pack.is_some_and(|pack| changed_since(pack, release)),
+        zip,
+        upload_page: curseforge::additional_file_page(curseforge.project_id, curseforge.file_id),
+        display_name: unsent.map(|u| u.names.display_name.clone()),
+        file_name: unsent.map(|u| u.names.file_name.clone()),
+        error: unsent.map(|u| u.error.clone()),
+        tag: release_tag(&release.version),
+    })
+}
+
+fn server_zip(pack: &Pack, pack_data: &Path, version: &str) -> PathBuf {
+    pack_data.join("builds").join(version).join(pack.server_zip_name(version))
+}
+
+/// Uploads a release's server pack after the publish that built it couldn't. When the zip is gone or was too large
+/// to upload, we build it again from the pack as it is now.
+pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, version: &str, log: &Log) -> Result<String> {
+    let releases_path = paths.pack_data.join("releases.json");
+    let mut release = load_releases(&releases_path).into_iter().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"))?;
+    let release_type = release.release_type.clone().unwrap_or_else(|| pack.config.curseforge.release_type.clone());
+    let curseforge = release.curseforge.as_mut().with_context(|| format!("{version} isn't on CurseForge."))?;
+    if !curseforge.awaits_server_pack() {
+        bail!("{version} already has its server pack on CurseForge.");
+    }
+    let zip = server_zip(pack, &paths.pack_data, version);
+    if !zip.exists() || curseforge.unsent_server_pack.as_ref().is_some_and(|u| u.too_large) {
+        log.info("Building the server pack again from the pack as it is now, with its mods downloaded on first start");
+        let mut cache = MetadataCache::load(&paths.cache_path);
+        let sides = sides::classify(pack, &mut cache).await?;
+        cache.save(&paths.cache_path)?;
+        let out_dir = paths.pack_data.join("builds").join(version);
+        export::server_pack(pack, &sides, version, export::ServerMods::DownloadedOnStart, &out_dir, &paths.data_dir, log).await?;
+        export::zip_server_pack(pack, version, &out_dir, log).await?;
+    }
+    curseforge::check_upload_size(&zip, "server pack")?;
+    let names = curseforge.unsent_server_pack.as_ref().map_or_else(|| default_server_names(pack), |u| u.names.clone());
+    let names = UploadNames { display_name: names.display_name.replace(VERSION_TOKEN, version), file_name: names.file_name.replace(VERSION_TOKEN, version) };
+    let notes = std::fs::read_to_string(pack.dir.join(CHANGELOG_ARCHIVE).join(format!("{version}.md"))).unwrap_or_default();
+    let uploaded = upload_server_pack(curseforge, &zip, names, &notes, &release_type, log).await;
+    save_release(&releases_path, &release)?;
+    Ok(format!("Uploaded the {version} server pack to CurseForge as file {}", uploaded?))
+}
+
+pub struct ReleasePaths {
+    pub data_dir: PathBuf,
+    pub pack_data: PathBuf,
+    pub cache_path: PathBuf,
+}
+
+/// Finishes a release a publish left unfinished: the server pack and Modrinth uploads it's missing, then the
+/// commit, tag and push it hasn't done yet.
+pub async fn finish_release(pack: &Pack, identity: &Identity, paths: &ReleasePaths, version: &str, log: &Log) -> Result<String> {
+    let releases_path = paths.pack_data.join("releases.json");
+    let find = || load_releases(&releases_path).into_iter().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"));
+    let release = find()?;
+    let mut failures = Vec::new();
+    if awaiting_server_pack(Some(pack), &paths.pack_data, &release).is_some()
+        && let Err(error) = upload_release_server_pack(pack, paths, version, log).await
+    {
+        failures.push(format!("The server pack upload failed: {error:#}."));
+    }
+    if awaiting_modrinth(pack, &paths.pack_data, &release).is_some()
+        && let Err(error) = upload_release_to_modrinth(pack, &paths.pack_data, version, log).await
+    {
+        failures.push(format!("The Modrinth upload failed: {error:#}."));
+    }
+    let mut release = find()?;
+    if let Err(error) = run_pending(pack, identity, &releases_path, &mut release, log).await {
+        failures.push(format!("{error:#}"));
+    }
+    if !failures.is_empty() {
+        bail!("{}", failures.join(" "));
+    }
+    Ok(format!("Finished publishing {version}"))
+}
+
+/// Records that you uploaded a release's server pack yourself, so we stop offering to upload it.
+pub fn mark_server_pack_uploaded(pack_data: &Path, version: &str) -> Result<()> {
+    let releases_path = pack_data.join("releases.json");
+    let mut release = load_releases(&releases_path).into_iter().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"))?;
+    release.curseforge.as_mut().with_context(|| format!("{version} isn't on CurseForge."))?.server_pack_uploaded_by_you = true;
+    save_release(&releases_path, &release)
+}
+
+/// Returns whether the release's server pack is on CurseForge, or it has no CurseForge release.
+/// CurseForge only reports the link once the client pack is public, and we record it then.
+pub async fn link_server_pack(releases_path: &Path, release: &mut Release) -> bool {
+    let Some(curseforge) = release.curseforge.as_ref().filter(|c| c.server_file_id.is_none()) else { return true };
+    let linked = curseforge::file(curseforge.project_id, curseforge.file_id).await.ok().flatten().and_then(|file| file.server_pack_file_id);
+    let Some(server_file_id) = linked else { return false };
+    adopt_server_pack(release, server_file_id);
+    let mut releases = load_releases(releases_path);
+    if let Some(stored) = releases.iter_mut().find(|r| r.version == release.version) {
+        adopt_server_pack(stored, server_file_id);
+        let _ = save_releases(releases_path, &releases);
+    }
+    true
+}
+
+/// Records a server pack you uploaded yourself once CurseForge links it to the client pack.
+pub fn adopt_server_pack(release: &mut Release, server_file_id: u64) {
+    if let Some(curseforge) = release.curseforge.as_mut().filter(|c| c.server_file_id.is_none()) {
+        curseforge.server_file_id = Some(server_file_id);
+        curseforge.unsent_server_pack = None;
+    }
 }
 
 async fn upload_to_modrinth(pack: &Pack, version: &str, path: &Path, display_name: &str, release_type: &str, notes: &str, log: &Log) -> Result<ModrinthRelease> {
@@ -448,23 +733,24 @@ pub fn awaiting_modrinth(pack: &Pack, pack_data: &Path, release: &Release) -> Op
 }
 
 /// Uploads a release's Modrinth pack after the publish that built it couldn't.
-pub async fn upload_release_to_modrinth(pack: Pack, pack_data: PathBuf, version: String, log: Log) -> Result<String> {
+pub async fn upload_release_to_modrinth(pack: &Pack, pack_data: &Path, version: &str, log: &Log) -> Result<String> {
     let releases_path = pack_data.join("releases.json");
     let mut releases = load_releases(&releases_path);
     let release = releases.iter_mut().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"))?;
     if release.modrinth.is_some() {
         bail!("{version} is already on Modrinth.");
     }
-    let path = pack_data.join("builds").join(&version).join(pack.modrinth_pack_name(&version));
+    let path = pack_data.join("builds").join(version).join(pack.modrinth_pack_name(version));
     if !path.exists() {
         bail!("The Modrinth pack packraven built for {version} is gone from {}, so packraven can't upload it.", path.display());
     }
     let notes = std::fs::read_to_string(pack.dir.join(CHANGELOG_ARCHIVE).join(format!("{version}.md"))).unwrap_or_default();
-    let display_name = release.display_name.clone().unwrap_or_else(|| default_client_names(&pack).display_name.replace(VERSION_TOKEN, &version));
+    let display_name = release.display_name.clone().unwrap_or_else(|| default_client_names(pack).display_name.replace(VERSION_TOKEN, version));
     let release_type = release.release_type.clone().unwrap_or_else(|| pack.config.curseforge.release_type.clone());
-    let uploaded = upload_to_modrinth(&pack, &version, &path, &display_name, &release_type, &notes, &log).await?;
+    let uploaded = upload_to_modrinth(pack, version, &path, &display_name, &release_type, &notes, log).await?;
     let message = format!("Uploaded {version} to Modrinth as version {}", uploaded.version_id);
     release.modrinth = Some(uploaded);
+    release.modrinth_error = None;
     save_releases(&releases_path, &releases)?;
     Ok(message)
 }
@@ -513,8 +799,39 @@ mod tests {
         let releases = load_releases(&path);
         std::fs::remove_file(&path).unwrap();
         let curseforge = releases[0].curseforge.as_ref().unwrap();
-        assert_eq!((curseforge.project_id, curseforge.file_id, curseforge.server_file_id), (5, 6, 7));
+        assert_eq!((curseforge.project_id, curseforge.file_id, curseforge.server_file_id), (5, 6, Some(7)));
         assert!(releases[0].modrinth.is_none() && !releases[0].announce);
+    }
+
+    #[test]
+    fn pending_steps_survive_a_save_and_older_releases_have_none() {
+        use super::PendingStep;
+        let path = std::env::temp_dir().join(format!("packraven-pending-{}.json", std::process::id()));
+        std::fs::write(&path, r#"[{"version": "0.9", "publishedAt": "2026-10-01T00:00:00Z"}]"#).unwrap();
+        assert!(load_releases(&path)[0].pending.is_empty());
+
+        let mut release = load_releases(&path).remove(0);
+        release.version = "1.0".into();
+        release.pending = vec![PendingStep::Tag { message: "Release 1.0".into() }, PendingStep::Push];
+        super::save_release(&path, &release).unwrap();
+        release.pending.remove(0);
+        super::save_release(&path, &release).unwrap();
+        let releases = load_releases(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(releases.iter().map(|r| r.version.as_str()).collect::<Vec<_>>(), ["0.9", "1.0"]);
+        assert_eq!(releases[1].pending, [PendingStep::Push]);
+    }
+
+    #[test]
+    fn a_release_without_its_server_pack_points_at_the_additional_file_page() {
+        let json = r#"[{"version": "1.0", "curseforge": {"projectId": 5, "fileId": 6, "unsentServerPack": {"names": {"displayName": "Server Pack 1.0", "fileName": "pack-server.zip"}, "error": "too large"}}, "publishedAt": "2026-11-01T00:00:00Z", "announce": false, "announcedAt": null}]"#;
+        let mut release = serde_json::from_str::<Vec<super::Release>>(json).unwrap().remove(0);
+        let upload = super::awaiting_server_pack(None, std::path::Path::new("."), &release).unwrap();
+        assert_eq!(upload.upload_page, "https://authors.curseforge.com/#/projects/5/files/6/create-additional-file");
+        assert_eq!((upload.display_name.as_deref(), upload.error.as_deref(), upload.zip), (Some("Server Pack 1.0"), Some("too large"), None));
+        super::adopt_server_pack(&mut release, 7);
+        assert!(super::awaiting_server_pack(None, std::path::Path::new("."), &release).is_none());
+        assert!(release.curseforge.unwrap().unsent_server_pack.is_none());
     }
 
     #[test]

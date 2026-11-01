@@ -17,6 +17,8 @@ class JobRecord {
   // The phase stays 'done' or 'failed' until the next run starts, so effects that react to a run
   // ending compare this count instead.
   finishedRuns = $state(0)
+  // The pack that was open when the run started, so another pack's views don't show its result.
+  pack: string | null = null
 }
 
 export function onJobEnd(name: JobName, run: (phase: JobPhase) => void) {
@@ -56,6 +58,13 @@ export function onServerStopped(listener: () => void) {
 }
 
 const idle = new JobRecord()
+// Setup adds a pack and then switches to it, so its result belongs to no one pack.
+const unscoped: ReadonlySet<string> = new Set<JobName>(['setup'])
+const scope = $state({ pack: null as string | null })
+
+export function setJobPack(pack: string | null) {
+  scope.pack = pack
+}
 const pending = new Map<string, LogLine[]>()
 let flushTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -65,7 +74,9 @@ function record(job: string): JobRecord {
 }
 
 export function job(name: JobName): JobRecord {
-  return jobs[name] ?? idle
+  const entry = jobs[name]
+  if (!entry) return idle
+  return unscoped.has(name) || entry.pack === null || entry.pack === scope.pack ? entry : idle
 }
 
 export function clearLog(...names: JobName[]) {
@@ -118,6 +129,7 @@ function register(): Promise<UnlistenFn[]> {
     if (payload.state === 'running') {
       pending.delete(payload.job)
       entry.lines = []
+      entry.pack = scope.pack
     } else {
       flushLogs()
     }

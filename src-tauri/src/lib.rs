@@ -34,6 +34,7 @@ mod logs;
 mod mirror;
 mod mod_commands;
 mod mod_list;
+mod mod_manifest;
 mod mod_updates;
 mod modrinth;
 mod modsync;
@@ -218,6 +219,9 @@ pub fn run() {
             commands::build_client_export,
             commands::build_modrinth_export,
             commands::upload_release_to_modrinth,
+            commands::upload_release_server_pack,
+            commands::finish_release,
+            commands::mark_server_pack_uploaded,
             commands::set_override_choice,
             commands::modrinth_project_title,
             commands::look_up_override_candidates,
@@ -225,6 +229,7 @@ pub fn run() {
             commands::set_modrinth_author,
             commands::use_modrinth_build,
             commands::published_to,
+            commands::unfinished_releases,
             commands::build_server_pack,
             commands::start_test,
             commands::start_client,

@@ -5,7 +5,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, errorText, type Overview, type PackList, type Platform } from './lib/api'
   import { minecraft, refreshAccount } from './lib/minecraft.svelte'
-  import { job, jobs, onJobEnd, serverPack, startListening, testState } from './lib/jobs.svelte'
+  import { job, jobs, onJobEnd, serverPack, setJobPack, startListening, testState } from './lib/jobs.svelte'
   import Changes from './views/Changes.svelte'
   import Server from './views/Server.svelte'
   import Mods from './views/Mods.svelte'
@@ -129,6 +129,8 @@
 
   async function load() {
     packs = await api.listPacks().catch(() => packs)
+    // We set it in the same update as packs, so views remounted for the new pack never see the last pack's jobs.
+    setJobPack(packs?.active ?? null)
     if (packs && !packs.active) {
       overview = null
       loadError = null
@@ -243,6 +245,15 @@
       : [],
   )
 
+  let releasesStatus = $derived(
+    [
+      overview?.releasesMissingServerPack ? `${overview.releasesMissingServerPack} ${overview.releasesMissingServerPack === 1 ? 'release' : 'releases'} without a server pack` : null,
+      overview?.releasesMissingModrinth ? `${overview.releasesMissingModrinth} not on Modrinth yet` : null,
+    ]
+      .filter(Boolean)
+      .join(', ') || undefined,
+  )
+
   let publishesTo = $derived<Platform[]>([...(overview && overview.projectId > 0 ? ['curseforge' as const] : []), ...(overview?.modrinthProjectId ? ['modrinth' as const] : [])])
 
   let modListStatus = $derived(
@@ -340,8 +351,8 @@
           id: 'releases',
           title: 'Releases',
           key: '8',
-          status: overview?.releasesMissingModrinth ? `${overview.releasesMissingModrinth} not on Modrinth yet` : undefined,
-          tone: overview?.releasesMissingModrinth ? 'warn' : undefined,
+          status: releasesStatus,
+          tone: releasesStatus ? 'warn' : undefined,
         },
       ],
     },

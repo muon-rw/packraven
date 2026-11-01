@@ -365,6 +365,7 @@ pub async fn game_version_ids(minecraft: &str, loader: &str) -> Result<Vec<u64>>
 pub async fn upload(project_id: u64, path: &Path, file_name: String, metadata: Value) -> Result<u64> {
     let token = upload_token().context(NO_UPLOAD_TOKEN)?;
     let bytes = tokio::fs::read(path).await?;
+    let size = bytes.len() as u64;
     let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str("application/zip")?;
     let form = reqwest::multipart::Form::new().text("metadata", metadata.to_string()).part("file", part);
     let response = CLIENT
@@ -375,8 +376,67 @@ pub async fn upload(project_id: u64, path: &Path, file_name: String, metadata: V
         .await?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or(Value::Null);
+    if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+        return Err(UploadTooLarge(size).into());
+    }
     if !status.is_success() {
-        bail!("CurseForge rejected the upload ({status}): {body}");
+        match &body {
+            Value::Null => bail!("CurseForge rejected the upload ({status})"),
+            body => bail!("CurseForge rejected the upload ({status}): {}", body["errorMessage"].as_str().map_or_else(|| body.to_string(), String::from)),
+        }
     }
     body["id"].as_u64().with_context(|| format!("CurseForge upload returned no file id: {body}"))
+}
+
+// CurseForge's support articles still say 2 GB, but the upload API sent back a 413 for a 1.29 GB server pack,
+// and a CurseForge moderator says the limit is now 1 GB. We assume the binary gigabyte, so we never refuse a
+// file CurseForge would take; one between 1 GB and 1 GiB still gets the 413.
+pub const UPLOAD_LIMIT: u64 = 1 << 30;
+
+/// Fails when a file is too large for the upload API, so a publish can stop before any upload makes it public.
+pub fn check_upload_size(path: &Path, what: &str) -> Result<()> {
+    let size = std::fs::metadata(path)?.len();
+    if size > UPLOAD_LIMIT {
+        bail!(
+            "The {what} is {:.2} GB, and CurseForge's upload API takes files up to about 1 GB, so packraven stopped before uploading anything. Check what fills {}, then publish again.",
+            size as f64 / 1e9,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// A 413 from the upload API, so callers can tell a file that will never go through from a failure worth retrying.
+#[derive(Debug)]
+pub struct UploadTooLarge(pub u64);
+
+impl std::fmt::Display for UploadTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CurseForge's upload API turned down the {:.2} GB file as too large", self.0 as f64 / 1e9)
+    }
+}
+
+impl std::error::Error for UploadTooLarge {}
+
+/// Returns the authors console page for uploading an additional file, like a server pack, to an existing file.
+pub fn additional_file_page(project_id: u64, parent_file_id: u64) -> String {
+    format!("https://authors.curseforge.com/#/projects/{project_id}/files/{parent_file_id}/create-additional-file")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_upload_size, UPLOAD_LIMIT};
+
+    #[test]
+    fn stops_only_files_over_the_upload_limit() {
+        let path = std::env::temp_dir().join(format!("packraven-upload-size-{}.zip", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(UPLOAD_LIMIT).unwrap();
+        assert!(check_upload_size(&path, "server pack").is_ok());
+        file.set_len(UPLOAD_LIMIT + 1).unwrap();
+        let error = check_upload_size(&path, "server pack").unwrap_err().to_string();
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+        assert!(error.starts_with("The server pack is 1.07 GB"), "{error}");
+    }
 }

@@ -129,6 +129,7 @@ pub struct Overview {
     not_on_modrinth: Vec<OverrideCandidate>,
     modrinth_error: Option<String>,
     releases_missing_modrinth: usize,
+    releases_missing_server_pack: usize,
     mod_list_error: Option<String>,
     watch_error: Option<String>,
     branch: Option<String>,
@@ -278,6 +279,7 @@ pub fn overview(state: State<'_, AppState>) -> CmdResult<Overview> {
         } else {
             0
         },
+        releases_missing_server_pack: publish::load_releases(&state.pack_data().join("releases.json")).iter().filter(|r| r.curseforge.as_ref().is_some_and(|c| c.awaits_server_pack())).count(),
         modrinth_error: mod_list.modrinth_error.filter(|_| pack.config.targets_modrinth()),
         mod_list_error: mod_list.error,
         watch_error: state.watch_error.lock().unwrap().clone(),
@@ -444,7 +446,8 @@ pub fn publish_preflight(state: State<'_, AppState>, version: String) -> CmdResu
     let mod_list = state.mod_list.lock().unwrap().clone();
     let pack = state.pack().map_err(err)?;
     let version = version.trim();
-    let cache = MetadataCache::load(&state.cache_path());
+    let mut cache = MetadataCache::load(&state.cache_path());
+    let warnings = publish::preflight_warnings(&pack, &mut cache);
     let allowlist = Allowlist::load(&state.allowlist_path());
     let decided = |platform| -> CmdResult<(Vec<OverrideFileView>, Vec<OverrideFileView>)> {
         if !pack.config.targets(platform) {
@@ -457,8 +460,17 @@ pub fn publish_preflight(state: State<'_, AppState>, version: String) -> CmdResu
     let (curseforge_shipped, curseforge_left_out) = decided(Platform::Curseforge)?;
     let (modrinth_shipped, modrinth_left_out) = decided(Platform::Modrinth)?;
     Ok(Preflight {
-        problems: publish::preflight(&pack, &cache, version, &mod_list.unhosted, mod_list.modrinth_error.as_deref(), &state.settings().identity()),
-        warnings: publish::preflight_warnings(&pack),
+        problems: {
+            let mut problems = publish::preflight(&pack, &cache, version, &mod_list.unhosted, mod_list.modrinth_error.as_deref(), &state.settings().identity());
+            let pack_data = state.pack_data();
+            let finished = |r: &publish::Release| r.version == version && unfinished(Some(&pack), &pack_data, r.clone()).is_none();
+            // A finished release almost always has its tag, and preflight already reports that.
+            if !publish::tag_exists(&pack, version) && publish::load_releases(&pack_data.join("releases.json")).iter().any(finished) {
+                problems.push(format!("You already published {version}. Change the version to publish again."));
+            }
+            problems
+        },
+        warnings,
         tag_taken: !version.is_empty() && publish::tag_exists(&pack, version),
         client: publish::default_client_names(&pack),
         server: publish::default_server_names(&pack),
@@ -494,10 +506,34 @@ pub fn build_modrinth_export(app: AppHandle, state: State<'_, AppState>) -> CmdR
 }
 
 #[tauri::command]
+pub fn upload_release_server_pack(app: AppHandle, state: State<'_, AppState>, version: String) -> CmdResult<()> {
+    let pack = state.pack().map_err(err)?;
+    let paths = release_paths(&state);
+    state.jobs.start(&app, "publish", move |log| async move { publish::upload_release_server_pack(&pack, &paths, &version, &log).await })
+}
+
+#[tauri::command]
+pub fn mark_server_pack_uploaded(state: State<'_, AppState>, version: String) -> CmdResult<()> {
+    publish::mark_server_pack_uploaded(&state.pack_data(), &version).map_err(err)
+}
+
+#[tauri::command]
+pub fn finish_release(app: AppHandle, state: State<'_, AppState>, version: String) -> CmdResult<()> {
+    let pack = state.pack().map_err(err)?;
+    let paths = release_paths(&state);
+    let identity = state.settings().identity();
+    state.jobs.start(&app, "publish", move |log| async move { publish::finish_release(&pack, &identity, &paths, &version, &log).await })
+}
+
+fn release_paths(state: &AppState) -> publish::ReleasePaths {
+    publish::ReleasePaths { data_dir: state.data_dir.clone(), pack_data: state.pack_data(), cache_path: state.cache_path() }
+}
+
+#[tauri::command]
 pub fn upload_release_to_modrinth(app: AppHandle, state: State<'_, AppState>, version: String) -> CmdResult<()> {
     let pack = state.pack().map_err(err)?;
     let pack_data = state.pack_data();
-    state.jobs.start(&app, "publish", move |log| publish::upload_release_to_modrinth(pack, pack_data, version, log))
+    state.jobs.start(&app, "publish", move |log| async move { publish::upload_release_to_modrinth(&pack, &pack_data, &version, &log).await })
 }
 
 #[derive(serde::Deserialize, Serialize, Clone, Copy, PartialEq)]
@@ -660,13 +696,57 @@ pub async fn modrinth_project_title(id: String) -> CmdResult<Option<String>> {
 pub struct PublishedTo {
     curseforge: bool,
     modrinth: bool,
+    server_pack_missing: Option<publish::ServerPackUpload>,
+    modrinth_error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnfinishedRelease {
+    version: String,
+    display_name: Option<String>,
+    server_pack_missing: Option<publish::ServerPackUpload>,
+    /// The Modrinth pack packraven built but couldn't upload.
+    modrinth_missing: Option<String>,
+    modrinth_error: Option<String>,
+    pending: Vec<publish::PendingStep>,
+    /// Whether the mods changed since the release shipped, so tagging it now would record a different mod list.
+    pack_changed: bool,
+}
+
+// Reads only releases.json and the builds folder, so Publish can call it on every visit without waiting on CurseForge.
+#[tauri::command(async)]
+pub fn unfinished_releases(state: State<'_, AppState>) -> Vec<UnfinishedRelease> {
+    let pack_data = state.pack_data();
+    let pack = state.pack().ok();
+    publish::load_releases(&pack_data.join("releases.json")).into_iter().rev().filter_map(|release| unfinished(pack.as_ref(), &pack_data, release)).collect()
+}
+
+fn unfinished(pack: Option<&Pack>, pack_data: &std::path::Path, release: publish::Release) -> Option<UnfinishedRelease> {
+    let server_pack_missing = publish::awaiting_server_pack(pack, pack_data, &release);
+    let modrinth_missing = pack.and_then(|pack| publish::awaiting_modrinth(pack, pack_data, &release)).and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned()));
+    (server_pack_missing.is_some() || modrinth_missing.is_some() || !release.pending.is_empty()).then(|| UnfinishedRelease {
+        pack_changed: pack.is_some_and(|pack| publish::changed_since(pack, &release)),
+        version: release.version,
+        display_name: release.display_name,
+        modrinth_error: release.modrinth_error.filter(|_| modrinth_missing.is_some()),
+        server_pack_missing,
+        modrinth_missing,
+        pending: release.pending,
+    })
 }
 
 #[tauri::command]
 pub fn published_to(state: State<'_, AppState>, version: String) -> Option<PublishedTo> {
-    let releases = publish::load_releases(&state.pack_data().join("releases.json"));
+    let pack_data = state.pack_data();
+    let releases = publish::load_releases(&pack_data.join("releases.json"));
     let release = releases.iter().find(|r| r.version == version)?;
-    Some(PublishedTo { curseforge: release.curseforge.is_some(), modrinth: release.modrinth.is_some() })
+    Some(PublishedTo {
+        curseforge: release.curseforge.is_some(),
+        modrinth: release.modrinth.is_some(),
+        server_pack_missing: publish::awaiting_server_pack(state.pack().ok().as_ref(), &pack_data, release),
+        modrinth_error: release.modrinth.is_none().then(|| release.modrinth_error.clone()).flatten(),
+    })
 }
 
 async fn classify_cached(cache_path: &std::path::Path, pack: &Pack) -> Result<Vec<ModSide>> {
@@ -832,6 +912,7 @@ pub struct ReleaseStatus {
     modrinth: Option<ModrinthStatus>,
     /// The Modrinth pack packraven would upload, when the pack is on Modrinth but this release isn't yet.
     modrinth_missing: Option<String>,
+    server_pack_missing: Option<publish::ServerPackUpload>,
 }
 
 #[derive(Serialize)]
@@ -861,18 +942,35 @@ pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus
     let mut result = Vec::new();
     let pack = state.pack().ok();
     let pack_data = state.pack_data();
-    for release in publish::load_releases(&state.pack_data().join("releases.json")).into_iter().rev() {
+    let releases_path = pack_data.join("releases.json");
+    let mut releases = publish::load_releases(&releases_path);
+    let mut adopted = false;
+    for release in releases.iter_mut().rev() {
         let curseforge = match &release.curseforge {
             Some(published) => {
                 let file = curseforge::file(published.project_id, published.file_id).await.ok().flatten();
-                let server = curseforge::file(published.project_id, published.server_file_id).await.ok().flatten();
+                let linked_server = file.as_ref().and_then(|f| f.server_pack_file_id);
+                // A server pack you uploaded yourself shows up as the client pack's server pack once CurseForge makes the client pack public.
+                if let (None, Some(id)) = (published.server_file_id, linked_server) {
+                    publish::adopt_server_pack(release, id);
+                    adopted = true;
+                }
+                let published = release.curseforge.as_ref().expect("checked above");
+                let server = match published.server_file_id {
+                    Some(id) => curseforge::file(published.project_id, id).await.ok().flatten(),
+                    None => None,
+                };
                 let describe = |f: &Option<curseforge::CfFile>| f.as_ref().map(|f| curseforge::file_status_name(f.file_status).to_string()).unwrap_or_else(|| "Not public yet".into());
                 Some(CurseforgeStatus {
                     project_id: published.project_id,
                     file_id: published.file_id,
                     status: describe(&file),
-                    server_status: describe(&server),
-                    server_pack_linked: file.as_ref().and_then(|f| f.server_pack_file_id).map(|id| id == published.server_file_id),
+                    server_status: match (published.server_file_id, published.server_pack_uploaded_by_you) {
+                        (Some(_), _) => describe(&server),
+                        (None, true) => "Uploaded by you".into(),
+                        (None, false) => "Not uploaded".into(),
+                    },
+                    server_pack_linked: published.server_file_id.and_then(|server_id| linked_server.map(|id| id == server_id)),
                 })
             }
             None => None,
@@ -889,16 +987,20 @@ pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus
             None => None,
         };
         result.push(ReleaseStatus {
-            modrinth_missing: pack.as_ref().and_then(|pack| publish::awaiting_modrinth(pack, &pack_data, &release)).and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned())),
-            display_name: release.display_name,
-            release_type: release.release_type,
-            version: release.version,
-            published_at: release.published_at,
+            modrinth_missing: pack.as_ref().and_then(|pack| publish::awaiting_modrinth(pack, &pack_data, release)).and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned())),
+            server_pack_missing: publish::awaiting_server_pack(pack.as_ref(), &pack_data, release),
+            display_name: release.display_name.clone(),
+            release_type: release.release_type.clone(),
+            version: release.version.clone(),
+            published_at: release.published_at.clone(),
             announce: release.announce,
-            announced_at: release.announced_at,
+            announced_at: release.announced_at.clone(),
             curseforge,
             modrinth,
         });
+    }
+    if adopted {
+        publish::save_releases(&releases_path, &releases).map_err(err)?;
     }
     Ok(result)
 }

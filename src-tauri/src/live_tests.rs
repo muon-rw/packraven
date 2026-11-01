@@ -74,6 +74,9 @@ async fn classify_sides() {
     }
     let both = result.iter().filter(|m| m.side == Side::Both).count();
     println!("total {}, both {both}", result.len());
+    // A table you can diff against another tool's exclusion list.
+    let table: String = result.iter().map(|m| format!("{}\t{}\t{}\t{}\n", m.path, serde_json::to_string(&m.side).unwrap().trim_matches('"'), m.name, m.reason)).collect();
+    std::fs::write(scratch().join("sides.tsv"), table).unwrap();
 }
 
 #[test]
@@ -479,4 +482,11 @@ async fn finds_curseforge_copies_of_modrinth_projects() {
     let found = crate::links::curseforge_counterparts(&["AANobbMI".into(), "u6dRKJwZ".into()]).await.unwrap();
     println!("{found:?}");
     assert_eq!(found.len(), 2);
+}
+
+#[test]
+#[ignore]
+fn read_mod_manifest() {
+    let jar = std::env::var("PACKRAVEN_JAR").expect("set PACKRAVEN_JAR to a mod jar");
+    println!("{:?}", crate::mod_manifest::read(Path::new(&jar)));
 }

@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0]
+## [0.4.0] - 2026-11-01
 
 ### Added
 - Tracking for publishing completion state. packraven will offer to finish mid-completion publishes if it detects something is missing. 
@@ -208,7 +208,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 - Mod updates skip jars Minecraft is currently holding open instead of stopping partway
 - Failed downloads will retry up to three times
 
-[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.3.4...HEAD
+[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/muon-rw/packraven/compare/v0.3.4...v0.4.0
 [0.3.4]: https://github.com/muon-rw/packraven/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/muon-rw/packraven/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/muon-rw/packraven/compare/v0.3.1...v0.3.2

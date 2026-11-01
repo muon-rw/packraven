@@ -302,21 +302,21 @@ pub async fn changelog(project_id: u64, file_id: u64) -> Result<String> {
 
 pub fn file_status_name(status: u32) -> &'static str {
     match status {
-        1 => "Processing",
         2 => "Changes required",
-        3 => "Under review",
+        3 | 9 | 11 => "Under review",
         4 => "Approved",
         5 => "Rejected",
         6 => "Malware detected",
         7 => "Deleted",
         8 => "Archived",
-        9 => "Testing",
         10 => "Released",
-        11 => "Ready for review",
         12 => "Deprecated",
-        13 => "Baking",
-        14 => "Awaiting publishing",
+        14 | 21 => "Approved, not released",
         15 => "Failed publishing",
+        18 => "Under manual review",
+        19 => "Scanning for malware",
+        // CurseForge's other pipeline stages (baking, cooking and so on) leave you nothing to do.
+        1 | 13 | 16 | 17 | 20 | 22 | 23 => "Processing",
         _ => "Unknown",
     }
 }
@@ -412,13 +412,64 @@ pub struct UploadTooLarge(pub u64);
 
 impl std::fmt::Display for UploadTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CurseForge's upload API turned down the {:.2} GB file as too large", self.0 as f64 / 1e9)
+        write!(f, "CurseForge turned down the {:.2} GB file as too large", self.0 as f64 / 1e9)
     }
 }
 
 impl std::error::Error for UploadTooLarge {}
 
 /// Returns the authors console page for uploading an additional file, like a server pack, to an existing file.
+/// What a CurseForge file's status means for you.
+#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub enum FileState {
+    Processing,
+    InReview,
+    /// Held for a moderator, which can take weeks.
+    ManualReview,
+    ChangesRequired,
+    Rejected,
+    MalwareDetected,
+    /// CurseForge's own publishing failed, so uploading it again is the fix.
+    FailedPublishing,
+    Deleted,
+    /// Archived or deprecated, which you chose.
+    Retired,
+    /// Approved, but marked for you to release by hand.
+    AwaitingRelease,
+    Approved,
+    Other,
+}
+
+impl FileState {
+    /// Returns whether the file waits on you rather than on CurseForge.
+    pub fn needs_you(self) -> bool {
+        matches!(self, Self::ManualReview | Self::ChangesRequired | Self::Rejected | Self::MalwareDetected | Self::FailedPublishing | Self::Deleted)
+    }
+}
+
+pub fn file_state(status: u32) -> FileState {
+    match status {
+        1 | 13 | 16 | 17 | 19 | 20 | 22 | 23 => FileState::Processing,
+        3 | 9 | 11 => FileState::InReview,
+        18 => FileState::ManualReview,
+        2 => FileState::ChangesRequired,
+        5 => FileState::Rejected,
+        6 => FileState::MalwareDetected,
+        15 => FileState::FailedPublishing,
+        7 => FileState::Deleted,
+        8 | 12 => FileState::Retired,
+        14 | 21 => FileState::AwaitingRelease,
+        4 | 10 => FileState::Approved,
+        _ => FileState::Other,
+    }
+}
+
+/// Returns the file's page in CurseForge's author dashboard, where you can delete it.
+pub fn file_page(project_id: u64, file_id: u64) -> String {
+    format!("https://authors.curseforge.com/#/projects/{project_id}/files/{file_id}")
+}
+
 pub fn additional_file_page(project_id: u64, parent_file_id: u64) -> String {
     format!("https://authors.curseforge.com/#/projects/{project_id}/files/{parent_file_id}/create-additional-file")
 }
@@ -426,6 +477,17 @@ pub fn additional_file_page(project_id: u64, parent_file_id: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{check_upload_size, UPLOAD_LIMIT};
+
+    #[test]
+    fn every_documented_file_status_has_a_name_and_a_meaning() {
+        use super::{file_state, file_status_name, FileState};
+        for status in 1..=23 {
+            assert_ne!(file_status_name(status), "Unknown", "status {status}");
+            assert!(file_state(status) != FileState::Other, "status {status}");
+        }
+        assert_eq!(file_state(18), FileState::ManualReview);
+        assert_eq!(file_status_name(16), "Processing");
+    }
 
     #[test]
     fn stops_only_files_over_the_upload_limit() {

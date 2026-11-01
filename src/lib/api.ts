@@ -323,6 +323,21 @@ export interface ModSide {
   requiredBy: string[]
 }
 
+export type FileState =
+  | 'processing'
+  | 'inReview'
+  | 'manualReview'
+  | 'changesRequired'
+  | 'rejected'
+  | 'malwareDetected'
+  | 'failedPublishing'
+  | 'deleted'
+  | 'retired'
+  | 'awaitingRelease'
+  | 'approved'
+  | 'other'
+export type PackFile = 'client' | 'server'
+
 export interface ReleaseStatus {
   version: string
   publishedAt: string
@@ -330,11 +345,30 @@ export interface ReleaseStatus {
   announcedAt: string | null
   displayName: string | null
   releaseType: string | null
-  curseforge: { projectId: number; fileId: number; status: string; serverStatus: string; serverPackLinked: boolean | null } | null
+  curseforge: {
+    projectId: number
+    fileId: number
+    status: string
+    serverStatus: string
+    serverPackLinked: boolean | null
+    // What each file's status means for you; null when CurseForge returned no file.
+    state: FileState | null
+    serverState: FileState | null
+    // When each file went up to CurseForge.
+    uploaded: string | null
+    serverUploaded: string | null
+    // Each file's page in CurseForge's author dashboard, where you read its review and can delete it.
+    page: string
+    serverPage: string | null
+  } | null
   modrinth: { status: string; url: string } | null
   // The Modrinth pack packraven would upload, when the pack is on Modrinth but this release isn't yet.
   modrinthMissing: string | null
   serverPackMissing: ServerPackUpload | null
+  // Whether the mods changed since the release shipped, so a server pack built now wouldn't match it.
+  packChanged: boolean
+  // Whether packraven still has the client pack it published, which replacing the client pack reuses.
+  clientZipPresent: boolean
 }
 
 // What you need to upload a release's server pack yourself, after packraven's upload failed.
@@ -751,6 +785,8 @@ export const api = {
   uploadReleaseServerPack: (version: string) => invoke<void>('upload_release_server_pack', { version }),
   finishRelease: (version: string) => invoke<void>('finish_release', { version }),
   markServerPackUploaded: (version: string) => invoke<void>('mark_server_pack_uploaded', { version }),
+  replaceCurseforgeFile: (version: string, file: PackFile) => invoke<void>('replace_curseforge_file', { version, file }),
+  releaseAttention: (version: string) => invoke<{ file: PackFile; state: FileState } | null>('release_attention', { version }),
   setOverrideChoice: (platform: Platform, paths: string[], choice: OverrideChoice | null) => invoke<void>('set_override_choice', { platform, paths, choice }),
   overrideChoices: (platform: Platform) => invoke<OverrideChoices>('override_choices', { platform }),
   lookUpOverrideCandidates: () => invoke<void>('look_up_override_candidates'),

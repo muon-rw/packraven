@@ -18,6 +18,10 @@ pub struct MetadataCache {
     skews: HashMap<String, CheckedSkew>,
     #[serde(default)]
     manifests: HashMap<String, ReadManifest>,
+    // Reading every jar's metadata is the slow part of classifying, so callers that otherwise only read the
+    // cache save it when we've read new jars.
+    #[serde(skip)]
+    read_new_manifests: bool,
 }
 
 // Bump this when mod_manifest reads something an older read didn't, so we read every jar again.
@@ -119,6 +123,11 @@ impl MetadataCache {
         std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
     }
 
+    /// Returns whether we read jars the cache didn't know yet, so it's worth saving.
+    pub fn read_new_manifests(&self) -> bool {
+        self.read_new_manifests
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -193,6 +202,7 @@ impl MetadataCache {
         }
         let Ok(manifest) = mod_manifest::read(&pack_dir.join(&entry.path)) else { return ModManifest::default() };
         self.manifests.insert(entry.sha1.clone(), ReadManifest { format: MANIFEST_FORMAT, manifest: manifest.clone() });
+        self.read_new_manifests = true;
         manifest
     }
 

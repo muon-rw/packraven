@@ -30,9 +30,12 @@ const INSTALL_BAT: &str = include_str!("scripts/install.bat");
 const INSTALL_SH: &str = include_str!("scripts/install.sh");
 const DOWNLOAD_BAT: &str = include_str!("scripts/download.bat");
 const DOWNLOAD_SH: &str = include_str!("scripts/download.sh");
-const DOWNLOADER_JAR: &[u8] = include_bytes!("scripts/downloader/packraven-downloader.jar");
-const DOWNLOADER: &str = "packraven-downloader.jar";
-const DOWNLOAD_LIST: &str = "packraven-downloads.txt";
+const DOWNLOADER_PS1: &str = include_str!("scripts/downloader/packraven-download.ps1");
+const DOWNLOADER_SH: &str = include_str!("scripts/downloader/packraven-download.sh");
+// Release server packs keep the files only our run scripts use in here, so the server's folder holds
+// just what you'd open yourself.
+const PACKRAVEN_DIR: &str = "packraven";
+const DOWNLOAD_LIST: &str = "packraven/downloads.txt";
 
 /// How a server pack gets the mod files packraven can download from CurseForge or Modrinth.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -514,8 +517,11 @@ pub async fn test_server_plan(pack: &Pack, sides: &[ModSide], version: &str, jav
 // loader's installer (or Fabric's server launcher) instead, and that downloads it from Mojang on first start.
 async fn release_server_plan(pack: &Pack, sides: &[ModSide], version: &str, mods: ServerMods, data_dir: &Path, log: &Log) -> Result<FilePlan> {
     let mut plan = pack_server_files(pack, sides, version, mods, log).await?;
+    plan.insert("README.txt".into(), Planned::Write(server_readme(pack, version, mods)?));
     if mods == ServerMods::DownloadedOnStart {
-        plan.insert(DOWNLOADER.into(), Planned::Copy(downloader_jar(data_dir)?));
+        for (name, script) in downloader_scripts() {
+            plan.insert(name.into(), Planned::Write(script));
+        }
     }
     let loader = pack.lock.mod_loader()?;
     let folder = data_dir.join(loader.name().to_lowercase());
@@ -523,7 +529,7 @@ async fn release_server_plan(pack: &Pack, sides: &[ModSide], version: &str, mods
         Some(url) => {
             let name = url_file_name(&url);
             let installer = download_once(&url, &folder.join(name), &format!("the {} installer", loader.name()), log).await?;
-            plan.insert(name.to_string(), Planned::Copy(installer));
+            plan.insert(format!("{PACKRAVEN_DIR}/{name}"), Planned::Copy(installer));
         }
         None => {
             plan.insert(FABRIC_LAUNCHER.into(), Planned::Copy(fabric_server_launcher(pack, &folder, log).await?));
@@ -532,17 +538,14 @@ async fn release_server_plan(pack: &Pack, sides: &[ModSide], version: &str, mods
     Ok(plan)
 }
 
-fn downloader_jar(data_dir: &Path) -> Result<PathBuf> {
-    let path = data_dir.join(DOWNLOADER);
-    if std::fs::read(&path).ok().as_deref() != Some(DOWNLOADER_JAR) {
-        std::fs::create_dir_all(data_dir)?;
-        std::fs::write(&path, DOWNLOADER_JAR)?;
-    }
-    Ok(path)
+// CurseForge flags unknown jars in an upload for manual review, so we download mods with scripts rather
+// than a jar of our own. A checkout on Windows may give them CRLF endings, which sh can't run.
+fn downloader_scripts() -> [(&'static str, String); 2] {
+    let lf = |script: &str| script.replace("\r\n", "\n");
+    [("packraven/download.ps1", lf(DOWNLOADER_PS1).replace('\n', "\r\n")), ("packraven/download.sh", lf(DOWNLOADER_SH))]
 }
 
-// Our downloader runs on whatever Java the server has, so we hand it URLs exactly as they go on the
-// wire. edge.forgecdn.net only redirects to mediafilez.forgecdn.net, which serves every file without
+// The downloader scripts hand URLs to curl, wget or PowerShell exactly as they go on the wire. edge.forgecdn.net only redirects to mediafilez.forgecdn.net, which serves every file without
 // an API key, even when the author turned off third-party distribution.
 fn server_download_url(entry: &LockEntry) -> Option<String> {
     let mut url = reqwest::Url::parse(entry.download_url()?).ok()?;
@@ -612,7 +615,29 @@ fn install_step(pack: &Pack, windows: bool) -> Result<String> {
     let launch = loader_launch(pack, windows)?;
     let launched = launched_file(&launch);
     let (template, launched) = if windows { (INSTALL_BAT, launched.replace('/', "\\")) } else { (INSTALL_SH, launched.to_string()) };
-    Ok(template.replace("{{LOADER}}", loader.name()).replace("{{INSTALLER}}", url_file_name(&url)).replace("{{LAUNCHED}}", &launched))
+    let installer = format!("{PACKRAVEN_DIR}{}{}", if windows { "\\" } else { "/" }, url_file_name(&url));
+    Ok(template.replace("{{LOADER}}", loader.name()).replace("{{INSTALLER}}", &installer).replace("{{LAUNCHED}}", &launched))
+}
+
+fn server_readme(pack: &Pack, version: &str, mods: ServerMods) -> Result<String> {
+    let loader = pack.lock.mod_loader()?;
+    let has_folder = mods == ServerMods::DownloadedOnStart || forge_installer_url(pack.lock.minecraft()?, &loader).is_some();
+    let folder = if has_folder { "The packraven folder holds the files the run scripts use to set up the server.\r\n" } else { "" };
+    let loader = loader.name();
+    let first_start = match mods {
+        ServerMods::DownloadedOnStart => format!("The first start downloads the pack's mods and installs {loader} and Minecraft"),
+        ServerMods::Bundled => format!("The first start installs {loader} and Minecraft"),
+    };
+    Ok(format!(
+        "{} {version} server\r\n\r\n\
+         Start the server with run.bat on Windows, or run.sh on Linux and macOS.\r\n\
+         {first_start}, which can take a few minutes. Later starts skip that.\r\n\r\n\
+         - Memory and other Java options: user_jvm_args.txt\r\n\
+         - Server settings: server.properties\r\n\
+         - To run the server on a Java you choose, write the path to its java executable in java.txt.\r\n\r\n\
+         {folder}",
+        pack.name()
+    ))
 }
 
 const DEFAULT_MOTD: &str = "{name} {version}";
@@ -936,7 +961,8 @@ mod tests {
         let pack = loader_pack("1.21.1", "neoforge-21.1.259");
         let bat = install_step(&pack, true).unwrap();
         assert!(bat.contains(r#"if exist "libraries\net\neoforged\neoforge\21.1.259\win_args.txt" goto run"#), "{bat}");
-        assert!(bat.contains(r#""%JAVA%" -jar "neoforge-21.1.259-installer.jar" --installServer .install"#), "{bat}");
+        assert!(bat.contains(r#""%JAVA%" -jar "packraven\neoforge-21.1.259-installer.jar" --installServer .install"#), "{bat}");
+        assert!(install_step(&pack, false).unwrap().contains(r#""$JAVA" -jar "packraven/neoforge-21.1.259-installer.jar""#));
         let sh = install_step(&pack, false).unwrap();
         assert!(sh.contains(r#"if [ ! -f "libraries/net/neoforged/neoforge/21.1.259/unix_args.txt" ]"#), "{sh}");
         let script = start_script(RUN_SH, "", &sh, &loader_launch(&pack, false).unwrap(), None, "");
@@ -948,7 +974,7 @@ mod tests {
         let pack = loader_pack("1.21.1", "neoforge-21.1.259");
         for (template, download, windows) in [(RUN_BAT, DOWNLOAD_BAT, true), (RUN_SH, DOWNLOAD_SH, false)] {
             let script = start_script(template, download, &install_step(&pack, windows).unwrap(), &loader_launch(&pack, windows).unwrap(), None, "");
-            let downloads = script.find(DOWNLOADER).expect(&script);
+            let downloads = script.find("download.ps1").or(script.find("download.sh")).expect(&script);
             assert!(downloads < script.find("--installServer").unwrap(), "{script}");
         }
     }
@@ -965,12 +991,10 @@ mod tests {
     }
 
     #[test]
-    fn downloader_jar_is_built_from_the_current_source() {
-        let mut jar = zip::ZipArchive::new(std::io::Cursor::new(DOWNLOADER_JAR)).unwrap();
-        let mut shipped = String::new();
-        std::io::Read::read_to_string(&mut jar.by_name("PackravenDownloader.java").unwrap(), &mut shipped).unwrap();
-        let source = include_str!("scripts/downloader/PackravenDownloader.java");
-        assert!(shipped.replace("\r\n", "\n") == source.replace("\r\n", "\n"), "the downloader jar is stale; run npm run build:downloader");
+    fn downloader_scripts_keep_their_platforms_line_endings() {
+        let [(_, ps1), (_, sh)] = downloader_scripts();
+        assert!(!sh.contains('\r') && sh.starts_with("#!/usr/bin/env sh\n"));
+        assert_eq!(ps1.matches('\n').count(), ps1.matches("\r\n").count());
     }
 
     #[test]

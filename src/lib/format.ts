@@ -1,3 +1,4 @@
+import type { FileState, PackFile } from './api'
 import { isolateHistory } from '@codemirror/commands'
 import type { ChangeSpec } from '@codemirror/state'
 import type { EditorView } from '@codemirror/view'
@@ -501,4 +502,25 @@ function matchLines(a: string[], b: string[]): [number, number][] {
 // Mirrors publish::release_tag: a version like v4.1.5 is its own tag, and the rest get a v.
 export function releaseTag(version: string): string {
   return /^v\d/.test(version) ? version : `v${version}`
+}
+
+/** Returns what's wrong with a CurseForge file that waits on you, or null when it waits on CurseForge or nothing. */
+export function curseforgeProblem(state: FileState | null, version: string, file: PackFile): string | null {
+  const pack = `the ${version} ${file} pack`
+  switch (state) {
+    case 'manualReview':
+      return `CurseForge is holding ${pack} for a moderator`
+    case 'changesRequired':
+      return `CurseForge asks for changes to ${pack}`
+    case 'rejected':
+      return `CurseForge rejected ${pack}`
+    case 'malwareDetected':
+      return `CurseForge flagged ${pack} as malware`
+    case 'failedPublishing':
+      return `CurseForge couldn't publish ${pack}`
+    case 'deleted':
+      return `The ${version} ${file} pack is gone from CurseForge`
+    default:
+      return null
+  }
 }

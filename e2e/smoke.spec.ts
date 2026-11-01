@@ -1036,3 +1036,61 @@ test('a server pack you uploaded yourself stops being offered for upload', async
   await expect(notice.getByRole('list', { name: /^Left to do for/ })).not.toContainText('server pack')
   await expect(notice.getByRole('heading', { name: /we didn't finish publishing it/ })).toBeFocused()
 })
+
+test('a server pack held for a moderator can be waited out, or replaced once it is gone', async ({ page }) => {
+  await openApp(page, 'releases', 'ready')
+  const notice = page.getByRole('region', { name: /holding the 0\.1\.1 server pack for a moderator/ })
+  await expect(notice).toContainText('Moderators can take weeks')
+  // Uploading waits until CurseForge no longer has the held file.
+  await notice.getByRole('button', { name: /^Check that it's gone/ }).click()
+  await expect(notice.getByRole('alert')).toContainText('CurseForge still has the server pack')
+  await expect(notice.getByRole('button', { name: /^Upload a new/ })).toHaveCount(0)
+
+  await notice.getByRole('button', { name: /^Keep waiting/ }).click()
+  await expect(notice).toHaveCount(0)
+  await page.reload()
+  await expect(page.getByText('Waiting for a moderator to review the 0.1.1 server pack.')).toBeVisible()
+  await page.getByRole('button', { name: /^Show options/ }).click()
+  await expect(page.getByRole('region', { name: /holding the 0\.1\.1 server pack/ })).toBeVisible()
+})
+
+test('a server pack gone from CurseForge can be uploaded again from Releases', async ({ page }) => {
+  const dialogs: string[] = []
+  page.on('dialog', (dialog) => {
+    dialogs.push(dialog.message())
+    dialog.accept()
+  })
+  await page.goto('/?view=releases&scenario=ready&serverdeleted')
+  const notice = page.getByRole('region', { name: /0\.1\.1 server pack is gone from CurseForge/ })
+  await notice.getByRole('button', { name: /^Upload a new server pack/ }).click()
+  await expect(page.getByText('Uploaded a new 0.1.1 server pack. CurseForge reviews it again.')).toBeVisible()
+  await expect(page.locator('.replaced')).toBeFocused()
+  await expect(notice).toHaveCount(0)
+  expect(dialogs[0]).toContain('Build a new server pack from the pack as it is now')
+  expect(dialogs[0]).not.toContain('Delete')
+})
+
+test('a client pack held for a moderator covers its server pack', async ({ page }) => {
+  await page.goto('/?view=releases&scenario=ready&clientheld')
+  const notice = page.getByRole('region', { name: /holding the 0\.1\.1 client pack for a moderator/ })
+  await expect(notice).toContainText('Its server pack goes with it.')
+  // Replacing the client pack replaces the server pack too, so it gets no notice of its own.
+  await expect(page.getByRole('region', { name: /server pack/ })).toHaveCount(0)
+  await expect(notice.getByRole('button', { name: /^Check that it's gone/ })).toBeVisible()
+})
+
+test("Publish points at Releases when a released version's file waits on you", async ({ page }) => {
+  await page.goto('/?view=publish&scenario=dirty&firstheld')
+  const checks = page.locator('#publish-checks')
+  await expect(checks).toContainText('You already released 0.1.0')
+  await expect(checks).toContainText('CurseForge is holding the 0.1.0 server pack for a moderator.')
+  await checks.getByRole('button', { name: 'See it in Releases' }).click()
+  await expect(page.getByRole('heading', { level: 2, name: 'Releases' })).toBeVisible()
+})
+
+test('Publish adds no note when the released version is fine on CurseForge', async ({ page }) => {
+  await openApp(page, 'publish', 'dirty')
+  const checks = page.locator('#publish-checks')
+  await expect(checks).toContainText('You already released 0.1.0')
+  await expect(checks.getByRole('button', { name: 'See it in Releases' })).toHaveCount(0)
+})

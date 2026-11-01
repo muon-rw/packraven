@@ -114,7 +114,7 @@ async fn boots_with(mut command: Command) -> bool {
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     let started = tokio::time::timeout(Duration::from_secs(900), async {
         while let Some(line) = crate::process::read_line_lossy(&mut reader).await {
-            if line.contains("ERROR") || line.contains("Exception") || line.contains("Done (") || line.contains("GraalVM") || line.contains("Installing the") || line.contains("Starting the server") {
+            if line.contains("ERROR") || line.contains("Exception") || line.contains("Done (") || line.contains("Downloading") || line.contains("download") || line.contains("GraalVM") || line.contains("Installing the") || line.contains("Starting the server") {
                 println!("{line}");
             }
             if line.contains("Done (") {

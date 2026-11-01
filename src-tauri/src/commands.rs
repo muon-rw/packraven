@@ -448,6 +448,9 @@ pub fn publish_preflight(state: State<'_, AppState>, version: String) -> CmdResu
     let version = version.trim();
     let mut cache = MetadataCache::load(&state.cache_path());
     let warnings = publish::preflight_warnings(&pack, &mut cache);
+    if cache.read_new_manifests() {
+        let _ = cache.save(&state.cache_path());
+    }
     let allowlist = Allowlist::load(&state.allowlist_path());
     let decided = |platform| -> CmdResult<(Vec<OverrideFileView>, Vec<OverrideFileView>)> {
         if !pack.config.targets(platform) {
@@ -509,7 +512,14 @@ pub fn build_modrinth_export(app: AppHandle, state: State<'_, AppState>) -> CmdR
 pub fn upload_release_server_pack(app: AppHandle, state: State<'_, AppState>, version: String) -> CmdResult<()> {
     let pack = state.pack().map_err(err)?;
     let paths = release_paths(&state);
-    state.jobs.start(&app, "publish", move |log| async move { publish::upload_release_server_pack(&pack, &paths, &version, &log).await })
+    state.jobs.start(&app, "publish", move |log| async move { publish::upload_release_server_pack(&pack, &paths, &version, false, &log).await })
+}
+
+#[tauri::command]
+pub fn replace_curseforge_file(app: AppHandle, state: State<'_, AppState>, version: String, file: publish::PackFile) -> CmdResult<()> {
+    let pack = state.pack().map_err(err)?;
+    let paths = release_paths(&state);
+    state.jobs.start(&app, "publish", move |log| async move { publish::replace_curseforge_file(&pack, &paths, &version, file, &log).await })
 }
 
 #[tauri::command]
@@ -913,6 +923,10 @@ pub struct ReleaseStatus {
     /// The Modrinth pack packraven would upload, when the pack is on Modrinth but this release isn't yet.
     modrinth_missing: Option<String>,
     server_pack_missing: Option<publish::ServerPackUpload>,
+    /// Whether the mods changed since the release shipped, so a server pack built now wouldn't match it.
+    pack_changed: bool,
+    /// Whether packraven still has the client pack it published, which replacing the client pack reuses.
+    client_zip_present: bool,
 }
 
 #[derive(Serialize)]
@@ -923,6 +937,15 @@ pub struct CurseforgeStatus {
     status: String,
     server_status: String,
     server_pack_linked: Option<bool>,
+    /// What each file's status means for you; None when CurseForge returned no file.
+    state: Option<curseforge::FileState>,
+    server_state: Option<curseforge::FileState>,
+    /// When each file went up to CurseForge, so you can tell how long a review has taken.
+    uploaded: Option<String>,
+    server_uploaded: Option<String>,
+    /// Each file's page in CurseForge's author dashboard, where you read its review and can delete it.
+    page: String,
+    server_page: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -937,6 +960,44 @@ fn capitalized(text: &str) -> String {
     chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Attention {
+    file: &'static str,
+    state: curseforge::FileState,
+}
+
+/// Returns the first of a release's CurseForge files that waits on you, so Publish can point you at Releases.
+#[tauri::command]
+pub async fn release_attention(state: State<'_, AppState>, version: String) -> CmdResult<Option<Attention>> {
+    let Some(release) = publish::load_releases(&state.pack_data().join("releases.json")).into_iter().find(|r| r.version == version) else { return Ok(None) };
+    let Some(published) = release.curseforge else { return Ok(None) };
+    let recent = recently(published.last_upload.as_deref().unwrap_or(&release.published_at));
+    for (file, id) in [("client", Some(published.file_id)), ("server", published.server_file_id)] {
+        let Some(id) = id else { continue };
+        let (_, found) = describe_file(&curseforge::file(published.project_id, id).await, recent);
+        if let Some(found) = found.filter(|s| s.needs_you()) {
+            return Ok(Some(Attention { file, state: found }));
+        }
+    }
+    Ok(None)
+}
+
+// CurseForge's API answers for files under review too, so a missing file was deleted, unless it went
+// up minutes ago and CurseForge is still processing it. A failed lookup tells us nothing either way.
+fn describe_file(lookup: &Result<Option<curseforge::CfFile>>, recent: bool) -> (String, Option<curseforge::FileState>) {
+    match lookup {
+        Ok(Some(file)) => (curseforge::file_status_name(file.file_status).into(), Some(curseforge::file_state(file.file_status))),
+        Ok(None) if recent => ("Processing".into(), Some(curseforge::FileState::Processing)),
+        Ok(None) => ("Gone from CurseForge".into(), Some(curseforge::FileState::Deleted)),
+        Err(_) => ("Couldn't check".into(), None),
+    }
+}
+
+fn recently(timestamp: &str) -> bool {
+    chrono::DateTime::parse_from_rfc3339(timestamp).is_ok_and(|at| chrono::Utc::now().signed_duration_since(at) < chrono::Duration::minutes(15))
+}
+
 #[tauri::command]
 pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus>> {
     let mut result = Vec::new();
@@ -948,7 +1009,8 @@ pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus
     for release in releases.iter_mut().rev() {
         let curseforge = match &release.curseforge {
             Some(published) => {
-                let file = curseforge::file(published.project_id, published.file_id).await.ok().flatten();
+                let file_lookup = curseforge::file(published.project_id, published.file_id).await;
+                let file = file_lookup.as_ref().ok().cloned().flatten();
                 let linked_server = file.as_ref().and_then(|f| f.server_pack_file_id);
                 // A server pack you uploaded yourself shows up as the client pack's server pack once CurseForge makes the client pack public.
                 if let (None, Some(id)) = (published.server_file_id, linked_server) {
@@ -956,21 +1018,30 @@ pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus
                     adopted = true;
                 }
                 let published = release.curseforge.as_ref().expect("checked above");
-                let server = match published.server_file_id {
-                    Some(id) => curseforge::file(published.project_id, id).await.ok().flatten(),
+                let server_lookup = match published.server_file_id {
+                    Some(id) => Some(curseforge::file(published.project_id, id).await),
                     None => None,
                 };
-                let describe = |f: &Option<curseforge::CfFile>| f.as_ref().map(|f| curseforge::file_status_name(f.file_status).to_string()).unwrap_or_else(|| "Not public yet".into());
+                let recent = recently(published.last_upload.as_deref().unwrap_or(&release.published_at));
+                let (status, state) = describe_file(&file_lookup, recent);
+                let (server_status, server_state) = match (&server_lookup, published.server_pack_uploaded_by_you) {
+                    (Some(lookup), _) => describe_file(lookup, recent),
+                    (None, true) => ("Uploaded by you".into(), None),
+                    (None, false) => ("Not uploaded".into(), None),
+                };
+                let uploaded = |lookup: Option<&Result<Option<curseforge::CfFile>>>| lookup.and_then(|l| l.as_ref().ok()).and_then(Option::as_ref).map(|f| f.file_date.clone()).filter(|d| !d.is_empty());
                 Some(CurseforgeStatus {
                     project_id: published.project_id,
                     file_id: published.file_id,
-                    status: describe(&file),
-                    server_status: match (published.server_file_id, published.server_pack_uploaded_by_you) {
-                        (Some(_), _) => describe(&server),
-                        (None, true) => "Uploaded by you".into(),
-                        (None, false) => "Not uploaded".into(),
-                    },
+                    status,
+                    server_status,
                     server_pack_linked: published.server_file_id.and_then(|server_id| linked_server.map(|id| id == server_id)),
+                    state,
+                    server_state,
+                    uploaded: uploaded(Some(&file_lookup)),
+                    server_uploaded: uploaded(server_lookup.as_ref()),
+                    page: curseforge::file_page(published.project_id, published.file_id),
+                    server_page: published.server_file_id.map(|id| curseforge::file_page(published.project_id, id)),
                 })
             }
             None => None,
@@ -989,6 +1060,8 @@ pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus
         result.push(ReleaseStatus {
             modrinth_missing: pack.as_ref().and_then(|pack| publish::awaiting_modrinth(pack, &pack_data, release)).and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned())),
             server_pack_missing: publish::awaiting_server_pack(pack.as_ref(), &pack_data, release),
+            pack_changed: pack.as_ref().is_some_and(|pack| publish::changed_since(pack, release)),
+            client_zip_present: pack.as_ref().is_some_and(|pack| pack_data.join("builds").join(&release.version).join(pack.client_zip_name(&release.version)).exists()),
             display_name: release.display_name.clone(),
             release_type: release.release_type.clone(),
             version: release.version.clone(),

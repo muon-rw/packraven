@@ -64,6 +64,10 @@ pub struct CurseforgeRelease {
     /// then we know of no server file, but mustn't offer to upload it again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub server_pack_uploaded_by_you: bool,
+    /// When we last uploaded a file for this release, since CurseForge's API doesn't find a file for its
+    /// first few minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_upload: Option<String>,
 }
 
 impl CurseforgeRelease {
@@ -137,7 +141,7 @@ struct StoredRelease {
 impl From<StoredRelease> for Release {
     fn from(stored: StoredRelease) -> Self {
         let legacy = match (stored.project_id, stored.file_id) {
-            (Some(project_id), Some(file_id)) => Some(CurseforgeRelease { project_id, file_id, server_file_id: stored.server_file_id, unsent_server_pack: None, server_pack_uploaded_by_you: false }),
+            (Some(project_id), Some(file_id)) => Some(CurseforgeRelease { project_id, file_id, server_file_id: stored.server_file_id, unsent_server_pack: None, server_pack_uploaded_by_you: false, last_upload: None }),
             _ => None,
         };
         Self {
@@ -411,7 +415,7 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
         // We record the release the moment CurseForge has it, so a publish that stops later leaves a release to
         // finish rather than one we'd upload twice.
         let unsent = UnsentServerPack { names: server_names.clone(), error: STOPPED_EARLY.into(), too_large: false };
-        let mut curseforge = CurseforgeRelease { project_id: pack.config.curseforge.project_id, file_id, server_file_id: None, unsent_server_pack: Some(unsent), server_pack_uploaded_by_you: false };
+        let mut curseforge = CurseforgeRelease { project_id: pack.config.curseforge.project_id, file_id, server_file_id: None, unsent_server_pack: Some(unsent), server_pack_uploaded_by_you: false, last_upload: Some(chrono::Utc::now().to_rfc3339()) };
         release.curseforge = Some(curseforge.clone());
         record(&pack, &releases_path, &release, &notes, &baseline_path)?;
         if let Err(error) = upload_server_pack(&mut curseforge, &server_zip, server_names, &notes, &release_type, &log).await {
@@ -567,6 +571,7 @@ async fn upload_server_pack(curseforge: &mut CurseforgeRelease, zip: &Path, name
             log.info(format!("Uploaded the server pack as file {server_file_id}"));
             curseforge.server_file_id = Some(server_file_id);
             curseforge.unsent_server_pack = None;
+            curseforge.last_upload = Some(chrono::Utc::now().to_rfc3339());
             Ok(server_file_id)
         }
         Err(error) => {
@@ -602,7 +607,7 @@ fn server_zip(pack: &Pack, pack_data: &Path, version: &str) -> PathBuf {
 
 /// Uploads a release's server pack after the publish that built it couldn't. When the zip is gone or was too large
 /// to upload, we build it again from the pack as it is now.
-pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, version: &str, log: &Log) -> Result<String> {
+pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, version: &str, rebuild: bool, log: &Log) -> Result<String> {
     let releases_path = paths.pack_data.join("releases.json");
     let mut release = load_releases(&releases_path).into_iter().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"))?;
     let release_type = release.release_type.clone().unwrap_or_else(|| pack.config.curseforge.release_type.clone());
@@ -611,7 +616,7 @@ pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, versi
         bail!("{version} already has its server pack on CurseForge.");
     }
     let zip = server_zip(pack, &paths.pack_data, version);
-    if !zip.exists() || curseforge.unsent_server_pack.as_ref().is_some_and(|u| u.too_large) {
+    if rebuild || !zip.exists() || curseforge.unsent_server_pack.as_ref().is_some_and(|u| u.too_large) {
         log.info("Building the server pack again from the pack as it is now, with its mods downloaded on first start");
         let mut cache = MetadataCache::load(&paths.cache_path);
         let sides = sides::classify(pack, &mut cache).await?;
@@ -629,6 +634,61 @@ pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, versi
     Ok(format!("Uploaded the {version} server pack to CurseForge as file {}", uploaded?))
 }
 
+#[derive(Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum PackFile {
+    Client,
+    Server,
+}
+
+// A file CurseForge rejected or deleted is out of the way, but one it still holds would sit beside the
+// new upload, so we wait for you to delete it.
+async fn ensure_gone(project_id: u64, file_id: u64, what: &str) -> Result<()> {
+    if let Some(file) = curseforge::file(project_id, file_id).await?
+        && !matches!(
+            curseforge::file_state(file.file_status),
+            curseforge::FileState::Deleted | curseforge::FileState::Rejected | curseforge::FileState::MalwareDetected | curseforge::FileState::FailedPublishing
+        )
+    {
+        bail!("CurseForge still has the {what}. Delete it on CurseForge first, then try again.");
+    }
+    Ok(())
+}
+
+/// Uploads a release's client or server pack again, once CurseForge no longer has the old one. A new
+/// client pack also needs a new server pack, since CurseForge removes a file's additional files with it.
+pub async fn replace_curseforge_file(pack: &Pack, paths: &ReleasePaths, version: &str, which: PackFile, log: &Log) -> Result<String> {
+    let releases_path = paths.pack_data.join("releases.json");
+    let mut release = load_releases(&releases_path).into_iter().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"))?;
+    let display_name = release.display_name.clone().unwrap_or_else(|| default_client_names(pack).display_name.replace(VERSION_TOKEN, version));
+    let curseforge = release.curseforge.as_mut().with_context(|| format!("{version} isn't on CurseForge."))?;
+    let mut summary = Vec::new();
+    if which == PackFile::Client {
+        ensure_gone(curseforge.project_id, curseforge.file_id, "client pack").await?;
+        let out_dir = paths.pack_data.join("builds").join(version);
+        let mut zip = out_dir.join(pack.client_zip_name(version));
+        if !zip.exists() {
+            log.info("Building the client pack again from the pack as it is now");
+            zip = export::client_export(pack, &MetadataCache::load(&paths.cache_path), version, &out_dir, log)?;
+        }
+        curseforge::check_upload_size(&zip, "client pack")?;
+        let notes = std::fs::read_to_string(pack.dir.join(CHANGELOG_ARCHIVE).join(format!("{version}.md"))).unwrap_or_default();
+        let file_name = zip.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| pack.client_zip_name(version));
+        curseforge.file_id = upload_client_pack(pack, &zip, UploadNames { display_name, file_name }, &notes, log).await?;
+        curseforge.last_upload = Some(chrono::Utc::now().to_rfc3339());
+        summary.push(format!("Uploaded the {version} client pack to CurseForge as file {}", curseforge.file_id));
+    } else if let Some(old) = curseforge.server_file_id {
+        ensure_gone(curseforge.project_id, old, "server pack").await?;
+    }
+    log.info("CurseForge no longer has the old file");
+    curseforge.server_file_id = None;
+    curseforge.server_pack_uploaded_by_you = false;
+    // We save the new client file before the server pack goes up, so a failed server upload leaves it to retry.
+    save_release(&releases_path, &release)?;
+    summary.push(upload_release_server_pack(pack, paths, version, true, log).await?);
+    Ok(summary.join(". "))
+}
+
 pub struct ReleasePaths {
     pub data_dir: PathBuf,
     pub pack_data: PathBuf,
@@ -643,7 +703,7 @@ pub async fn finish_release(pack: &Pack, identity: &Identity, paths: &ReleasePat
     let release = find()?;
     let mut failures = Vec::new();
     if awaiting_server_pack(Some(pack), &paths.pack_data, &release).is_some()
-        && let Err(error) = upload_release_server_pack(pack, paths, version, log).await
+        && let Err(error) = upload_release_server_pack(pack, paths, version, false, log).await
     {
         failures.push(format!("The server pack upload failed: {error:#}."));
     }

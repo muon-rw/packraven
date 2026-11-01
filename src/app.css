@@ -430,8 +430,11 @@ kbd {
   color: var(--fail);
 }
 
-button.busy::before {
+/* The spinner busy buttons show, for status lines that aren't buttons. */
+button.busy::before,
+.spinner {
   content: '';
+  flex: none;
   display: inline-block;
   width: 0.8em;
   height: 0.8em;

@@ -1,1 +1,1 @@
-"$JAVA" -jar packraven-downloader.jar || exit 1
+sh ./packraven/download.sh || exit 1

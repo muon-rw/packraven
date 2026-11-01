@@ -12,7 +12,7 @@
   import OverrideDecisions from '../components/OverrideDecisions.svelte'
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
   import { nav } from '../lib/nav.svelte'
-  import { asReleaseType, releaseTag } from '../lib/format'
+  import { asReleaseType, curseforgeProblem, releaseTag } from '../lib/format'
 
   let {
     overview,
@@ -61,6 +61,8 @@
   let problems: string[] = $state([])
   let exportWarnings: string[] = $state([])
   let checking = $state(true)
+  // The first check fills in most of the view, so until it lands we say what's happening at the top.
+  let checkedOnce = $state(false)
   let config = $state<PackConfig | null>(null)
   let changelog = $state<string | null>(null)
   let changelogError: string | null = $state(null)
@@ -186,6 +188,7 @@
       api.publishPreflight(wanted).then(
         (result) => {
           if (!current) return
+          checkedOnce = true
           problems = result.problems
           exportWarnings = result.warnings
           tagTaken = result.tagTaken
@@ -196,7 +199,11 @@
           curseforgeShipped = result.curseforgeShipped
           curseforgeLeftOut = result.curseforgeLeftOut
         },
-        (e) => current && (problems = [`Couldn't run the pre-publish checks: ${errorText(e)}`]),
+        (e) => {
+          if (!current) return
+          checkedOnce = true
+          problems = [`Couldn't run the pre-publish checks: ${errorText(e)}`]
+        },
       ).finally(() => current && (checking = false))
     }, 300)
     return () => {
@@ -265,6 +272,25 @@
     ),
   )
   let tagTaken = $state(false)
+  // A released version's file that waits on you on CurseForge, which Releases can fix. We look it up after the
+  // checks load, and a slow or failed lookup just leaves the note out.
+  let attention = $state<{ version: string; text: string } | null>(null)
+  $effect(() => {
+    const version = trimmed
+    attention = null
+    if (!tagTaken || !version) return
+    let current = true
+    api.releaseAttention(version).then(
+      (found) => {
+        const text = found && curseforgeProblem(found.state, version, found.file)
+        if (current && text) attention = { version, text }
+      },
+      () => {},
+    )
+    return () => {
+      current = false
+    }
+  })
   let emptyNotes = $derived(changelog !== null && !changelog.trim())
   let warnings = $derived(
     [
@@ -427,6 +453,9 @@
     </div>
   </header>
 
+  {#if checking && !checkedOnce}
+    <p class="loading muted" role="status"><span class="spinner" aria-hidden="true"></span>Checking the pack before you publish</p>
+  {/if}
   {#if published && (publishJob.phase === 'done' || reported)}
     {@const tagged = `packraven tagged the release commit ${releaseTag(published.version)}${published.pushed ? ' and pushed it' : " but hasn't pushed it yet"}`}
     {#if landed === 'pending'}
@@ -550,24 +579,34 @@
   </section>
 
   <section class="step" aria-labelledby="checks-title" aria-busy={checking}>
-    <h3 id="checks-title">Checks</h3>
-    <ul class="checks" id="publish-checks">
+    <div class="checks-head">
+      <h3 id="checks-title">Checks</h3>
+      {#if checking}<span class="loading muted small" role="status"><span class="spinner" aria-hidden="true"></span>Checking</span>{/if}
+    </div>
+    <!-- We keep the last results in view while a recheck runs, dimmed so they don't read as current. -->
+    <ul class="checks" id="publish-checks" class:stale={checking && checkedOnce}>
       {#each blockers as problem (problem)}
         <li class="bad">
           <svg viewBox="0 0 16 16" role="img" aria-label="Blocks publishing"><path d="M4 4l8 8M12 4l-8 8" /></svg>
           <span><LinkedText text={problem} /></span>
         </li>
       {/each}
+      {#if attention && attention.version === trimmed}
+        <li class="warn">
+          <svg viewBox="0 0 16 16" role="img" aria-label="Warning"><path d="M8 3v6M8 12v1" /></svg>
+          <span>{attention.text}. <button class="link" onclick={onreleases}>See it in Releases</button></span>
+        </li>
+      {/if}
       {#each warnings as warning (warning)}
         <li class="warn">
           <svg viewBox="0 0 16 16" role="img" aria-label="Warning"><path d="M8 3v6M8 12v1" /></svg>
           {warning}
         </li>
       {/each}
-      {#if !blockers.length && !warnings.length}
+      {#if !blockers.length && !warnings.length && !checking}
         <li class="ok">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" /></svg>
-          {checking ? 'Checking' : 'Ready to publish'}
+          Ready to publish
         </li>
       {/if}
     </ul>
@@ -604,8 +643,12 @@
           <dd class="pack-names">
             <button type="button" class="summary" aria-expanded={open} aria-controls="{side}-rename" onclick={() => (renaming[side] = !open)}>
               <span class="resolved">
-                <span>{resolved.displayName}</span>
-                <span class="file muted">{resolved.fileName}</span>
+                {#if defaultNames}
+                  <span>{resolved.displayName}</span>
+                  <span class="file muted">{resolved.fileName}</span>
+                {:else}
+                  <span class="muted">Checking</span>
+                {/if}
               </span>
               <span class="rename"><Twisty {open} />Rename<span class="visually-hidden"> the {title.toLowerCase()}</span></span>
             </button>
@@ -680,8 +723,12 @@
           <dt>Modrinth pack</dt>
           <dd class="pack-names">
             <span class="resolved">
-              <span>{resolvedNames('client').displayName}</span>
-              <span class="file muted">{withVersion(modrinthFile)}</span>
+              {#if defaultNames}
+                <span>{resolvedNames('client').displayName}</span>
+                <span class="file muted">{withVersion(modrinthFile)}</span>
+              {:else}
+                <span class="muted">Checking</span>
+              {/if}
             </span>
             <span class="muted small">
               One shared file for clients and servers.
@@ -1105,6 +1152,23 @@
   .ships .link {
     margin-left: 8px;
     font-size: var(--step--1);
+  }
+
+  .loading {
+    display: flex;
+    align-items: center;
+    margin: 0;
+  }
+
+  .checks-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 12px;
+  }
+
+  .checks.stale {
+    opacity: 0.6;
   }
 
   .checks {

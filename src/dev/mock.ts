@@ -107,7 +107,7 @@ const config = {
 const modrinthRelease = (version: string) => ({ status: 'Listed', url: `https://modrinth.com/project/ravens-high-fantasy/version/${version}` })
 const zipStem = (version: string) => `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-${version}`
 // packraven rebuilds a server pack CurseForge turned down as too large before it tries again.
-const tooLarge = "CurseForge's upload API turned down the 1.29 GB file as too large"
+const tooLarge = "CurseForge turned down the 1.29 GB file as too large"
 const unsentServerPack = (version: string, fileId: number, error = tooLarge, packChanged = false): ServerPackUpload => ({
   zip: `C:/Users/you/AppData/Roaming/dev.muon.packraven/packs/ravens-high-fantasy/builds/${version}/${zipStem(version)}-server.zip`,
   uploadPage: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}/create-additional-file`,
@@ -121,14 +121,35 @@ const unsentServerPack = (version: string, fileId: number, error = tooLarge, pac
 })
 // Add `serverpackfails` to the URL to have a mock publish fail its server pack upload.
 const serverPackFails = new URLSearchParams(location.search).has('serverpackfails')
+// Add `clientheld` to have CurseForge hold the newest release's client pack for manual review.
+const clientHeld = new URLSearchParams(location.search).has('clientheld')
+// Add `serverdeleted` to have the newest release's server pack gone from CurseForge, as after you delete it.
+const serverDeleted = new URLSearchParams(location.search).has('serverdeleted')
+// Add `firstheld` to have CurseForge hold the first release's server pack for manual review.
+const firstHeld = new URLSearchParams(location.search).has('firstheld')
 // The newest release missed Modrinth and its server pack in the dirty scenario, so Releases offers to upload them.
 const releases: ReleaseStatus[] = scenario === 'empty' ? [] : [
   { version: '0.1.0', publishedAt: '2026-10-03T18:20:00Z', announce: true, announcedAt: '2026-10-03T19:02:00Z', displayName: `${pack.name} 0.1.0`, releaseType: 'beta', modrinth: modrinthRelease('0.1.0'), modrinthMissing: null, serverPackMissing: null,
-    curseforge: { projectId: 1234567, fileId: 7001001, status: 'Approved', serverStatus: 'Approved', serverPackLinked: true } },
+    curseforge: { projectId: 1234567, fileId: 7001001, status: 'Approved', serverStatus: 'Approved', serverPackLinked: true, state: 'approved', serverState: firstHeld ? 'manualReview' : 'approved', uploaded: '2026-10-03T18:20:00Z', serverUploaded: '2026-10-03T18:22:00Z', page: 'https://authors.curseforge.com/#/projects/1234567/files/7001001', serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7001002' }, packChanged: false, clientZipPresent: true },
   { version: fx.version === '0.1.0' ? '0.1.1' : fx.version, publishedAt: '2026-10-12T21:40:00Z', announce: true, announcedAt: null,
     displayName: `${pack.name} 0.1.1`, releaseType: 'beta', modrinth: scenario === 'dirty' ? null : modrinthRelease('0.1.1'), modrinthMissing: scenario === 'dirty' ? `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-0.1.1.mrpack` : null,
     serverPackMissing: scenario === 'dirty' ? unsentServerPack('0.1.1', 7105511, tooLarge, true) : null,
-    curseforge: { projectId: 1234567, fileId: 7105511, status: 'Under review', serverStatus: scenario === 'dirty' ? 'Not uploaded' : 'Under review', serverPackLinked: null } },
+    // In the ready scenario CurseForge holds its server pack for manual review, so Releases offers to replace it.
+    curseforge: {
+      projectId: 1234567,
+      fileId: 7105511,
+      status: clientHeld ? 'Under manual review' : 'Under review',
+      serverStatus: scenario === 'dirty' ? 'Not uploaded' : serverDeleted ? 'Gone from CurseForge' : 'Under manual review',
+      serverPackLinked: null,
+      state: clientHeld ? 'manualReview' : 'inReview',
+      serverState: scenario === 'dirty' ? null : serverDeleted ? 'deleted' : 'manualReview',
+      uploaded: '2026-10-12T21:40:00Z',
+      serverUploaded: scenario === 'dirty' ? null : '2026-10-12T21:43:00Z',
+      page: 'https://authors.curseforge.com/#/projects/1234567/files/7105511',
+      serverPage: scenario === 'dirty' ? null : 'https://authors.curseforge.com/#/projects/1234567/files/7105512',
+    },
+    packChanged: false,
+    clientZipPresent: true },
 ]
 
 // In the dirty scenario the newest release also stopped before its commit, tag and push, and the mods changed since.
@@ -1273,6 +1294,19 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
         pending: unfinishedSteps.get(r.version)?.pending ?? [],
         packChanged: unfinishedSteps.get(r.version)?.packChanged ?? false,
       })),
+  // Like the backend, the client pack's problem comes first.
+  release_attention: (a) => {
+    const curseforge = releases.find((r) => r.version === a.version)?.curseforge
+    const needsYou = (state: string | null) => !!state && ['manualReview', 'changesRequired', 'rejected', 'malwareDetected', 'failedPublishing', 'deleted'].includes(state)
+    if (!curseforge) return null
+    if (needsYou(curseforge.state)) return { file: 'client', state: curseforge.state }
+    return needsYou(curseforge.serverState) ? { file: 'server', state: curseforge.serverState } : null
+  },
+  replace_curseforge_file: (a) =>
+    mockJob('publish', ['CurseForge no longer has the old file', 'Building the server pack again', 'Uploaded the server pack as file 7300002'], `Uploaded the ${a.version} server pack to CurseForge as file 7300002`, () => {
+      const release = releases.find((r) => r.version === a.version)!
+      release.curseforge = { ...release.curseforge!, serverStatus: 'Processing', serverState: 'processing', serverUploaded: new Date().toISOString(), serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7300002' }
+    }),
   mark_server_pack_uploaded: (a) => {
     const release = releases.find((r) => r.version === a.version)!
     release.serverPackMissing = null
@@ -1310,7 +1344,9 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
           modrinth: config.modrinth.project_id ? modrinthRelease(version) : null,
           modrinthMissing: null,
           serverPackMissing: serverPackFails ? unsentServerPack(version, fileId, 'CurseForge rejected the upload (502 Bad Gateway)') : null,
-          curseforge: { projectId: 1234567, fileId, status: 'Not public yet', serverStatus: serverPackFails ? 'Not uploaded' : 'Not public yet', serverPackLinked: null },
+          curseforge: { projectId: 1234567, fileId, status: 'Not public yet', serverStatus: serverPackFails ? 'Not uploaded' : 'Not public yet', serverPackLinked: null, state: null, serverState: null, uploaded: null, serverUploaded: null, page: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}`, serverPage: null },
+          packChanged: false,
+          clientZipPresent: true,
         })
       },
     )

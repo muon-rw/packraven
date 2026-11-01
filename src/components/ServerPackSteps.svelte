@@ -187,8 +187,8 @@
     font-size: var(--step--1);
   }
 
-  /* Small text fits more characters into the global measure, so we narrow it to keep lines readable. */
+  /* ch is the width of a 0, wider than this font's average letter, so 52ch keeps small lines near 80 characters. */
   .measure {
-    max-width: 62ch;
+    max-width: 52ch;
   }
 </style>

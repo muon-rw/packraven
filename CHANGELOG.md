@@ -2,6 +2,20 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1]
+### Added
+- Releases now detects when an uploaded client or server pack needs attention on CurseForge, like a file held for manual review, rejected, or deleted, and offers to replace it. For files held for review, you can also choose to keep waiting.
+- Releases describes every CurseForge file status in plain words.
+- Publish now points you to Releases when a version you already released has a file that needs attention.
+- Server packs include a short README on how to start the server.
+
+### Changed
+- Server packs now download their mods with scripts instead of a jar, since CurseForge always flags unknown jars for manual review.
+- Moved files only packraven's run scripts use into a `packraven` subfolder, so a freshly unzipped serverpack only has the bare minimum files to prevent user confusion. 
+
+### Fixed
+- Publish's checks no longer take several seconds every time they run.
+
 ## [0.4.0] - 2026-11-01
 
 ### Added

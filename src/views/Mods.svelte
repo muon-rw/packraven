@@ -16,6 +16,7 @@
   import { job, onJobEnd, serverPack } from '../lib/jobs.svelte'
   import { availableUpdate, browse, cancelChange, cancelMenuLabel, changeFor, changeQueued, downloadingCount, dropChange, isLocked, modUpdates, newestOnChannel, point, projectKey, queuedButton, startChange, waitingOnModrinth } from '../lib/modUpdates.svelte'
   import { remoteTextHtml } from '../lib/markdown'
+  import { changedPart } from '../lib/fileNames'
   import type { MenuItem } from '../lib/menu'
   import { commandKey, shortcut, trashName } from '../lib/platform'
   import { paneFocus } from '../lib/panes.svelte'
@@ -459,19 +460,6 @@
 
   function list(names: string[]) {
     return names.length < 3 ? names.join(' and ') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
-  }
-
-  // Two files of one mod usually share a long name, so after the arrow we show only the part of
-  // the new name that differs, cut at a separator: Apotheosis-1.21.1-8.1.2.jar → 8.9.0.
-  function changedPart(from: string, to: string) {
-    let start = 0
-    while (start < from.length && from[start] === to[start]) start++
-    while (start > 0 && !/[-_+ ]/.test(to[start - 1])) start--
-    let end = 0
-    while (end < from.length - start && end < to.length - start && from[from.length - 1 - end] === to[to.length - 1 - end]) end++
-    while (end > 0 && !/[-_+ .]/.test(to[to.length - end])) end--
-    const part = to.slice(start, to.length - end).replace(/^[-_+ .]+|[-_+ .]+$/g, '')
-    return part.length >= 2 ? part : to
   }
 
   // Every file of a mod shares most of its name, so we show only the part that sets it apart.

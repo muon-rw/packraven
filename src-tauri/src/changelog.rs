@@ -156,6 +156,32 @@ pub async fn mod_diff(pack: &Pack, current: &Lockfile, cache: &mut MetadataCache
     Ok(diff)
 }
 
+const PART_START: &[char] = &['-', '_', '+', ' '];
+const PART_END: &[char] = &['-', '_', '+', ' ', '.'];
+
+// Two files of one mod usually share a long name, so we keep only the part of each that differs,
+// cut at a separator: Apotheosis-1.21.1-8.1.1.jar to Apotheosis-1.21.1-8.1.2.jar reads 8.1.1 to 8.1.2.
+// The Mods view trims names the same way (changedParts in src/lib/fileNames.ts).
+fn changed_parts(from: &str, to: &str) -> (String, String) {
+    let (old, new): (Vec<char>, Vec<char>) = (from.chars().collect(), to.chars().collect());
+    let mut start = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    while start > 0 && !PART_START.contains(&new[start - 1]) {
+        start -= 1;
+    }
+    let room = old.len().min(new.len()) - start;
+    let mut end = old.iter().rev().zip(new.iter().rev()).take(room).take_while(|(a, b)| a == b).count();
+    while end > 0 && !PART_END.contains(&new[new.len() - end]) {
+        end -= 1;
+    }
+    let part = |name: &[char]| name[start..name.len() - end].iter().collect::<String>().trim_matches(PART_END).to_string();
+    let (old_part, new_part) = (part(&old), part(&new));
+    if old_part.chars().count() >= 2 && new_part.chars().count() >= 2 {
+        (old_part, new_part)
+    } else {
+        (from.to_string(), to.to_string())
+    }
+}
+
 pub fn render(notes: &str, diff: &ModDiff) -> String {
     let mut out = notes.trim_end().to_string();
     let link = |c: &ModChange| match &c.url {
@@ -178,7 +204,8 @@ pub fn render(notes: &str, diff: &ModDiff) -> String {
     if !diff.updated.is_empty() {
         out.push_str("\n### Updated\n");
         for c in &diff.updated {
-            let _ = writeln!(out, "- {}: {} to {}", link(c), c.from.as_deref().unwrap_or("?"), c.to.as_deref().unwrap_or("?"));
+            let (from, to) = changed_parts(c.from.as_deref().unwrap_or("?"), c.to.as_deref().unwrap_or("?"));
+            let _ = writeln!(out, "- {}: {from} to {to}", link(c));
         }
     }
     if !diff.removed.is_empty() {
@@ -206,5 +233,22 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert_eq!(baseline.label, "Pack 1.2.0");
         assert_eq!(baseline.lock.files[0].curseforge, Some(CurseforgeFile { project_id: 10, file_id: 20, url: String::new() }));
+    }
+
+    #[test]
+    fn updated_mods_show_only_the_changed_part_of_each_name() {
+        assert_eq!(changed_parts("Apotheosis-1.21.1-8.1.1.jar", "Apotheosis-1.21.1-8.1.2.jar"), ("8.1.1".into(), "8.1.2".into()));
+        assert_eq!(changed_parts("sodium-neoforge-0.6.13.jar", "sodium-neoforge-0.6.15.jar"), ("0.6.13".into(), "0.6.15".into()));
+        assert_eq!(changed_parts("Mod-1.20.1-2.0.jar", "Mod-1.21.1-2.1.jar"), ("1.20.1-2.0".into(), "1.21.1-2.1".into()));
+        assert_eq!(changed_parts("Create 6.0.4", "Create 6.0.6"), ("6.0.4".into(), "6.0.6".into()));
+        assert_eq!(changed_parts("mod-1.jar", "mod-2.jar"), ("mod-1.jar".into(), "mod-2.jar".into()));
+        assert_eq!(changed_parts("Pokémon-1.0.jar", "Pokémon-1.1.jar"), ("1.0".into(), "1.1".into()));
+    }
+
+    #[test]
+    fn render_trims_updated_mod_names() {
+        let change = ModChange { name: "Apotheosis".into(), url: None, from: Some("Apotheosis-1.21.1-8.1.1.jar".into()), to: Some("Apotheosis-1.21.1-8.1.2.jar".into()), in_mod_list: true };
+        let diff = ModDiff { updated: vec![change], ..Default::default() };
+        assert_eq!(render("", &diff), "## Mod changes\n\n### Updated\n- Apotheosis: 8.1.1 to 8.1.2\n");
     }
 }

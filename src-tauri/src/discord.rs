@@ -10,6 +10,8 @@ use crate::pack::{DiscordConfig, Pack, CHANGELOG_ARCHIVE};
 use crate::publish::{self, Release};
 
 const DESCRIPTION_LIMIT: usize = 4000;
+const TITLE_LIMIT: usize = 256;
+const USERNAME_LIMIT: usize = 80;
 const DISCOHOOK_SHARE: &str = "https://discohook.app/api/v1/share";
 const APPROVED_STATUSES: [u32; 2] = [4, 10];
 
@@ -23,6 +25,7 @@ pub struct Announcement {
 }
 
 pub struct Project {
+    pub site: &'static str,
     pub name: Option<String>,
     pub url: String,
     pub logo: Option<String>,
@@ -63,13 +66,37 @@ fn discord_markdown(changelog: &str) -> String {
         .join("\n")
 }
 
-fn shorten(text: &str, file_url: &str, limit: usize) -> String {
-    if text.len() <= limit {
+// Discord doesn't document how it counts characters. UTF-16 units never undercount code points,
+// so measuring in them keeps us under the limit either way.
+fn discord_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+fn fitting_prefix(text: &str, limit: usize) -> &str {
+    let mut used = 0;
+    for (index, c) in text.char_indices() {
+        used += c.len_utf16();
+        if used > limit {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+fn clamp(text: &str, limit: usize) -> String {
+    if discord_len(text) <= limit {
         return text.to_string();
     }
-    let budget = limit.saturating_sub(120);
-    let cut = text[..text.floor_char_boundary(budget)].rfind('\n').unwrap_or(text.floor_char_boundary(budget));
-    format!("{}\n\n[Read the full changelog on CurseForge]({file_url})", text[..cut].trim_end())
+    format!("{}…", fitting_prefix(text, limit - 1).trim_end())
+}
+
+fn shorten(text: &str, link: &str, limit: usize) -> String {
+    if discord_len(text) <= limit {
+        return text.to_string();
+    }
+    let kept = fitting_prefix(text, limit.saturating_sub(discord_len(link) + 2));
+    let cut = kept.rfind('\n').unwrap_or(kept.len());
+    format!("{}\n\n{link}", text[..cut].trim_end())
 }
 
 fn color(hex: &str) -> u32 {
@@ -84,13 +111,17 @@ pub fn message(announcement: &Announcement, config: &DiscordConfig) -> Value {
     let body = if changelog.is_empty() {
         "A new version is out.".to_string()
     } else {
-        shorten(&changelog, &announcement.file_url, DESCRIPTION_LIMIT.saturating_sub(header.len() + footer.len() + 4))
+        let link = format!("[Read the full changelog on {}]({})", announcement.project.site, announcement.file_url);
+        shorten(&changelog, &link, DESCRIPTION_LIMIT.saturating_sub(discord_len(&header) + discord_len(&footer) + 4))
     };
-    let description = [header, body, footer].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n\n");
+    // A header and footer that fill the limit on their own leave the changelog no room, so as a last
+    // resort we cut the whole description rather than let Discord reject the post.
+    let description = clamp(&[header, body, footer].into_iter().filter(|part| !part.is_empty()).collect::<Vec<_>>().join("\n\n"), DESCRIPTION_LIMIT);
     let title = match announcement.fill(&config.title) {
         title if title.is_empty() => format!("{} {}", announcement.name, announcement.version),
         title => title,
     };
+    let title = clamp(&title, TITLE_LIMIT);
     let mut embed = json!({
         "title": title,
         "url": announcement.file_url,
@@ -106,7 +137,7 @@ pub fn message(announcement: &Announcement, config: &DiscordConfig) -> Value {
         embed["author"] = json!({ "name": author.name, "url": author.url, "icon_url": author.avatar_url });
     }
     json!({
-        "username": announcement.name,
+        "username": clamp(&announcement.name, USERNAME_LIMIT),
         "content": if role.is_empty() { String::new() } else { format!("<@&{role}>") },
         "allowed_mentions": { "parse": [], "roles": if role.is_empty() { vec![] } else { vec![role.to_string()] } },
         "embeds": [embed],
@@ -188,6 +219,7 @@ pub async fn pack_project(pack: &Pack) -> Project {
 async fn modrinth_project(id: &str) -> Project {
     let found = modrinth::project(id).await.ok().flatten();
     Project {
+        site: "Modrinth",
         name: found.as_ref().map(|p| p.title.clone()),
         url: found.as_ref().map_or_else(|| format!("https://modrinth.com/project/{id}"), modrinth::Project::url),
         logo: found.and_then(|p| p.icon_url),
@@ -197,12 +229,13 @@ async fn modrinth_project(id: &str) -> Project {
 
 pub async fn project(project_id: u64, preferred_author: &str) -> Project {
     if project_id == 0 {
-        return Project { name: None, url: "https://www.curseforge.com".into(), logo: None, author: None };
+        return Project { site: "CurseForge", name: None, url: "https://www.curseforge.com".into(), logo: None, author: None };
     }
     let found = curseforge::mods(&[project_id]).await.ok().and_then(|mut mods| mods.remove(&project_id));
     let authors = found.as_ref().map(|m| m.authors.clone()).unwrap_or_default();
     let author = authors.iter().find(|a| a.name.eq_ignore_ascii_case(preferred_author.trim())).or(authors.first()).cloned();
     Project {
+        site: "CurseForge",
         author,
         url: found
             .as_ref()
@@ -235,10 +268,29 @@ mod tests {
     #[test]
     fn headings_become_bold_and_long_text_links_out() {
         assert_eq!(discord_markdown("## Mod changes\n### Added\n- Foo"), "**Mod changes**\n**Added**\n- Foo");
-        let long = "- line\n".repeat(1000);
-        let short = shorten(&long, "https://example.com/files/1", DESCRIPTION_LIMIT);
-        assert!(short.len() <= DESCRIPTION_LIMIT);
-        assert!(short.ends_with("(https://example.com/files/1)"));
+        let long = "- línea 🎉\n".repeat(1000);
+        let link = "[Read the full changelog on Modrinth](https://example.com/files/1)";
+        let short = shorten(&long, link, DESCRIPTION_LIMIT);
+        assert!(discord_len(&short) <= DESCRIPTION_LIMIT);
+        assert!(short.ends_with(&format!("🎉\n\n{link}")));
+    }
+
+    #[test]
+    fn oversized_templates_and_names_stay_within_discord_limits() {
+        let announcement = Announcement {
+            name: "P".repeat(100),
+            version: "1.0".into(),
+            changelog: "- line\n".repeat(1000),
+            file_url: "https://cf/files/7".into(),
+            project: Project { site: "CurseForge", name: None, url: "https://cf".into(), logo: None, author: None },
+            game: String::new(),
+        };
+        let config = DiscordConfig { header: "é".repeat(5000), footer: "[Install]({file_url})".into(), title: "T".repeat(300), ..Default::default() };
+        let message = message(&announcement, &config);
+        let embed = &message["embeds"][0];
+        assert!(discord_len(embed["description"].as_str().unwrap()) <= DESCRIPTION_LIMIT);
+        assert_eq!(discord_len(embed["title"].as_str().unwrap()), TITLE_LIMIT);
+        assert_eq!(discord_len(message["username"].as_str().unwrap()), USERNAME_LIMIT);
     }
 
     #[test]
@@ -249,6 +301,7 @@ mod tests {
             changelog: "- Foo".into(),
             file_url: "https://cf/files/7".into(),
             project: Project {
+                site: "CurseForge",
                 name: Some("Pack CF".into()),
                 url: "https://cf".into(),
                 logo: Some("https://logo".into()),

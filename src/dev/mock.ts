@@ -2,6 +2,7 @@
 // We load data from src/dev/fixtures.json when present (gitignored; you generate it from a real instance),
 // and otherwise from the committed demo-fixtures.json, a snapshot of a real pack.
 import demoFixtures from './demo-fixtures.json'
+import { changedParts } from '../lib/fileNames'
 import type { PendingStep, Platform, ReleaseStatus, ServerPackUpload } from '../lib/api'
 
 // Add `?scenario=` to the URL to put the pack in one of the states we review the UI in.
@@ -252,7 +253,7 @@ function renderChangelog() {
   const link = (c: Change) => (c.url ? `[${c.name}](${c.url})` : c.name)
   const sections = [
     modDiff.added.length ? `\n### Added\n${modDiff.added.map((c) => `- ${link(c)}\n`).join('')}` : '',
-    modDiff.updated.length ? `\n### Updated\n${modDiff.updated.map((c) => `- ${link(c)}: ${c.from} to ${c.to}\n`).join('')}` : '',
+    modDiff.updated.length ? `\n### Updated\n${modDiff.updated.map((c) => `- ${link(c)}: ${changedParts(c.from ?? '?', c.to ?? '?').join(' to ')}\n`).join('')}` : '',
     modDiff.removed.length ? `\n### Removed\n${modDiff.removed.map((c) => `- ${link(c)}\n`).join('')}` : '',
   ].join('')
   if (!sections) return notes.trimEnd()

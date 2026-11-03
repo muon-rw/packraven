@@ -5,11 +5,13 @@
   import SaveBadge from '../components/SaveBadge.svelte'
   import { onDestroy, onMount } from 'svelte'
   import { ask } from '@tauri-apps/plugin-dialog'
-  import { api, errorText, type PackConfig, type PackJavaDefault, type RunArgs } from '../lib/api'
+  import { openUrl } from '@tauri-apps/plugin-opener'
+  import { api, errorText, type PackConfig, type PackJavaDefault, type RunArgs, type UpdateCheckerSetup } from '../lib/api'
+  import { repoName, UPDATE_TYPES, updateTypeEffect } from '../lib/format'
   import OverridePermissions from '../components/OverridePermissions.svelte'
   import { scanJava } from '../lib/java.svelte'
   import { trackSave } from '../lib/launch.svelte'
-  import { serverView } from '../lib/nav.svelte'
+  import { serverView, showInFiles } from '../lib/nav.svelte'
 
   let {
     dir,
@@ -67,6 +69,7 @@
       webhook = (await api.getWebhook()) ?? ''
       savedWebhook = webhook.trim()
       packJava = (await api.getPackJava()) ?? ''
+      updateChecker = await api.updateCheckerSetup().catch(() => null)
       savedPackJava = packJava.trim()
       configError = null
       await loadJavaDefault()
@@ -75,6 +78,20 @@
       savedConfig = null
       configError = errorText(error)
     }
+  }
+
+  let updateChecker = $state<UpdateCheckerSetup | null>(null)
+
+  function saveAddReleases() {
+    if (!config || !savedConfig || config.update_checker.add_releases === savedConfig.update_checker.add_releases) return
+    const next = config.update_checker.add_releases
+    saveConfigField('update-checker-add', (c) => (c.update_checker.add_releases = next))
+  }
+
+  function saveUpdateType() {
+    if (!config || !savedConfig || config.update_checker.update_type === savedConfig.update_checker.update_type) return
+    const next = config.update_checker.update_type
+    saveConfigField('update-checker-type', (c) => (c.update_checker.update_type = next))
   }
 
   async function loadJavaDefault() {
@@ -581,6 +598,50 @@
         </div>
         <p class="hint">packraven checks every few minutes while it's running in the tray. You can also announce a release by hand from Releases.</p>
       </section>
+
+      {#if updateChecker}
+        <section aria-labelledby="update-checker-title">
+          <h3 id="update-checker-title">Modpack Update Checker</h3>
+          {#if updateChecker.kind === 'github'}
+            {@const repo = updateChecker.repo}
+            <div class="hint checker-intro">
+              <p>
+                Players see new releases in game through
+                <a href={repo.page} onclick={(e) => { e.preventDefault(); openUrl(repo.page) }}>{repoName(repo)}</a>.
+                packraven adds each release there once every platform it's on has approved it.
+              </p>
+              <p>
+                packraven uses your <button type="button" class="link" onclick={onappsettings}>GitHub token from App settings</button>, which needs Contents: Read and write access to {repo.owner}/{repo.name}.
+              </p>
+            </div>
+            <div class="check-line">
+              <label class="check">
+                <input type="checkbox" bind:checked={config.update_checker.add_releases} onchange={saveAddReleases} /> Add new releases to the update checker
+              </label>
+              {@render badge('update-checker-add')}
+            </div>
+            {#if config.update_checker.add_releases}
+              <div class="field">
+                <div class="label-row">
+                  <label for="update-type">Update type</label>
+                  {@render badge('update-checker-type')}
+                </div>
+                <select id="update-type" bind:value={config.update_checker.update_type} onchange={saveUpdateType} aria-describedby="update-type-effect update-type-hint">
+                  {#each UPDATE_TYPES as { type, label } (type)}<option value={type}>{label}</option>{/each}
+                </select>
+                <span class="hint" id="update-type-effect">{updateTypeEffect(config.update_checker.update_type, updateChecker.forceCompatible)}</span>
+                <span class="hint" id="update-type-hint">Publish starts with this type for each release, and you can change it there.</span>
+              </div>
+            {:else}
+              <p class="hint">Publish leaves releases out of the update checker unless you pick an update type there.</p>
+            {/if}
+          {:else}
+            {@const configPath = updateChecker.configPath}
+            <p class="hint">{updateChecker.reason} Until then, add releases to the update checker yourself.</p>
+            <p><button type="button" class="link" onclick={() => showInFiles(configPath)}>Open the config in Files</button></p>
+          {/if}
+        </section>
+      {/if}
     </form>
 
     <OverridePermissions platform="curseforge" targeted={config.curseforge.project_id > 0} reloadKey={config.curseforge.project_id} {onchange} />
@@ -661,6 +722,12 @@
   .hint {
     color: var(--muted);
     font-size: var(--step--1);
+  }
+
+  .checker-intro {
+    display: grid;
+    gap: 4px;
+    max-width: 65ch;
   }
 
   .hint.failed {

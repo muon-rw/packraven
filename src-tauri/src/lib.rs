@@ -53,6 +53,7 @@ mod sides;
 mod system_commands;
 mod testrun;
 mod twins;
+mod update_checker;
 mod text_search;
 mod watcher;
 #[cfg(test)]
@@ -339,6 +340,9 @@ pub fn run() {
             discord_commands::announce_release,
             discord_commands::discohook_link,
             discord_commands::discohook_preview,
+            commands::update_checker_setup,
+            commands::update_checker_problem,
+            commands::add_to_update_checker,
         ])
         .build(tauri::generate_context!())
         .expect("error while building packraven")

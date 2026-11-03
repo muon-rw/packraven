@@ -3,7 +3,7 @@
 // and otherwise from the committed demo-fixtures.json, a snapshot of a real pack.
 import demoFixtures from './demo-fixtures.json'
 import { changedParts } from '../lib/fileNames'
-import type { PendingStep, Platform, ReleaseStatus, ServerPackUpload } from '../lib/api'
+import type { PendingStep, Platform, ReleaseStatus, ServerPackUpload, UpdateType } from '../lib/api'
 
 // Add `?scenario=` to the URL to put the pack in one of the states we review the UI in.
 const scenarios = {
@@ -103,6 +103,7 @@ const config = {
   test: { port: 25565, client_memory: '8G' },
   discord: { role_id: '112233445566778899', color: '#4d6b2f', announce_on_approval: true, title: '{project_name} - v{version}', show_author: true, header: '', footer: '[Install]({file_url})' },
   updates: { channel: 'alpha', locked: [] as string[] },
+  update_checker: { add_releases: true, update_type: 'minor_breaking' as UpdateType },
 }
 
 const modrinthRelease = (version: string) => ({ status: 'Listed', url: `https://modrinth.com/project/ravens-high-fantasy/version/${version}` })
@@ -131,7 +132,8 @@ const firstHeld = new URLSearchParams(location.search).has('firstheld')
 // The newest release missed Modrinth and its server pack in the dirty scenario, so Releases offers to upload them.
 const releases: ReleaseStatus[] = scenario === 'empty' ? [] : [
   { version: '0.1.0', publishedAt: '2026-10-03T18:20:00Z', announce: true, announcedAt: '2026-10-03T19:02:00Z', displayName: `${pack.name} 0.1.0`, releaseType: 'beta', modrinth: modrinthRelease('0.1.0'), modrinthMissing: null, serverPackMissing: null,
-    curseforge: { projectId: 1234567, fileId: 7001001, status: 'Approved', serverStatus: 'Approved', serverPackLinked: true, state: 'approved', serverState: firstHeld ? 'manualReview' : 'approved', uploaded: '2026-10-03T18:20:00Z', serverUploaded: '2026-10-03T18:22:00Z', page: 'https://authors.curseforge.com/#/projects/1234567/files/7001001', serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7001002' }, packChanged: false, clientZipPresent: true },
+    curseforge: { projectId: 1234567, fileId: 7001001, status: 'Approved', serverStatus: 'Approved', serverPackLinked: true, state: 'approved', serverState: firstHeld ? 'manualReview' : 'approved', uploaded: '2026-10-03T18:20:00Z', serverUploaded: '2026-10-03T18:22:00Z', page: 'https://authors.curseforge.com/#/projects/1234567/files/7001001', serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7001002' }, packChanged: false, clientZipPresent: true,
+    updateChecker: { updateType: 'minor_breaking', addedAt: '2026-10-03T19:02:00Z' } },
   { version: fx.version === '0.1.0' ? '0.1.1' : fx.version, publishedAt: '2026-10-12T21:40:00Z', announce: true, announcedAt: null,
     displayName: `${pack.name} 0.1.1`, releaseType: 'beta', modrinth: scenario === 'dirty' ? null : modrinthRelease('0.1.1'), modrinthMissing: scenario === 'dirty' ? `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-0.1.1.mrpack` : null,
     serverPackMissing: scenario === 'dirty' ? unsentServerPack('0.1.1', 7105511, tooLarge, true) : null,
@@ -150,7 +152,11 @@ const releases: ReleaseStatus[] = scenario === 'empty' ? [] : [
       serverPage: scenario === 'dirty' ? null : 'https://authors.curseforge.com/#/projects/1234567/files/7105512',
     },
     packChanged: false,
-    clientZipPresent: true },
+    clientZipPresent: true,
+    updateChecker:
+      scenario === 'dirty'
+        ? { updateType: 'minor_breaking', error: "Your GitHub token can't write to muon-rw/MPUC. Give it Contents: Read and write access to that repository." }
+        : { updateType: 'major' } },
 ]
 
 // In the dirty scenario the newest release also stopped before its commit, tag and push, and the mods changed since.
@@ -1348,9 +1354,25 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
           curseforge: { projectId: 1234567, fileId, status: 'Not public yet', serverStatus: serverPackFails ? 'Not uploaded' : 'Not public yet', serverPackLinked: null, state: null, serverState: null, uploaded: null, serverUploaded: null, page: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}`, serverPage: null },
           packChanged: false,
           clientZipPresent: true,
+          updateChecker: (a.options as { updateChecker: UpdateType | null }).updateChecker ? { updateType: (a.options as { updateChecker: UpdateType }).updateChecker } : null,
         })
       },
     )
+  },
+  // Add `nompuc` to the URL for a pack without Modpack Update Checker, or `mpucgitlab` for one packraven can't add releases to.
+  update_checker_setup: () =>
+    new URLSearchParams(location.search).has('nompuc')
+      ? null
+      : new URLSearchParams(location.search).has('mpucgitlab')
+        ? { kind: 'unsupported', reason: "packraven can only add releases to a GitHub repository. Set updateCheckerId in Modpack Update Checker's config to a https://raw.githubusercontent.com/ address to use one.", configPath: 'config/modpack-update-checker/config.json' }
+        : { kind: 'github', repo: { owner: 'muon-rw', name: 'MPUC', branch: 'main', folder: '', page: 'https://github.com/muon-rw/MPUC/tree/main/' }, forceCompatible: true },
+  // Add `mpucnotoken` to the URL for a pack whose GitHub token can't write to its update checker repo.
+  update_checker_problem: () =>
+    new URLSearchParams(location.search).has('mpucnotoken') ? "Your GitHub token can't write to muon-rw/MPUC. Give it Contents: Read and write access to that repository." : null,
+  add_to_update_checker: (a) => {
+    const release = releases.find((r) => r.version === a.version)
+    if (release) release.updateChecker = { updateType: release.updateChecker?.updateType ?? config.update_checker.update_type, addedAt: new Date().toISOString() }
+    return `Added ${a.version} to muon-rw/MPUC`
   },
   discover_instances: () => [pack, { ...pack, dir: 'C:/Instances/Shared Pack', name: 'Shared Pack', addonCount: 0, hasGit: false, hasLock: false, remote: null, added: false }],
   server_sides: () => serverSides,

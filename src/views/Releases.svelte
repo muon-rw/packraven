@@ -3,13 +3,13 @@
   import { listen } from '@tauri-apps/api/event'
   import { ask } from '@tauri-apps/plugin-dialog'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type FileState, type PackFile, type ReleaseStatus } from '../lib/api'
+  import { api, errorText, type FileState, type PackFile, type ReleaseStatus, type UpdateCheckerSetup, type UpdateType } from '../lib/api'
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
   import Notice from '../components/Notice.svelte'
   import { job, onJobEnd } from '../lib/jobs.svelte'
-  import { asReleaseType, curseforgeProblem } from '../lib/format'
+  import { asReleaseType, asUpdateType, curseforgeProblem, repoName, updateTypeLabel } from '../lib/format'
 
-  let { onsettings }: { onsettings: () => void } = $props()
+  let { onsettings, onappsettings }: { onsettings: () => void; onappsettings: () => void } = $props()
 
   let releases: ReleaseStatus[] = $state([])
   let releasesError: string | null = $state(null)
@@ -20,6 +20,13 @@
   let rolePing = $state(false)
   let uploading = $state<string | null>(null)
   let uploadErrors = $state<Record<string, string>>({})
+  let updateChecker = $state<UpdateCheckerSetup | null>(null)
+  let defaultUpdateType = $state<UpdateType>('minor_breaking')
+  let addingToChecker = $state<string | null>(null)
+  // A failure the backend couldn't record on the release, such as one from before it found the release.
+  let checkerErrors = $state<Record<string, string>>({})
+  // Errors already on the page stay quiet when Releases opens, so we only announce the outcome of an add you started.
+  let checkerAnnouncement = $state('')
   // The file we're replacing or checking, as "version:client" or "version:server", and what came of it.
   let replacing = $state<string | null>(null)
   let checking = $state<string | null>(null)
@@ -94,6 +101,9 @@
   let releaseType = $state('release')
   let showCurseforge = $derived(releases.some((r) => r.curseforge))
   let showModrinth = $derived(releases.some((r) => r.modrinth || r.modrinthMissing))
+  let checkerRepo = $derived(updateChecker?.kind === 'github' ? updateChecker.repo : null)
+  let showUpdateChecker = $derived(!!checkerRepo || releases.some((r) => r.updateChecker))
+  let columns = $derived(2 + (showCurseforge ? 1 : 0) + (showModrinth ? 1 : 0) + (showUpdateChecker ? 1 : 0))
 
   onMount(() => {
     loadReleases()
@@ -101,10 +111,12 @@
     api.getPackConfig().then((c) => {
       rolePing = !!c.discord.role_id.trim()
       releaseType = c.curseforge.release_type
+      defaultUpdateType = c.update_checker.update_type
     }, () => {})
-    const unlisten = listen('release-announced', () => loadReleases())
+    api.updateCheckerSetup().then((setup) => (updateChecker = setup), () => (updateChecker = null))
+    const unlisten = [listen('release-announced', () => loadReleases()), listen('release-update-checker', () => loadReleases())]
     return () => {
-      unlisten.then((stop) => stop())
+      for (const stop of unlisten) stop.then((stop) => stop())
     }
   })
 
@@ -240,6 +252,58 @@
     return holdups(release).length === 0
   }
 
+  // The background check waits for the same things before it announces or adds a release.
+  function approvalWait(release: ReleaseStatus) {
+    const curseforge = release.serverPackMissing ? 'CurseForge approves it and has its server pack' : 'CurseForge approves it'
+    return [release.curseforge && curseforge, release.modrinthMissing && "it's on Modrinth"].filter(Boolean).join(', and ')
+  }
+
+  function updateCheckerStatus(release: ReleaseStatus) {
+    const entry = release.updateChecker
+    if (!entry) return 'Not added'
+    if (entry.addedAt) return `Added ${new Date(entry.addedAt).toLocaleDateString()}`
+    if (checkerError(release)) return "Couldn't add it"
+    const wait = approvalWait(release)
+    return wait ? `packraven adds this once ${wait}` : 'packraven adds this within a few minutes'
+  }
+
+  function checkerError(release: ReleaseStatus) {
+    return release.updateChecker?.addedAt ? null : (checkerErrors[release.version] ?? release.updateChecker?.error ?? null)
+  }
+
+  // Adding a release tells players to update, so we ask first when it isn't out everywhere yet, or when it never
+  // had an update type of its own.
+  async function addToUpdateChecker(release: ReleaseStatus) {
+    const { version } = release
+    const type = release.updateChecker?.updateType ?? defaultUpdateType
+    const where = checkerRepo ? repoName(checkerRepo) : 'the update checker'
+    const lines = [
+      release.updateChecker ? null : `Add ${version} to ${where} as ${asUpdateType(type)}, the default from Pack settings.`,
+      approved(release) ? null : `Players will see ${version} as an update in game right away, though ${holdups(release).join(', and ')}.`,
+    ].filter(Boolean)
+    if (lines.length) {
+      const confirmed = await ask(lines.join('\n\n'), {
+        title: `Add ${version} to the update checker`,
+        kind: 'warning',
+        okLabel: 'Add it',
+        cancelLabel: 'Cancel',
+      })
+      if (!confirmed) return
+    }
+    addingToChecker = version
+    checkerAnnouncement = ''
+    try {
+      checkerAnnouncement = await api.addToUpdateChecker(version)
+      delete checkerErrors[version]
+    } catch (e) {
+      checkerErrors[version] = errorText(e)
+      checkerAnnouncement = `Couldn't add ${version} to the update checker. ${errorText(e)}`
+    } finally {
+      addingToChecker = null
+      await loadReleases()
+    }
+  }
+
   async function loadReleases() {
     loading = true
     try {
@@ -293,9 +357,8 @@
   function discordState(release: ReleaseStatus) {
     if (release.announcedAt) return `Announced ${new Date(release.announcedAt).toLocaleDateString()}`
     if (release.announce) {
-      const curseforge = release.serverPackMissing ? 'CurseForge approves it and has its server pack' : 'CurseForge approves it'
-      const waiting = [release.curseforge && curseforge, release.modrinthMissing && "it's on Modrinth"].filter(Boolean)
-      return waiting.length ? `packraven posts this once ${waiting.join(', and ')}` : 'packraven posts this within a few minutes'
+      const wait = approvalWait(release)
+      return wait ? `packraven posts this once ${wait}` : 'packraven posts this within a few minutes'
     }
     return 'Not announced'
   }
@@ -310,18 +373,19 @@
     <div>
       <h2>Releases</h2>
       <p class="muted">
-        Versions published from packraven on this machine, their status on each platform, and Discord announcements.
+        Versions published from packraven on this machine, their status on each platform, {showUpdateChecker ? 'Discord announcements, and Modpack Update Checker entries' : 'and Discord announcements'}.
         {#if !hasWebhook}No Discord webhook is set, so packraven won't announce anything.{/if}
       </p>
     </div>
     <div class="actions">
-      <button class="ghost settings" onclick={onsettings}>Discord settings</button>
+      <button class="ghost settings" onclick={onsettings}>{showUpdateChecker ? 'Announcement settings' : 'Discord settings'}</button>
       <button class:busy={loading} disabled={loading} onclick={loadReleases}>{loading ? 'Checking' : 'Refresh'}</button>
     </div>
   </header>
 
   {#if releasesError}<p class="failed" role="alert">{releasesError}</p>{/if}
   {#if discordError}<p class="failed" role="alert">{discordError}</p>{/if}
+  <p class="visually-hidden" role="status">{checkerAnnouncement}</p>
   <!-- The problem notice you acted on goes away, so this takes its place and takes focus. -->
   {#if replaced}
     <div class="replaced" tabindex="-1" bind:this={replacedNotice}>
@@ -339,6 +403,7 @@
           {#if showCurseforge}<th>CurseForge</th>{/if}
           {#if showModrinth}<th>Modrinth</th>{/if}
           <th>Discord</th>
+          {#if showUpdateChecker}<th>Update Checker</th>{/if}
         </tr>
       </thead>
       <tbody>
@@ -376,9 +441,9 @@
                     <a href={modrinth.url} onclick={(e) => { e.preventDefault(); openUrl(modrinth.url) }}>View<span class="visually-hidden"> {release.version} on Modrinth</span></a>
                   </div>
                 {:else if release.modrinthMissing}
-                  <div class="discord">
+                  <div class="stacked">
                     <span class="muted">Not uploaded</span>
-                    <span class="discord-actions">
+                    <span class="cell-actions">
                       <button class:busy={uploading === release.version} disabled={uploading !== null} onclick={() => uploadToModrinth(release)}>
                         {uploading === release.version ? 'Uploading' : 'Upload to Modrinth'}<span class="visually-hidden"> {release.version}</span>
                       </button>
@@ -391,9 +456,9 @@
               </td>
             {/if}
             <td>
-              <div class="discord">
+              <div class="stacked">
                 <span class:muted={!release.announcedAt}>{discordState(release)}</span>
-                <span class="discord-actions">
+                <span class="cell-actions">
                   {#if hasWebhook}
                     <button class="ghost" class:busy={announcing === release.version} disabled={announcing !== null} onclick={() => announceNow(release)}>
                       {release.announcedAt ? 'Announce again' : approved(release) ? 'Announce now' : 'Announce before approval'}
@@ -403,13 +468,34 @@
                 </span>
               </div>
             </td>
+            {#if showUpdateChecker}
+              {@const entry = release.updateChecker}
+              {@const failed = !!checkerError(release)}
+              <td>
+                <div class="stacked">
+                  {#if entry}<span>{updateTypeLabel(entry.updateType)} update</span>{/if}
+                  <span class:muted={!entry?.addedAt && !failed} class:failed>{updateCheckerStatus(release)}</span>
+                  {#if checkerRepo && !entry?.addedAt && !failed}
+                    <span class="cell-actions">
+                      <button class="ghost" class:busy={addingToChecker === release.version} disabled={addingToChecker !== null} onclick={() => addToUpdateChecker(release)}>
+                        {#if addingToChecker === release.version}
+                          Adding<span class="visually-hidden"> {release.version} to the update checker</span>
+                        {:else}
+                          Add<span class="visually-hidden"> {release.version} to the update checker</span>{entry ? ' now' : ''}
+                        {/if}
+                      </button>
+                    </span>
+                  {/if}
+                </div>
+              </td>
+            {/if}
           </tr>
           {@const problems = fileProblems(release)}
           {#each problems as { file, page, found } (file)}
             {@const key = `${release.version}:${file}`}
             {@const label = `${release.version} ${file} pack`}
             <tr class="follow-up">
-              <td colspan={2 + (showCurseforge ? 1 : 0) + (showModrinth ? 1 : 0)}>
+              <td colspan={columns}>
                 {#if found.waitable && isWaiting(release, file)}
                   <p class="waiting muted small">
                     Waiting for a moderator to review the {label}.
@@ -457,9 +543,36 @@
               </td>
             </tr>
           {/each}
+          {@const checkerProblem = showUpdateChecker ? checkerError(release) : null}
+          {#if checkerProblem}
+            <tr class="follow-up">
+              <td colspan={columns}>
+                <section class="server-upload" aria-labelledby="checker-problem-{release.version}">
+                  <Notice tone="warn" live={false}>
+                    <h3 id="checker-problem-{release.version}">Couldn't add {release.version} to the update checker</h3>
+                    <p class="muted">{checkerProblem}</p>
+                    <div class="checker-actions">
+                      <button class:busy={addingToChecker === release.version} disabled={addingToChecker !== null} onclick={() => addToUpdateChecker(release)}>
+                        {#if addingToChecker === release.version}
+                          Adding<span class="visually-hidden"> {release.version} to the update checker</span>
+                        {:else}
+                          Try<span class="visually-hidden"> adding {release.version} to the update checker</span> again
+                        {/if}
+                      </button>
+                      <button class="link" onclick={onappsettings}>Open App settings</button>
+                      {#if checkerRepo}
+                        {@const repo = checkerRepo}
+                        <button class="link" onclick={() => openUrl(repo.page)}>Open {repoName(repo)} on GitHub</button>
+                      {/if}
+                    </div>
+                  </Notice>
+                </section>
+              </td>
+            </tr>
+          {/if}
           {#if release.serverPackMissing && !problems.some((p) => p.file === 'client')}
             <tr class="follow-up">
-              <td colspan={2 + (showCurseforge ? 1 : 0) + (showModrinth ? 1 : 0)}>
+              <td colspan={columns}>
                 <section class="server-upload" aria-labelledby="server-upload-{release.version}">
                   <Notice tone="warn" live={false}>
                     <h3 id="server-upload-{release.version}">Upload the {release.version} server pack</h3>
@@ -514,7 +627,9 @@
   }
 
   /* In a narrow pane the table scrolls sideways on its own, so the rest of the view keeps its width. */
+  /* The positioned ancestor keeps the visually hidden button text inside the scroll region, or it widens the window. */
   .scroll {
+    position: relative;
     overflow-x: auto;
     container-type: inline-size;
   }
@@ -539,7 +654,7 @@
     vertical-align: top;
   }
 
-  .discord {
+  .stacked {
     display: grid;
     gap: 2px;
   }
@@ -603,6 +718,13 @@
     gap: 4px;
   }
 
+  .checker-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 16px;
+  }
+
   .waiting {
     position: sticky;
     left: 0;
@@ -621,14 +743,14 @@
     gap: 4px 10px;
   }
 
-  .discord-actions {
+  .cell-actions {
     display: flex;
     flex-wrap: wrap;
     gap: 2px;
     margin-left: -8px;
   }
 
-  .discord-actions button {
+  .cell-actions button {
     color: var(--forest);
     white-space: nowrap;
   }

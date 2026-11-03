@@ -97,6 +97,7 @@ export interface PackConfig {
   test: { port: number; client_memory: string }
   discord: { role_id: string; color: string; announce_on_approval: boolean; title: string; show_author: boolean; header: string; footer: string }
   updates: { channel: ReleaseType; locked: StoredModKey[] }
+  update_checker: { add_releases: boolean; update_type: UpdateType }
 }
 
 export type ReleaseType = 'release' | 'beta' | 'alpha'
@@ -338,6 +339,24 @@ export type FileState =
   | 'other'
 export type PackFile = 'client' | 'server'
 
+export type UpdateType = 'minor' | 'minor_breaking' | 'major' | 'incompatible'
+export interface UpdateCheckerRepo {
+  owner: string
+  name: string
+  branch: string
+  // Empty, or a path ending in a slash.
+  folder: string
+  // The folder on github.com.
+  page: string
+}
+// forceCompatible: whether Modpack Update Checker still opens worlds from before an incompatible update.
+export type UpdateCheckerSetup = { kind: 'github'; repo: UpdateCheckerRepo; forceCompatible: boolean } | { kind: 'unsupported'; reason: string; configPath: string }
+export interface UpdateCheckerEntry {
+  updateType: UpdateType
+  addedAt?: string
+  error?: string
+}
+
 export interface ReleaseStatus {
   version: string
   publishedAt: string
@@ -369,6 +388,7 @@ export interface ReleaseStatus {
   packChanged: boolean
   // Whether packraven still has the client pack it published, which replacing the client pack reuses.
   clientZipPresent: boolean
+  updateChecker: UpdateCheckerEntry | null
 }
 
 // What you need to upload a release's server pack yourself, after packraven's upload failed.
@@ -667,6 +687,9 @@ export const api = {
   setWebhook: (url: string) => invoke<void>('set_webhook', { url }),
   discordTest: () => invoke<void>('discord_test'),
   announceRelease: (version: string) => invoke<void>('announce_release', { version }),
+  updateCheckerSetup: () => invoke<UpdateCheckerSetup | null>('update_checker_setup'),
+  updateCheckerProblem: () => invoke<string | null>('update_checker_problem'),
+  addToUpdateChecker: (version: string) => invoke<string>('add_to_update_checker', { version }),
   discohookLink: (version: string) => invoke<string>('discohook_link', { version }),
   discohookPreview: (version: string) => invoke<string>('discohook_preview', { version }),
   defenderStatus: () => invoke<DefenderView>('defender_status'),
@@ -800,7 +823,7 @@ export const api = {
   startClient: (join: boolean) => invoke<void>('start_client', { join }),
   serverCommand: (line: string) => invoke<void>('server_command', { line }),
   killProcess: (which: 'server' | 'client') => invoke<void>('kill_process', { which }),
-  publish: (options: { version: string; message: string; push: boolean; client: UploadNames; server: UploadNames }) => invoke<void>('publish', { options }),
+  publish: (options: { version: string; message: string; push: boolean; client: UploadNames; server: UploadNames; updateChecker: UpdateType | null }) => invoke<void>('publish', { options }),
   releases: () => invoke<ReleaseStatus[]>('releases'),
   outputDir: () => invoke<string>('output_dir'),
 }

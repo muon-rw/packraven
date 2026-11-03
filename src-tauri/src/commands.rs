@@ -909,6 +909,22 @@ pub fn publish(app: AppHandle, state: State<'_, AppState>, options: PublishOptio
     state.jobs.start(&app, "publish", move |log| publish::publish(context, options, log))
 }
 
+#[tauri::command]
+pub fn update_checker_setup(state: State<'_, AppState>) -> CmdResult<Option<crate::update_checker::Setup>> {
+    Ok(crate::update_checker::setup(&state.pack().map_err(err)?))
+}
+
+#[tauri::command]
+pub async fn update_checker_problem(state: State<'_, AppState>) -> CmdResult<Option<String>> {
+    Ok(crate::update_checker::problem(&state.pack().map_err(err)?).await)
+}
+
+#[tauri::command]
+pub async fn add_to_update_checker(state: State<'_, AppState>, version: String) -> CmdResult<String> {
+    let pack = state.pack().map_err(err)?;
+    crate::update_checker::add_release(&pack, &state.pack_data().join("releases.json"), &version).await.map_err(err)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseStatus {
@@ -927,6 +943,7 @@ pub struct ReleaseStatus {
     pack_changed: bool,
     /// Whether packraven still has the client pack it published, which replacing the client pack reuses.
     client_zip_present: bool,
+    update_checker: Option<crate::update_checker::Entry>,
 }
 
 #[derive(Serialize)]
@@ -1068,6 +1085,7 @@ pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus
             published_at: release.published_at.clone(),
             announce: release.announce,
             announced_at: release.announced_at.clone(),
+            update_checker: release.update_checker.clone(),
             curseforge,
             modrinth,
         });

@@ -43,6 +43,20 @@ pub struct PackConfig {
     pub test: TestConfig,
     pub discord: DiscordConfig,
     pub updates: UpdatesConfig,
+    pub update_checker: UpdateCheckerConfig,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct UpdateCheckerConfig {
+    pub add_releases: bool,
+    pub update_type: crate::update_checker::UpdateType,
+}
+
+impl Default for UpdateCheckerConfig {
+    fn default() -> Self {
+        Self { add_releases: true, update_type: crate::update_checker::UpdateType::default() }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -197,6 +211,7 @@ impl Default for PackConfig {
             test: TestConfig::default(),
             discord: DiscordConfig::default(),
             updates: UpdatesConfig::default(),
+            update_checker: UpdateCheckerConfig::default(),
         }
     }
 }
@@ -587,7 +602,7 @@ impl Pack {
         }
         let updated = pattern.replace(&text, |caps: &regex::Captures| format!("{}\"{}\"", &caps[1], version));
         std::fs::write(&path, updated.as_ref())?;
-        Ok(())
+        crate::update_checker::sync_current_version(&self.dir, version)
     }
 
     pub fn has_bcc(&self) -> bool {

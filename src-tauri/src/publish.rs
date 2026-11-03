@@ -15,6 +15,7 @@ use crate::pack::{version_problem, LockEntry, ModLoader, ModrinthFile, Pack, Pla
 use crate::{links, twins};
 use crate::sides::{self, MetadataCache};
 use crate::modsync;
+use crate::update_checker::{self, UpdateType};
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", from = "StoredRelease")]
@@ -42,6 +43,8 @@ pub struct Release {
     /// Identifies the mods that shipped, so finishing the release later can tell you the pack changed since.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mods_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_checker: Option<update_checker::Entry>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -136,6 +139,8 @@ struct StoredRelease {
     pending: Vec<PendingStep>,
     #[serde(default)]
     mods_digest: Option<String>,
+    #[serde(default)]
+    update_checker: Option<update_checker::Entry>,
 }
 
 impl From<StoredRelease> for Release {
@@ -156,6 +161,7 @@ impl From<StoredRelease> for Release {
             announced_at: stored.announced_at,
             pending: stored.pending,
             mods_digest: stored.mods_digest,
+            update_checker: stored.update_checker,
         }
     }
 }
@@ -170,6 +176,9 @@ pub struct PublishOptions {
     pub client: UploadNames,
     #[serde(default)]
     pub server: UploadNames,
+    /// How the update checker describes the release, or None to leave it out of the update checker.
+    #[serde(default)]
+    pub update_checker: Option<UpdateType>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq, Clone)]
@@ -404,6 +413,7 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
         announced_at: None,
         pending: [Some(PendingStep::Tag { message }), options.push.then_some(PendingStep::Push)].into_iter().flatten().collect(),
         mods_digest: Some(mods_digest(&pack)),
+        update_checker: options.update_checker.filter(|_| update_checker::repo(&pack).is_some()).map(update_checker::Entry::new),
     };
 
     if let Some(client_zip) = client_zip {

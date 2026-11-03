@@ -3,7 +3,7 @@
   import { onMount, tick } from 'svelte'
   import { ask } from '@tauri-apps/plugin-dialog'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type OverrideFileView, type Overview, type PackConfig, type PublishedTo, type UnfinishedRelease, type UploadNames } from '../lib/api'
+  import { api, errorText, type OverrideFileView, type Overview, type PackConfig, type PublishedTo, type UnfinishedRelease, type UpdateCheckerSetup, type UpdateType, type UploadNames } from '../lib/api'
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import RenderedChangelog from '../components/RenderedChangelog.svelte'
   import JobLog from '../components/JobLog.svelte'
@@ -11,8 +11,8 @@
   import Twisty from '../components/Twisty.svelte'
   import OverrideDecisions from '../components/OverrideDecisions.svelte'
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
-  import { nav } from '../lib/nav.svelte'
-  import { asReleaseType, curseforgeProblem, releaseTag } from '../lib/format'
+  import { nav, showInFiles } from '../lib/nav.svelte'
+  import { asReleaseType, asUpdateType, curseforgeProblem, releaseTag, repoName, UPDATE_TYPES, updateTypeEffect } from '../lib/format'
 
   let {
     overview,
@@ -67,6 +67,24 @@
   let changelog = $state<string | null>(null)
   let changelogError: string | null = $state(null)
   let hasWebhook = $state(false)
+  let updateChecker = $state<UpdateCheckerSetup | null>(null)
+  let updateType = $state<UpdateType | 'none'>('none')
+  let checkerRepo = $derived(updateChecker?.kind === 'github' ? updateChecker.repo : null)
+  let chosenUpdateType = $derived(checkerRepo && updateType !== 'none' ? updateType : null)
+  // What GitHub says would stop packraven adding the release, checked whenever you choose to add one.
+  let checkerProblem = $state<string | null>(null)
+  $effect(() => {
+    checkerProblem = null
+    if (!chosenUpdateType) return
+    let current = true
+    api.updateCheckerProblem().then(
+      (problem) => current && (checkerProblem = problem),
+      () => {},
+    )
+    return () => {
+      current = false
+    }
+  })
   let previewing = $state(false)
   let previewError = $state<string | null>(null)
   let error: string | null = $state(null)
@@ -130,8 +148,15 @@
     loadChangelog()
     loadUnfinished()
     api.getPackConfig().then(
-      (c) => (config = c),
+      (c) => {
+        config = c
+        resetUpdateType()
+      },
       () => (config = null),
+    )
+    api.updateCheckerSetup().then(
+      (setup) => (updateChecker = setup),
+      () => (updateChecker = null),
     )
     api.getWebhook().then((w) => (hasWebhook = !!w), () => (hasWebhook = false))
     api.getSettings().then(
@@ -140,10 +165,15 @@
     )
   })
 
+  function resetUpdateType() {
+    updateType = config?.update_checker.add_releases ? config.update_checker.update_type : 'none'
+  }
+
   onJobEnd('publish', (phase) => {
     loadUnfinished()
     if (phase !== 'done') return
     commitMessage = ''
+    resetUpdateType()
     names = noOverrides()
     renaming = { client: false, server: false }
     loadChangelog()
@@ -302,6 +332,7 @@
 
   let rolePing = $derived(!!config?.discord.role_id.trim())
   let announces = $derived(hasWebhook && !!config?.discord.announce_on_approval)
+  let approvalWait = $derived(toCurseforge ? 'CurseForge approves it' : "it's on Modrinth")
 
   async function publish() {
     const client = resolvedNames('client')
@@ -323,7 +354,9 @@
         : null,
       `Commit ${uncommitted.length ? `your ${uncommitted.length} uncommitted ${uncommitted.length === 1 ? 'file' : 'files'} and ` : ''}the release as "${commitMessage.trim() || defaultMessage}", tag it ${releaseTag(trimmed)}${push ? ', then push' : ''}.`,
       'Archive the release notes and clear changelog.md for the next release.',
-      announces ? `Post to Discord once ${toCurseforge ? 'CurseForge approves it' : "it's on Modrinth"}${rolePing ? ', pinging the role' : ''}.` : null,
+      announces ? `Post to Discord once ${approvalWait}${rolePing ? ', pinging the role' : ''}.` : null,
+      checkerRepo && chosenUpdateType ? `Add it to ${repoName(checkerRepo)} on GitHub as ${asUpdateType(chosenUpdateType)} once ${approvalWait}, so players see it in game.` : null,
+      checkerRepo && !chosenUpdateType ? `Leave it out of ${repoName(checkerRepo)}, so players won't be told about it in game.` : null,
       emptyNotes ? `The changelog on ${platforms} will be empty.` : null,
     ].filter(Boolean)
     const confirmed = await ask(`${consequences.join('\n')}\n\nThis can't be undone.`, {
@@ -339,7 +372,14 @@
       finishing = null
       landed = 'pending'
       published = { version: trimmed, pushed: push, clientName: client.displayName }
-      await api.publish({ version: trimmed, message: commitMessage.trim(), push, client: trimmedNames('client'), server: trimmedNames('server') })
+      await api.publish({
+        version: trimmed,
+        message: commitMessage.trim(),
+        push,
+        client: trimmedNames('client'),
+        server: trimmedNames('server'),
+        updateChecker: chosenUpdateType,
+      })
       onchange()
     } catch (e) {
       error = errorText(e)
@@ -603,7 +643,13 @@
           {warning}
         </li>
       {/each}
-      {#if !blockers.length && !warnings.length && !checking}
+      {#if checkerProblem}
+        <li class="warn">
+          <svg viewBox="0 0 16 16" role="img" aria-label="Warning"><path d="M8 3v6M8 12v1" /></svg>
+          <span>packraven won't be able to add {trimmed || 'this release'} to the update checker. {checkerProblem} <button class="link" onclick={() => (nav.view = 'settings')}>Open App settings</button></span>
+        </li>
+      {/if}
+      {#if !blockers.length && !warnings.length && !checkerProblem && !checking}
         <li class="ok">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" /></svg>
           Ready to publish
@@ -853,6 +899,35 @@
     {#if previewError}<p class="failed">{previewError}</p>{/if}
   </section>
 
+  {#if updateChecker}
+    <section class="step" aria-labelledby="update-checker-title">
+      <h3 id="update-checker-title">Modpack Update Checker</h3>
+      {#if updateChecker.kind === 'github'}
+        {@const repo = updateChecker.repo}
+        <label class="update-type">
+          <span class="muted small">Update type for {trimmed || 'this release'}</span>
+          <select bind:value={updateType} aria-describedby="update-checker-hint">
+            {#each UPDATE_TYPES as { type, label } (type)}<option value={type}>{label} update</option>{/each}
+            <option value="none">Don't add it</option>
+          </select>
+        </label>
+        <div class="muted small" id="update-checker-hint">
+          {#if chosenUpdateType}
+            <p>{updateTypeEffect(chosenUpdateType, updateChecker.forceCompatible)}</p>
+            <p>We'll only add it to {repoName(repo)} once {approvalWait}.</p>
+          {:else}
+            <p>packraven leaves it out of {repoName(repo)}, so players won't be told about it in game. You can still add it from Releases.</p>
+          {/if}
+          <p><button class="link" onclick={() => settingsAt('update-checker-title')}>Change the default in Pack settings</button></p>
+        </div>
+      {:else}
+        {@const configPath = updateChecker.configPath}
+        <p class="muted">{updateChecker.reason} Until then, add this release to the update checker yourself.</p>
+        <p><button class="link" onclick={() => showInFiles(configPath)}>Open the config in Files</button></p>
+      {/if}
+    </section>
+  {/if}
+
   {#if showLog}
     <section class="step log-block" aria-labelledby="log-title">
       <h3 id="log-title">Build log</h3>
@@ -993,10 +1068,17 @@
     --changelog-max-height: 60vh;
   }
 
-  .commit-field {
+  .commit-field,
+  .update-type {
     display: grid;
     gap: 4px;
     max-width: 480px;
+  }
+
+  #update-checker-hint {
+    display: grid;
+    gap: 4px;
+    max-width: 60ch;
   }
 
   #commit-hint {

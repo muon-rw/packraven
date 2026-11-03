@@ -1,4 +1,4 @@
-import type { FileState, PackFile } from './api'
+import type { FileState, PackFile, UpdateCheckerRepo, UpdateType } from './api'
 import { isolateHistory } from '@codemirror/commands'
 import type { ChangeSpec } from '@codemirror/state'
 import type { EditorView } from '@codemirror/view'
@@ -417,6 +417,41 @@ const DIFF_CELLS = 2_000_000
  * Returns the smallest edits we can cheaply find that turn `before` into `after`, so the
  * cursor, selections and folds stay where they were.
  */
+export const UPDATE_TYPES: { type: UpdateType; label: string }[] = [
+  { type: 'minor', label: 'Minor' },
+  { type: 'minor_breaking', label: 'Minor breaking' },
+  { type: 'major', label: 'Major' },
+  { type: 'incompatible', label: 'Incompatible' },
+]
+
+export function updateTypeLabel(type: UpdateType): string {
+  return UPDATE_TYPES.find((t) => t.type === type)?.label ?? type
+}
+
+export function asUpdateType(type: UpdateType): string {
+  return `${type === 'incompatible' ? 'an' : 'a'} ${updateTypeLabel(type).toLowerCase()} update`
+}
+
+// Modpack Update Checker looks at the highest update type since the version a world was last played on.
+export function updateTypeEffect(type: UpdateType, forceCompatible: boolean): string {
+  switch (type) {
+    case 'minor':
+      return 'Players open worlds from earlier versions as usual.'
+    case 'minor_breaking':
+      return 'Modpack Update Checker asks players to back up a world from an earlier version before they open it.'
+    case 'major':
+      return 'The same backup prompt as minor breaking, marking a bigger release.'
+    case 'incompatible':
+      return forceCompatible
+        ? "Modpack Update Checker warns players that worlds from earlier versions aren't compatible, and asks them to back up before they open one."
+        : "Modpack Update Checker tells players that worlds from earlier versions aren't compatible, and won't open them."
+  }
+}
+
+export function repoName(repo: UpdateCheckerRepo): string {
+  return `${repo.owner}/${repo.name}${repo.folder ? `/${repo.folder.replace(/\/$/, '')}` : ''}`
+}
+
 export function asReleaseType(type: string): string {
   const lower = type.toLowerCase()
   return lower === 'release' ? 'a release' : `${/^[aeiou]/.test(lower) ? 'an' : 'a'} ${lower}`

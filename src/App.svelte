@@ -811,7 +811,7 @@
     {:else if pane === 'publish'}
       <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFrom('pack', index)} onreleases={() => showFrom('releases', index)} />
     {:else if pane === 'releases'}
-      <Releases onsettings={() => showFrom('pack', index)} />
+      <Releases onsettings={() => showFrom('pack', index)} onappsettings={() => showFrom('settings', index)} />
     {:else if pane === 'pack' && packs?.active}
       <PackSettings dir={packs.active} name={overview?.name ?? 'this pack'} onserver={() => showFrom('server', index)} onappsettings={() => showFrom('settings', index)} onchange={refresh} onremoved={() => { only('mods'); refresh() }} />
     {:else}

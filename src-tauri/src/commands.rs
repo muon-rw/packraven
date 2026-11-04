@@ -42,6 +42,7 @@ impl AppState {
     }
 
     pub(crate) fn rewatch(&self, app: &AppHandle) {
+        self.update_presence();
         let dir = self.settings().instance_dir;
         if crate::setup::has_hooks(&dir) {
             let _ = crate::setup::link_hooks(&dir);
@@ -49,6 +50,12 @@ impl AppState {
         let watched = (!dir.as_os_str().is_empty()).then(|| crate::watcher::watch(app.clone(), dir));
         *self.watch_error.lock().unwrap() = watched.as_ref().and_then(|w| w.as_ref().err()).map(|e| format!("{e:#}"));
         *self.watcher.lock().unwrap() = watched.and_then(Result::ok);
+    }
+
+    pub(crate) fn update_presence(&self) {
+        let settings = self.settings();
+        let pack = settings.discord_shows_pack.then(|| Pack::open(&settings.instance_dir).ok()).flatten();
+        crate::presence::set_pack(pack.map(|pack| pack.name()));
     }
 
     pub(crate) fn data_dir(&self) -> PathBuf {

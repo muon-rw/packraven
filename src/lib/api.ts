@@ -13,6 +13,7 @@ export interface Settings {
   gitName: string
   gitEmail: string
   autoUpdate: boolean
+  discordShowsPack: boolean
   runArgs: RunArgs
 }
 
@@ -766,6 +767,7 @@ export const api = {
   checkForUpdate: () => invoke<UpdateView>('check_for_update'),
   installUpdate: () => invoke<void>('install_update'),
   setAutoUpdate: (enabled: boolean) => invoke<void>('set_auto_update', { enabled }),
+  setDiscordShowsPack: (enabled: boolean) => invoke<void>('set_discord_shows_pack', { enabled }),
   updateChangelog: (since: string | null = null, through: string | null = null) => invoke<ReleaseNotes[]>('update_changelog', { since, through }),
   dismissUpdateChangelog: () => invoke<void>('dismiss_update_changelog'),
   overview: () => invoke<Overview>('overview'),

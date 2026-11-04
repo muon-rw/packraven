@@ -386,6 +386,29 @@
     }
   }
 
+  let discordShowsPackError: string | null = $state(null)
+
+  async function toggleDiscordShowsPack() {
+    if (!settings) return
+    const wanted = !settings.discordShowsPack
+    settings.discordShowsPack = wanted
+    savedField = 'discord-shows-pack'
+    saveState = 'saving'
+    try {
+      discordShowsPackError = null
+      await api.setDiscordShowsPack(wanted)
+      if (savedSettings) savedSettings.discordShowsPack = wanted
+      if (savedField === 'discord-shows-pack') {
+        saveTick += 1
+        saveState = 'saved'
+      }
+    } catch (error) {
+      settings.discordShowsPack = !wanted
+      if (savedField === 'discord-shows-pack') saveState = 'failed'
+      discordShowsPackError = `Couldn't change the Discord setting: ${errorText(error)}`
+    }
+  }
+
   async function checkForUpdate() {
     checkingUpdate = true
     try {
@@ -486,8 +509,7 @@
     <h3 id="minecraft-account-title">Minecraft account</h3>
     {#if account}
       <p>
-        Signed in as <strong>{account.name}</strong>. Test clients on this computer launch as this account{#if credentials}, and packraven keeps your Microsoft tokens in
-          {credentials.keychain}{/if}.
+        Signed in as <strong>{account.name}</strong>. Test clients on this computer launch as this account.
       </p>
     {:else if signingIn}
       <p class="muted">Finish signing in with Microsoft in your browser. packraven is waiting.</p>
@@ -534,6 +556,26 @@
       aria-labelledby="autostart-label"
       aria-describedby="autostart-hint"
       onclick={toggleAutostart}
+    ><span></span></button>
+  </div>
+
+  <div class="switch-row">
+    <div>
+      <div class="switch-label">
+        <span id="discord-shows-pack-label">Show the pack I'm working on in my Discord status</span>
+        {@render badge('discord-shows-pack')}
+      </div>
+      <p class="muted" id="discord-shows-pack-hint">Turn this off to keep unannounced packs private. Discord still shows that you're using packraven.</p>
+      {#if discordShowsPackError}<p class="failed" role="alert">{discordShowsPackError}</p>{/if}
+    </div>
+    <button
+      type="button"
+      role="switch"
+      class="switch"
+      aria-checked={settings.discordShowsPack}
+      aria-labelledby="discord-shows-pack-label"
+      aria-describedby="discord-shows-pack-hint"
+      onclick={toggleDiscordShowsPack}
     ><span></span></button>
   </div>
 

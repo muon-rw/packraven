@@ -748,6 +748,7 @@ const mockJavas = [
 let minecraftAccount: { name: string; uuid: string } | null = scenario === 'empty' ? null : { name: 'muonr', uuid: '0f6c1e5a2b3d4c5e8f9a0b1c2d3e4f50' }
 const SIGN_IN_FIRST = 'Sign in to Minecraft to launch the client.'
 let autoUpdate = true
+let discordShowsPack = true
 // The dirty scenario has an update waiting, so screenshots cover the rail's restart button.
 const mockPackravenReleases = [
   {
@@ -1052,7 +1053,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   minecraft_sign_out: () => {
     minecraftAccount = null
   },
-  get_settings: () => ({ instanceDir: pack.dir, packs: [pack.dir], installDir: 'C:/curseforge/minecraft/Install', javaByMajor: { ...javaByMajor }, defenderExcluded: [], defenderDismissed: false, minecraftEulaAccepted: eulaAccepted, editorAskMb: 50, editorMaxMb: 100, gitName: '', gitEmail: '', autoUpdate, runArgs: appRunArgs }),
+  get_settings: () => ({ instanceDir: pack.dir, packs: [pack.dir], installDir: 'C:/curseforge/minecraft/Install', javaByMajor: { ...javaByMajor }, defenderExcluded: [], defenderDismissed: false, minecraftEulaAccepted: eulaAccepted, editorAskMb: 50, editorMaxMb: 100, gitName: '', gitEmail: '', autoUpdate, discordShowsPack, runArgs: appRunArgs }),
   save_settings: (a) => (appRunArgs = (a.settings as { runArgs: typeof appRunArgs }).runArgs),
   update_status: () => updateView(),
   check_for_update: () => updateView(),
@@ -1070,6 +1071,9 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
         emit('self-update-changed', updateView())
       }, percent * 30)
     }
+  },
+  set_discord_shows_pack: ({ enabled }) => {
+    discordShowsPack = enabled as boolean
   },
   set_auto_update: ({ enabled }) => {
     autoUpdate = enabled as boolean

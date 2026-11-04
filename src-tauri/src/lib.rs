@@ -42,6 +42,7 @@ mod nbt;
 mod os_drag;
 mod pack;
 mod pack_commands;
+mod presence;
 mod process;
 mod publish;
 mod remote;
@@ -76,6 +77,7 @@ fn show_main_window(app: &AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        presence::set_window_visible(true);
     }
 }
 
@@ -144,6 +146,7 @@ pub fn run() {
                 minecraft: Arc::default(),
                 minecraft_sign_in: Mutex::default(),
             });
+            presence::start();
             app.state::<AppState>().rewatch(app.handle());
             announcer::start(app.handle().clone());
             app.manage(self_update::SelfUpdate::default());
@@ -178,6 +181,7 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
+                presence::set_window_visible(false);
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -332,6 +336,7 @@ pub fn run() {
             system_commands::check_for_update,
             system_commands::install_update,
             system_commands::set_auto_update,
+            system_commands::set_discord_shows_pack,
             system_commands::update_changelog,
             system_commands::dismiss_update_changelog,
             discord_commands::get_webhook,

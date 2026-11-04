@@ -255,3 +255,10 @@ pub fn set_auto_update(app: AppHandle, state: State<'_, AppState>, enabled: bool
     crate::self_update::auto_update_changed(&app, enabled);
     Ok(())
 }
+
+#[tauri::command]
+pub fn set_discord_shows_pack(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    state.update_settings(|s| s.discord_shows_pack = enabled).map_err(|e| format!("{e:#}"))?;
+    state.update_presence();
+    Ok(())
+}

@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.4]
+## [0.4.4] - 2026-11-03
 ### Fixed
 - Improved the responsiveness of detecting when Curseforge has approved a file
 
@@ -237,7 +237,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 - Mod updates skip jars Minecraft is currently holding open instead of stopping partway
 - Failed downloads will retry up to three times
 
-[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.4.4...HEAD
+[0.4.4]: https://github.com/muon-rw/packraven/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/muon-rw/packraven/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/muon-rw/packraven/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/muon-rw/packraven/compare/v0.4.0...v0.4.1

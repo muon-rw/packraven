@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::curseforge;
+use crate::curseforge::{self, FileState};
 use crate::http::CLIENT;
 use crate::modrinth;
 use crate::pack::{DiscordConfig, Pack, CHANGELOG_ARCHIVE};
@@ -13,7 +13,6 @@ const DESCRIPTION_LIMIT: usize = 4000;
 const TITLE_LIMIT: usize = 256;
 const USERNAME_LIMIT: usize = 80;
 const DISCOHOOK_SHARE: &str = "https://discohook.app/api/v1/share";
-const APPROVED_STATUSES: [u32; 2] = [4, 10];
 
 pub struct Announcement {
     pub name: String,
@@ -165,18 +164,39 @@ pub async fn discohook_link(message: &Value) -> Result<String> {
     response.get("url").and_then(Value::as_str).map(String::from).context("Discohook didn't return a link")
 }
 
-/// Returns whether every platform the release went to lists it. Modrinth usually lists a version on
-/// an approved project as soon as we upload it, but it can hold one for review too.
-pub async fn is_approved(release: &Release) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Listing {
+    Public,
+    /// Still in CurseForge's automated processing or review, which usually takes minutes.
+    Pending,
+    /// Waiting on a moderator, on you, or on something we couldn't check.
+    Held,
+}
+
+/// Returns whether every platform the release went to lists it, taking the slowest platform's listing.
+/// Modrinth usually lists a version on an approved project as soon as we upload it, but it can hold one
+/// for review too.
+pub async fn listing(release: &Release) -> Listing {
     let on_curseforge = match &release.curseforge {
-        Some(published) => matches!(curseforge::file(published.project_id, published.file_id).await, Ok(Some(file)) if APPROVED_STATUSES.contains(&file.file_status)),
-        None => true,
+        Some(published) => match curseforge::file(published.project_id, published.file_id).await {
+            Ok(Some(file)) => match curseforge::file_state(file.file_status) {
+                FileState::Approved => Listing::Public,
+                FileState::Processing | FileState::InReview => Listing::Pending,
+                _ => Listing::Held,
+            },
+            _ if release.uploaded_to_curseforge_recently() => Listing::Pending,
+            _ => Listing::Held,
+        },
+        None => Listing::Public,
     };
     let on_modrinth = match &release.modrinth {
-        Some(published) => matches!(modrinth::version(&published.version_id).await, Ok(Some(version)) if version.status.as_deref().is_none_or(|status| status == "listed")),
-        None => true,
+        Some(published) => match modrinth::version(&published.version_id).await {
+            Ok(Some(version)) if version.status.as_deref().is_none_or(|status| status == "listed") => Listing::Public,
+            _ => Listing::Held,
+        },
+        None => Listing::Public,
     };
-    on_curseforge && on_modrinth
+    on_curseforge.max(on_modrinth)
 }
 
 pub async fn announcement(pack: &Pack, release: &Release) -> Announcement {

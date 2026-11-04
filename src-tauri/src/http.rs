@@ -6,9 +6,11 @@ use futures_util::StreamExt;
 use sha1::{Digest, Sha1};
 use tokio::io::AsyncWriteExt;
 
+pub const USER_AGENT: &str = concat!("muon-rw/packraven/", env!("CARGO_PKG_VERSION"));
+
 pub static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .user_agent(concat!("muon-rw/packraven/", env!("CARGO_PKG_VERSION")))
+        .user_agent(USER_AGENT)
         .build()
         .expect("http client")
 });

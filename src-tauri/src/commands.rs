@@ -988,8 +988,8 @@ pub struct Attention {
 #[tauri::command]
 pub async fn release_attention(state: State<'_, AppState>, version: String) -> CmdResult<Option<Attention>> {
     let Some(release) = publish::load_releases(&state.pack_data().join("releases.json")).into_iter().find(|r| r.version == version) else { return Ok(None) };
+    let recent = release.uploaded_to_curseforge_recently();
     let Some(published) = release.curseforge else { return Ok(None) };
-    let recent = recently(published.last_upload.as_deref().unwrap_or(&release.published_at));
     for (file, id) in [("client", Some(published.file_id)), ("server", published.server_file_id)] {
         let Some(id) = id else { continue };
         let (_, found) = describe_file(&curseforge::file(published.project_id, id).await, recent);
@@ -1009,10 +1009,6 @@ fn describe_file(lookup: &Result<Option<curseforge::CfFile>>, recent: bool) -> (
         Ok(None) => ("Gone from CurseForge".into(), Some(curseforge::FileState::Deleted)),
         Err(_) => ("Couldn't check".into(), None),
     }
-}
-
-fn recently(timestamp: &str) -> bool {
-    chrono::DateTime::parse_from_rfc3339(timestamp).is_ok_and(|at| chrono::Utc::now().signed_duration_since(at) < chrono::Duration::minutes(15))
 }
 
 #[tauri::command]
@@ -1039,7 +1035,7 @@ pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus
                     Some(id) => Some(curseforge::file(published.project_id, id).await),
                     None => None,
                 };
-                let recent = recently(published.last_upload.as_deref().unwrap_or(&release.published_at));
+                let recent = release.uploaded_to_curseforge_recently();
                 let (status, state) = describe_file(&file_lookup, recent);
                 let (server_status, server_state) = match (&server_lookup, published.server_pack_uploaded_by_you) {
                     (Some(lookup), _) => describe_file(lookup, recent),

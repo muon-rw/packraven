@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::credentials::{self, Credential};
-use crate::http::CLIENT;
+use crate::http::{CLIENT, USER_AGENT};
 use crate::pack::ModLoader;
 
 const CORE_API: &str = "https://api.curseforge.com/v1";
@@ -241,8 +241,18 @@ pub async fn fingerprint_matches(fingerprints: &[u32]) -> Result<Vec<Fingerprint
     Ok(serde_json::from_value(data["exactMatches"].take())?)
 }
 
+// CloudFront caches api.curseforge.com responses per User-Agent and ignores query strings and
+// Cache-Control, so the status packraven saw right after an upload kept coming back for many minutes.
+// We change the User-Agent every 30 seconds, which keeps a status that fresh while lookups within
+// the same 30 seconds still come from the cache.
+const FILE_STATUS_FRESHNESS_SECS: i64 = 30;
+
 pub async fn file(project_id: u64, file_id: u64) -> Result<Option<CfFile>> {
-    match core_get(&format!("/mods/{project_id}/files/{file_id}")).await {
+    let key = core_key().context(NO_CORE_KEY)?;
+    let user_agent = format!("{USER_AGENT} (status {})", chrono::Utc::now().timestamp() / FILE_STATUS_FRESHNESS_SECS);
+    let request = CLIENT.get(format!("{CORE_API}/mods/{project_id}/files/{file_id}")).header("x-api-key", key).header(reqwest::header::USER_AGENT, user_agent);
+    let response = async { anyhow::Ok(request.send().await?.error_for_status()?.json::<Value>().await?["data"].take()) };
+    match response.await {
         Ok(data) => Ok(Some(serde_json::from_value(data)?)),
         Err(error) if error.downcast_ref::<reqwest::Error>().and_then(|e| e.status()).is_some_and(|s| s.as_u16() == 404) => Ok(None),
         Err(error) => Err(error),

@@ -47,6 +47,16 @@ pub struct Release {
     pub update_checker: Option<update_checker::Entry>,
 }
 
+impl Release {
+    /// Returns whether we uploaded a CurseForge file for this release in the last 15 minutes, which
+    /// CurseForge's API may not find yet.
+    pub fn uploaded_to_curseforge_recently(&self) -> bool {
+        let Some(curseforge) = &self.curseforge else { return false };
+        let at = curseforge.last_upload.as_deref().unwrap_or(&self.published_at);
+        chrono::DateTime::parse_from_rfc3339(at).is_ok_and(|at| chrono::Utc::now().signed_duration_since(at) < chrono::Duration::minutes(15))
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase", tag = "step")]
 pub enum PendingStep {
@@ -484,7 +494,9 @@ fn save_release(releases_path: &Path, release: &Release) -> Result<()> {
         Some(stored) => *stored = release.clone(),
         None => releases.push(release.clone()),
     }
-    save_releases(releases_path, &releases)
+    save_releases(releases_path, &releases)?;
+    crate::announcer::check_soon();
+    Ok(())
 }
 
 // Recording a release also archives its notes and clears changelog.md for the next one.
@@ -822,6 +834,7 @@ pub async fn upload_release_to_modrinth(pack: &Pack, pack_data: &Path, version: 
     release.modrinth = Some(uploaded);
     release.modrinth_error = None;
     save_releases(&releases_path, &releases)?;
+    crate::announcer::check_soon();
     Ok(message)
 }
 

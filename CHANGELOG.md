@@ -2,6 +2,11 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6]
+### Changed
+- No longer copy the entire client changelog into the server pack's changelog
+- Publish now warns if your mods changed since your last successful end to end launch (server with a client join)
+
 ## [0.4.5] - 2026-11-04
 ### Added
 - Discord Rich Presence. Show people how hard you're working!

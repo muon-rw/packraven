@@ -411,6 +411,9 @@ export interface ServerPackUpload {
 }
 
 // A release CurseForge or Modrinth is still missing a pack for, read from what packraven recorded.
+// Why Publish warns that you haven't tested the pack as it is now. null means you have.
+export type Untested = { kind: 'never' } | { kind: 'changed'; mods: number; minecraft: boolean; loader: boolean }
+
 export interface UnfinishedRelease {
   version: string
   displayName: string | null
@@ -803,7 +806,7 @@ export const api = {
   modDescription: (key: string) => invoke<RemoteText>('mod_description', { key }),
   removeMods: (paths: string[]) => invoke<void>('remove_mods', { paths }),
   publishPreflight: (version: string) =>
-    invoke<{ problems: string[]; warnings: string[]; tagTaken: boolean; client: UploadNames; server: UploadNames; modrinthFile: string; curseforgeShipped: OverrideFileView[]; curseforgeLeftOut: OverrideFileView[]; modrinthShipped: OverrideFileView[]; modrinthLeftOut: OverrideFileView[] }>('publish_preflight', { version }),
+    invoke<{ problems: string[]; warnings: string[]; untested: Untested | null; tagTaken: boolean; client: UploadNames; server: UploadNames; modrinthFile: string; curseforgeShipped: OverrideFileView[]; curseforgeLeftOut: OverrideFileView[]; modrinthShipped: OverrideFileView[]; modrinthLeftOut: OverrideFileView[] }>('publish_preflight', { version }),
   buildClientExport: () => invoke<void>('build_client_export'),
   buildModrinthExport: () => invoke<void>('build_modrinth_export'),
   uploadReleaseToModrinth: (version: string) => invoke<void>('upload_release_to_modrinth', { version }),

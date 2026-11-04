@@ -438,7 +438,7 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
         let mut curseforge = CurseforgeRelease { project_id: pack.config.curseforge.project_id, file_id, server_file_id: None, unsent_server_pack: Some(unsent), server_pack_uploaded_by_you: false, last_upload: Some(chrono::Utc::now().to_rfc3339()) };
         release.curseforge = Some(curseforge.clone());
         record(&pack, &releases_path, &release, &notes, &baseline_path)?;
-        if let Err(error) = upload_server_pack(&mut curseforge, &server_zip, server_names, &notes, &release_type, &log).await {
+        if let Err(error) = upload_server_pack(&mut curseforge, &server_zip, server_names, &release_type, &log).await {
             log.stream("err", &format!("Couldn't upload the server pack: {error:#}"));
         }
         release.curseforge = Some(curseforge);
@@ -579,14 +579,13 @@ async fn upload_client_pack(pack: &Pack, zip: &Path, names: UploadNames, notes: 
 }
 
 // Either way the outcome goes on the release: the server file, or why it isn't there.
-async fn upload_server_pack(curseforge: &mut CurseforgeRelease, zip: &Path, names: UploadNames, notes: &str, release_type: &str, log: &Log) -> Result<u64> {
+async fn upload_server_pack(curseforge: &mut CurseforgeRelease, zip: &Path, names: UploadNames, release_type: &str, log: &Log) -> Result<u64> {
     log.info(format!("Uploading {} as {}", zip.display(), names.file_name));
+    // We put the release notes on the client pack only; repeating them here just clutters the file list.
     let metadata = json!({
-        "changelog": notes,
-        "changelogType": "markdown",
+        "changelog": "",
         "displayName": names.display_name,
-        "parentFileID": curseforge.file_id,
-        "releaseType": release_type,
+        "parentFileID": curseforge.file_id,        "releaseType": release_type,
     });
     match curseforge::upload(curseforge.project_id, zip, names.file_name.clone(), metadata).await {
         Ok(server_file_id) => {
@@ -650,8 +649,7 @@ pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, versi
     curseforge::check_upload_size(&zip, "server pack")?;
     let names = curseforge.unsent_server_pack.as_ref().map_or_else(|| default_server_names(pack), |u| u.names.clone());
     let names = UploadNames { display_name: names.display_name.replace(VERSION_TOKEN, version), file_name: names.file_name.replace(VERSION_TOKEN, version) };
-    let notes = std::fs::read_to_string(pack.dir.join(CHANGELOG_ARCHIVE).join(format!("{version}.md"))).unwrap_or_default();
-    let uploaded = upload_server_pack(curseforge, &zip, names, &notes, &release_type, log).await;
+    let uploaded = upload_server_pack(curseforge, &zip, names, &release_type, log).await;
     save_release(&releases_path, &release)?;
     Ok(format!("Uploaded the {version} server pack to CurseForge as file {}", uploaded?))
 }

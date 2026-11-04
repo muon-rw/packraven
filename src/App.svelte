@@ -548,6 +548,12 @@
   let paneMode = $derived<'single' | 'split' | 'tabs'>(!split ? 'single' : tabbed ? 'tabs' : 'split')
   let leftWidth = $derived(clamp(Math.round((paneSplit.value ?? 0.5) * splitTotal), PANE_MIN, splitTotal - PANE_MIN))
 
+  // A split too narrow to show side by side becomes tabs, and then you'd lose sight of the view you came from anyway.
+  function openBesideIfRoom(view: View, pane: number) {
+    if (splitTotal >= 2 * PANE_MIN) openBeside(view)
+    else showFrom(view, pane)
+  }
+
   function onTabKey(event: KeyboardEvent) {
     if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return
     event.preventDefault()
@@ -809,7 +815,7 @@
       {#if loadError}<div class="banner">{@render loadNotice(index)}</div>{/if}
       <Git onchange={refresh} />
     {:else if pane === 'publish'}
-      <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFrom('pack', index)} onreleases={() => showFrom('releases', index)} />
+      <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFrom('pack', index)} onreleases={() => showFrom('releases', index)} onrun={() => openBesideIfRoom('test', index)} onappsettings={() => showFrom('settings', index)} />
     {:else if pane === 'releases'}
       <Releases onsettings={() => showFrom('pack', index)} onappsettings={() => showFrom('settings', index)} />
     {:else if pane === 'pack' && packs?.active}

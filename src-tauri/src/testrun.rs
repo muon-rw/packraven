@@ -1,9 +1,11 @@
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, Command};
@@ -13,7 +15,7 @@ use crate::export::{local_dev_jars, server_args};
 use crate::jobs::Log;
 use crate::launch::{self, Player};
 use crate::mirror::{mirror, FilePlan, MirrorReport, Planned};
-use crate::pack::Pack;
+use crate::pack::{LockEntry, ModKey, Pack};
 use crate::process::{spawn_watched, LineHook};
 use crate::settings::{RunArgs, Settings};
 
@@ -21,6 +23,7 @@ use crate::settings::{RunArgs, Settings};
 const KEPT_ON_RESYNC: [&str; 5] = ["world", "logs", "crash-reports", "usercache.json", ".fabric"];
 // We join by IP rather than "localhost", which can resolve to IPv6 first and miss a server bound to IPv4.
 const TEST_SERVER_IP: &str = "127.0.0.1";
+const TESTED_MODS: &str = "tested-mods.json";
 
 #[derive(Default)]
 pub struct Managed {
@@ -137,7 +140,97 @@ fn test_properties(text: &str, port: u16) -> String {
     lines.join("\n") + "\n"
 }
 
-pub async fn run_server(app: AppHandle, run: Arc<TestRun>, pack: &Pack, java: PathBuf, test_dir: PathBuf, run_args: RunArgs, ready: watch::Sender<bool>, log: Log) -> Result<String> {
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct TestedMods {
+    files: Vec<TestedFile>,
+    client_only: Vec<String>,
+    keep: Vec<String>,
+    minecraft: Option<String>,
+    loader: Option<String>,
+}
+
+// We match a file by its project when it has one, so an update counts as one changed mod rather than
+// a removal and an addition.
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct TestedFile {
+    id: String,
+    sha1: String,
+}
+
+#[derive(Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+pub enum Untested {
+    Never,
+    Changed { mods: usize, minecraft: bool, loader: bool },
+}
+
+impl TestedMods {
+    // Publish reruns this on every change, so we take each jar's sha1 from the mod list rather than
+    // reading hundreds of megabytes. Override jars aren't in the mod list, but there are few of them,
+    // and a rebuild can keep the name, so we hash those ourselves.
+    pub fn of(pack: &Pack) -> Self {
+        let locked: HashMap<&str, &LockEntry> = pack.lock.files.iter().map(|entry| (entry.path.as_str(), entry)).collect();
+        let mut files: Vec<TestedFile> = std::fs::read_dir(pack.dir.join("mods"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let path = format!("mods/{}", entry.file_name().to_string_lossy());
+                if !crate::modsync::is_binary(&path) || !entry.metadata().is_ok_and(|m| m.is_file()) {
+                    return None;
+                }
+                Some(match locked.get(path.as_str()) {
+                    Some(locked) => TestedFile { id: locked.key().map_or(path, |key| key.to_string()), sha1: locked.sha1.clone() },
+                    None => TestedFile { sha1: hex::encode(Sha1::digest(std::fs::read(entry.path()).ok()?)), id: path },
+                })
+            })
+            .collect();
+        files.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        let keys = |keys: &[ModKey]| keys.iter().map(ToString::to_string).collect();
+        Self {
+            files,
+            client_only: keys(&pack.config.server.client_only),
+            keep: keys(&pack.config.server.keep),
+            minecraft: pack.lock.minecraft.clone(),
+            loader: pack.lock.loader.as_ref().map(ToString::to_string),
+        }
+    }
+
+    // Moving a mod on or off the server changes what a test runs, so it counts as that mod changing.
+    fn changed_since(&self, tested: &TestedMods) -> Option<Untested> {
+        let index = |mods: &TestedMods| -> HashMap<String, String> { mods.files.iter().map(|f| (f.id.clone(), f.sha1.clone())).collect() };
+        let (before, after) = (index(tested), index(self));
+        let mut changed: HashSet<&String> = before.keys().chain(after.keys()).filter(|id| before.get(*id) != after.get(*id)).collect();
+        for (was, is) in [(&tested.client_only, &self.client_only), (&tested.keep, &self.keep)] {
+            changed.extend(was.iter().filter(|key| !is.contains(key)).chain(is.iter().filter(|key| !was.contains(key))));
+        }
+        let (minecraft, loader) = (self.minecraft != tested.minecraft, self.loader != tested.loader);
+        (!changed.is_empty() || minecraft || loader).then_some(Untested::Changed { mods: changed.len(), minecraft, loader })
+    }
+}
+
+pub fn untested(pack_data: &Path, pack: &Pack) -> Option<Untested> {
+    let tested = std::fs::read_to_string(pack_data.join(TESTED_MODS)).ok().and_then(|text| serde_json::from_str::<TestedMods>(&text).ok());
+    match tested {
+        Some(tested) => TestedMods::of(pack).changed_since(&tested),
+        None => Some(Untested::Never),
+    }
+}
+
+// A player reaching the world is our best sign the run worked, so we record the mods it ran with then.
+pub struct JoinRecord {
+    path: PathBuf,
+    contents: String,
+}
+
+impl JoinRecord {
+    pub fn new(pack_data: &Path, pack: &Pack) -> Result<Self> {
+        Ok(Self { path: pack_data.join(TESTED_MODS), contents: serde_json::to_string(&TestedMods::of(pack))? })
+    }
+}
+
+pub async fn run_server(app: AppHandle, run: Arc<TestRun>, pack: &Pack, java: PathBuf, test_dir: PathBuf, run_args: RunArgs, ready: watch::Sender<bool>, tested: JoinRecord, log: Log) -> Result<String> {
     let (extra_jvm, extra) = (run_args.server_jvm(), run_args.server());
     log_extra_args(&log, &extra_jvm, &extra);
     let mut command = Command::new(&java);
@@ -149,6 +242,7 @@ pub async fn run_server(app: AppHandle, run: Arc<TestRun>, pack: &Pack, java: Pa
             emit(&hook_app, "server-ready", line);
         } else if let Some(index) = line.find(" joined the game") {
             let name = line[..index].rsplit(' ').next().unwrap_or_default();
+            let _ = std::fs::write(&tested.path, &tested.contents);
             emit(&hook_app, "player-joined", name);
         }
     });
@@ -201,5 +295,47 @@ mod tests {
     fn test_server_listens_on_this_pc_only() {
         let properties = test_properties("motd=Ravens\nonline-mode=false\nserver-ip=0.0.0.0\nserver-port=1\n", 25565);
         assert_eq!(properties, "motd=Ravens\nonline-mode=false\nserver-ip=127.0.0.1\nserver-port=25565\n");
+    }
+
+    fn pack_in(name: &str) -> Pack {
+        let dir = std::env::temp_dir().join(format!("packraven-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("mods")).unwrap();
+        Pack { dir, config: Default::default(), lock: Default::default() }
+    }
+
+    fn hosted(path: &str, project_id: u64, sha1: &str) -> LockEntry {
+        LockEntry::curseforge(path.into(), sha1.into(), 1, crate::pack::CurseforgeFile { project_id, file_id: 1, url: String::new() })
+    }
+
+    #[test]
+    fn rebuilding_an_override_jar_under_the_same_name_needs_a_new_test() {
+        let pack = pack_in("rebuilt-override");
+        std::fs::write(pack.dir.join("mods/own.jar"), "build 1").unwrap();
+        let tested = TestedMods::of(&pack);
+        std::fs::write(pack.dir.join("mods/notes.txt"), "not a mod").unwrap();
+        let other_files = TestedMods::of(&pack).changed_since(&tested);
+        std::fs::write(pack.dir.join("mods/own.jar"), "build 2").unwrap();
+        let rebuilt = TestedMods::of(&pack).changed_since(&tested);
+        let _ = std::fs::remove_dir_all(&pack.dir);
+        assert_eq!(other_files, None);
+        assert_eq!(rebuilt, Some(Untested::Changed { mods: 1, minecraft: false, loader: false }));
+    }
+
+    #[test]
+    fn updating_a_mod_and_moving_it_off_the_server_counts_as_one_change() {
+        let mut pack = pack_in("updated-mod");
+        std::fs::write(pack.dir.join("mods/a-1.jar"), "a").unwrap();
+        pack.lock.files = vec![hosted("mods/a-1.jar", 1, "old")];
+        let tested = TestedMods::of(&pack);
+        std::fs::remove_file(pack.dir.join("mods/a-1.jar")).unwrap();
+        std::fs::write(pack.dir.join("mods/a-2.jar"), "a").unwrap();
+        pack.lock.files = vec![hosted("mods/a-2.jar", 1, "new")];
+        pack.config.server.client_only.push(ModKey::Curseforge(1));
+        let changed = TestedMods::of(&pack).changed_since(&tested);
+        let never = untested(&pack.dir.join("no-pack-data"), &pack);
+        let _ = std::fs::remove_dir_all(&pack.dir);
+        assert_eq!(changed, Some(Untested::Changed { mods: 1, minecraft: false, loader: false }));
+        assert_eq!(never, Some(Untested::Never));
     }
 }

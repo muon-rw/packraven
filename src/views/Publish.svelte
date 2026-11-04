@@ -3,8 +3,8 @@
   import { onMount, tick } from 'svelte'
   import { ask } from '@tauri-apps/plugin-dialog'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type OverrideFileView, type Overview, type PackConfig, type PublishedTo, type UnfinishedRelease, type UpdateCheckerSetup, type UpdateType, type UploadNames } from '../lib/api'
-  import { job, onJobEnd } from '../lib/jobs.svelte'
+  import { api, errorText, type OverrideFileView, type Overview, type PackConfig, type PublishedTo, type UnfinishedRelease, type Untested, type UpdateCheckerSetup, type UpdateType, type UploadNames } from '../lib/api'
+  import { job, onJobEnd, testState } from '../lib/jobs.svelte'
   import RenderedChangelog from '../components/RenderedChangelog.svelte'
   import JobLog from '../components/JobLog.svelte'
   import LinkedText from '../components/LinkedText.svelte'
@@ -20,7 +20,17 @@
     onchanges,
     onsettings,
     onreleases,
-  }: { overview: Overview | null; onchange: () => void; onchanges: () => void; onsettings: () => void; onreleases: () => void } = $props()
+    onrun,
+    onappsettings,
+  }: {
+    overview: Overview | null
+    onchange: () => void
+    onchanges: () => void
+    onsettings: () => void
+    onreleases: () => void
+    onrun: () => void
+    onappsettings: () => void
+  } = $props()
 
   let push = $state(true)
   // Which collapsed groups of files you opened in What we'll ship.
@@ -60,6 +70,7 @@
   }
   let problems: string[] = $state([])
   let exportWarnings: string[] = $state([])
+  let untested = $state<Untested | null>(null)
   let checking = $state(true)
   // The first check fills in most of the view, so until it lands we say what's happening at the top.
   let checkedOnce = $state(false)
@@ -212,6 +223,8 @@
     void overview?.notOnCurseforge.length
     void overview?.notOnModrinth.length
     void job('publish').finishedRuns
+    // A join records the mods the test ran with, so it can clear the untested warning.
+    void testState.players.length
     let current = true
     checking = true
     const timer = setTimeout(() => {
@@ -221,6 +234,7 @@
           checkedOnce = true
           problems = result.problems
           exportWarnings = result.warnings
+          untested = result.untested
           tagTaken = result.tagTaken
           defaultNames = { client: result.client, server: result.server }
           modrinthFile = result.modrinthFile
@@ -320,6 +334,17 @@
     return () => {
       current = false
     }
+  })
+  let untestedText = $derived.by(() => {
+    if (!untested) return null
+    if (untested.kind === 'never') return "You haven't joined a test server with this pack yet."
+    const changes = [
+      untested.mods ? `${untested.mods} ${untested.mods === 1 ? 'mod' : 'mods'}` : null,
+      untested.minecraft ? 'the Minecraft version' : null,
+      untested.loader ? 'the loader version' : null,
+    ].filter((change): change is string => !!change)
+    const listed = changes.length > 1 ? `${changes.slice(0, -1).join(', ')} and ${changes.at(-1)}` : changes[0]
+    return `${listed[0].toUpperCase()}${listed.slice(1)} changed since you last joined a test server.`
   })
   let emptyNotes = $derived(changelog !== null && !changelog.trim())
   let warnings = $derived(
@@ -646,7 +671,13 @@
       {#if checkerProblem}
         <li class="warn">
           <svg viewBox="0 0 16 16" role="img" aria-label="Warning"><path d="M8 3v6M8 12v1" /></svg>
-          <span>packraven won't be able to add {trimmed || 'this release'} to the update checker. {checkerProblem} <button class="link" onclick={() => (nav.view = 'settings')}>Open App settings</button></span>
+          <span>packraven won't be able to add {trimmed || 'this release'} to the update checker. {checkerProblem} <button class="link" onclick={onappsettings}>Open App settings</button></span>
+        </li>
+      {/if}
+      {#if untestedText}
+        <li class="warn">
+          <svg viewBox="0 0 16 16" role="img" aria-label="Warning"><path d="M8 3v6M8 12v1" /></svg>
+          <span>{untestedText} <button class="link" onclick={onrun}>Run a Quick test</button> before you publish.</span>
         </li>
       {/if}
       {#if !blockers.length && !warnings.length && !checkerProblem && !checking}
@@ -846,7 +877,7 @@
     <p class="muted small" id="commit-hint">
       Leave it empty to use "{defaultMessage}". We'll commit any remaining changes along with the new version
       and archived notes. The commit author will be {identity ?? 'the name and email in your git config'}.
-      <button class="link" onclick={() => (nav.view = 'settings')}>Change in App settings</button>
+      <button class="link" onclick={onappsettings}>Change in App settings</button>
     </p>
     {#if uncommitted.length}
       <details>

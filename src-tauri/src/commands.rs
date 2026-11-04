@@ -438,6 +438,7 @@ pub fn set_side_override(state: State<'_, AppState>, key: String, mode: String) 
 pub struct Preflight {
     problems: Vec<String>,
     warnings: Vec<String>,
+    untested: Option<testrun::Untested>,
     tag_taken: bool,
     client: publish::UploadNames,
     server: publish::UploadNames,
@@ -481,6 +482,7 @@ pub fn publish_preflight(state: State<'_, AppState>, version: String) -> CmdResu
             problems
         },
         warnings,
+        untested: testrun::untested(&state.pack_data(), &pack),
         tag_taken: !version.is_empty() && publish::tag_exists(&pack, version),
         client: publish::default_client_names(&pack),
         server: publish::default_server_names(&pack),
@@ -819,6 +821,7 @@ pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, 
     let (data_dir, cache_path) = (state.data_dir.clone(), state.cache_path());
     let test_dir = state.pack_data().join("test-server");
     let natives = state.pack_data().join("natives");
+    let tested = testrun::JoinRecord::new(&state.pack_data(), &pack).map_err(err)?;
     let run_args = settings.combined_run_args(&settings.instance_dir);
     let jobs = state.jobs.clone();
     let run = state.test.clone();
@@ -845,7 +848,7 @@ pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, 
         let server_pack = Pack::open(&pack.dir)?;
         let (server_app, server_run) = (job_app.clone(), run.clone());
         jobs.start(&job_app, "server", move |server_log| async move {
-            testrun::run_server(server_app, server_run, &server_pack, java, test_dir, run_args, ready_tx, server_log).await
+            testrun::run_server(server_app, server_run, &server_pack, java, test_dir, run_args, ready_tx, tested, server_log).await
         })
         .map_err(anyhow::Error::msg)?;
         let Some(player) = player else { return Ok("Server starting".into()) };

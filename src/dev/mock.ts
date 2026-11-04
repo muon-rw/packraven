@@ -1249,6 +1249,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       problems: [...(blocker ? [blocker] : []), ...preflight, ...modrinth],
       tagTaken,
       warnings: scenario === 'dirty' ? ['betterclouds-neoforge-1.3.2.jar is disabled, so packraven leaves it out of the export.'] : [],
+      untested: scenario === 'dirty' ? { kind: 'changed', mods: 3, minecraft: false, loader: false } : scenario === 'empty' ? { kind: 'never' } : null,
       client: { displayName: `${pack.name} {version}`, fileName: `${stem}.zip` },
       server: { displayName: 'Server Pack {version}', fileName: `${stem}-server.zip` },
       modrinthFile: `${stem}.mrpack`,

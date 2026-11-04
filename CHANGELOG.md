@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.6]
+## [0.4.6] - 2026-11-04
 ### Changed
 - No longer copy the entire client changelog into the server pack's changelog
 - Publish now warns if your mods changed since your last successful end to end launch (server with a client join)
@@ -246,7 +246,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 - Mod updates skip jars Minecraft is currently holding open instead of stopping partway
 - Failed downloads will retry up to three times
 
-[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.4.5...HEAD
+[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.4.6...HEAD
+[0.4.6]: https://github.com/muon-rw/packraven/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/muon-rw/packraven/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/muon-rw/packraven/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/muon-rw/packraven/compare/v0.4.2...v0.4.3

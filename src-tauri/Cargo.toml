@@ -1,6 +1,6 @@
 [package]
 name = "packraven"
-version = "0.4.4"
+version = "0.4.5"
 description = "Release console for CurseForge modpacks"
 authors = ["muon-rw"]
 license = ""

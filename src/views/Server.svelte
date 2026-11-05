@@ -12,7 +12,7 @@
   import { commandKey, shortcut } from '../lib/platform'
   import { paneFocus } from '../lib/panes.svelte'
 
-  let { overview }: { overview: Overview | null } = $props()
+  let { overview, onfiles }: { overview: Overview | null; onfiles: (path: string) => void } = $props()
 
   type Tab = typeof serverView.tab
   type Settings = Pick<PackConfig['server'], 'memory' | 'jvm_args' | 'args' | 'graalvm' | 'properties'>
@@ -189,14 +189,13 @@
         {#if serverView.tab === 'properties'}
           Written to <span class="file">server.properties</span> in every server pack and test run. All other values fall back to vanilla or modded defaults.
         {:else if serverView.tab === 'startup'}
-          Startup settings for the published server pack. We'll write these into the pack's <span class="file">user_jvm_args.txt</span> and run scripts.
+          Startup settings for the published server pack. We'll write these into the pack's <span class="file">user_jvm_args.txt</span>, run scripts and <span class="file">PLEASE READ - IMPORTANT!.txt</span>.
         {:else if loading && !mods.length}
           Reading which mods the server needs.
         {:else if !mods.length}
           This pack has no mods yet.
         {:else}
-          {mods.length} {mods.length === 1 ? 'mod' : 'mods'}, {excludedCount || 'none'} excluded from the server. We decide from their CurseForge and Modrinth tags and
-          their own metadata, and we always keep a mod that a server mod requires. Change any mod below; test runs and Publish build server packs from these choices.
+          {mods.length} {mods.length === 1 ? 'mod' : 'mods'}, {excludedCount || 'none'} excluded from the server. Test runs and Publish build server packs from these choices.
         {/if}
       </p>
     </div>
@@ -251,6 +250,7 @@
         {launch}
         {testPort}
         onchange={saveSettings}
+        {onfiles}
       />
     {/if}
   {:else}

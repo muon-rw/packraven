@@ -372,10 +372,13 @@
     gap: 16px 18px;
   }
 
+  /* Text inputs keep their size=20 width unless we let them shrink, which overflowed the 200px columns. */
   .field {
     display: grid;
+    grid-template-columns: minmax(0, 1fr);
     gap: 6px;
     align-content: start;
+    min-width: 0;
   }
 
   .field > label,
@@ -420,6 +423,7 @@
   .control > input,
   .control > select {
     flex: 1;
+    min-width: 0;
   }
 
   /* Numbers stay short so their unit sits beside them, and a field with a hint takes two columns

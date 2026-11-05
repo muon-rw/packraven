@@ -548,10 +548,19 @@
   let paneMode = $derived<'single' | 'split' | 'tabs'>(!split ? 'single' : tabbed ? 'tabs' : 'split')
   let leftWidth = $derived(clamp(Math.round((paneSplit.value ?? 0.5) * splitTotal), PANE_MIN, splitTotal - PANE_MIN))
 
+  // Files needs room for its tree beside an editor you can read, more than other views.
+  const FILES_PANE_MIN = 600
+
   // A split too narrow to show side by side becomes tabs, and then you'd lose sight of the view you came from anyway.
-  function openBesideIfRoom(view: View, pane: number) {
-    if (splitTotal >= 2 * PANE_MIN) openBeside(view)
+  function openBesideIfRoom(view: View, pane: number, min = PANE_MIN) {
+    const room = splitTotal >= 2 * PANE_MIN && splitTotal - leftWidth >= min
+    if (!split && room) openBeside(view)
     else showFrom(view, pane)
+  }
+
+  function openFileBesideIfRoom(path: string, pane: number) {
+    nav.filePath = path
+    openBesideIfRoom('files', pane, FILES_PANE_MIN)
   }
 
   function onTabKey(event: KeyboardEvent) {
@@ -803,7 +812,7 @@
     {:else if pane === 'mods'}
       <Mods pack={packs?.active ?? null} {publishesTo} game={overview ? `${overview.minecraft} ${loaderName(overview.loader).split(' ')[0]}` : 'this pack'} clientRunning={!!overview?.clientRunning} ontest={() => showFrom('test', index)} />
     {:else if pane === 'server'}
-      <Server {overview} />
+      <Server {overview} onfiles={(path) => openFileBesideIfRoom(path, index)} />
     {:else if pane === 'test'}
       <TestRun {overview} onserver={() => showFrom('server', index)} onappsettings={() => showFrom('settings', index)} />
     {:else if pane === 'files'}

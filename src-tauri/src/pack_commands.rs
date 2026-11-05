@@ -4,8 +4,9 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::commands::AppState;
+use crate::export::{ServerMods, ServerReadme};
 use crate::join;
-use crate::pack::SERVER_ICON;
+use crate::pack::{DEFAULT_SERVER_README, SERVER_ICON, SERVER_README};
 use crate::server_icon;
 use crate::settings::RunArgs;
 use crate::setup::{self, InstanceInfo, SetupOptions};
@@ -164,6 +165,24 @@ pub fn remove_server_icon(state: State<'_, AppState>) -> CmdResult<()> {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(format!("Couldn't remove server-icon.png: {error}")),
         _ => Ok(()),
     }
+}
+
+// We start your copy from the default template, so you edit the README you'd otherwise ship.
+#[tauri::command]
+pub fn customize_server_readme(state: State<'_, AppState>) -> CmdResult<()> {
+    let path = state.pack().map_err(err)?.dir.join(SERVER_README);
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::write(&path, DEFAULT_SERVER_README).map_err(|e| format!("Couldn't create {SERVER_README}: {e}"))
+}
+
+// We preview the README a published server pack would get, since that's the one hosts download.
+#[tauri::command]
+pub fn server_readme(state: State<'_, AppState>) -> CmdResult<ServerReadme> {
+    let pack = state.pack().map_err(err)?;
+    let version = pack.version().unwrap_or_else(|| "{version}".into());
+    crate::export::server_readme(&pack, &version, ServerMods::DownloadedOnStart).map_err(err)
 }
 
 #[derive(Serialize)]

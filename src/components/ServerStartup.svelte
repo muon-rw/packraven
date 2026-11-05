@@ -1,4 +1,6 @@
 <script lang="ts">
+  import ServerReadme from './ServerReadme.svelte'
+
   let {
     memory,
     jvmArgs,
@@ -8,6 +10,7 @@
     launch,
     testPort,
     onchange,
+    onfiles,
   }: {
     memory: string
     jvmArgs: string[]
@@ -17,6 +20,7 @@
     launch: { windows: string; unix: string } | null
     testPort: number
     onchange: (changes: { memory?: string; jvm_args?: string[]; args?: string[]; graalvm?: string }) => void
+    onfiles: (path: string) => void
   } = $props()
 
   type GraalvmChoice = 'auto' | '21' | '25' | 'exact'
@@ -181,7 +185,7 @@
   </div>
 
   <aside class="result" aria-labelledby="result-title">
-    <h3 id="result-title">What hosts run</h3>
+    <h3 id="result-title">Files added to the Server Pack</h3>
     <figure>
       <figcaption class="file">user_jvm_args.txt</figcaption>
       <pre><span class="muted"># The loader installer's lines</span>
@@ -197,6 +201,7 @@
       Test runs use the same flags and arguments with this machine's Java, on port {testPort}, open only to this computer. They also get any extra launch
       arguments you set for debugging in App settings or Pack settings.
     </p>
+    <ServerReadme onedit={onfiles} />
   </aside>
 </div>
 

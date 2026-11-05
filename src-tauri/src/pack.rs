@@ -14,6 +14,8 @@ const NEWER_LOCK_FORMAT: &str = "A newer version of packraven wrote this pack's 
 pub const CHANGELOG: &str = "changelog.md";
 pub const CHANGELOG_ARCHIVE: &str = "changelogs";
 pub const SERVER_ICON: &str = "server-icon.png";
+pub const SERVER_README: &str = "server-readme.txt";
+pub const DEFAULT_SERVER_README: &str = include_str!("../resources/server-readme.txt");
 pub const BCC_PROJECT_ID: u64 = 551894;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -529,6 +531,12 @@ pub enum ModLoader<'a> {
 }
 
 impl ModLoader<'_> {
+    pub fn version(&self) -> &str {
+        match self {
+            ModLoader::NeoForge(version) | ModLoader::Forge(version) | ModLoader::Fabric(version) => version,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             ModLoader::NeoForge(_) => "NeoForge",

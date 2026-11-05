@@ -2,6 +2,11 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7]
+### Added
+- Improved the serverpack readme to be easier to understand. 
+- Packmakers can change the readme wording for their own serverpacks in server settings. 
+
 ## [0.4.6] - 2026-11-04
 ### Changed
 - No longer copy the entire client changelog into the server pack's changelog

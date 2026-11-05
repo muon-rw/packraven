@@ -314,6 +314,12 @@ export interface ModDiff {
 export type Side = 'both' | 'client' | 'server'
 export type Override = 'auto' | 'client' | 'keep'
 
+export interface ServerReadme {
+  text: string
+  custom: boolean
+  unknownPlaceholders: string[]
+}
+
 export interface ModSide {
   path: string
   key: string | null
@@ -686,6 +692,8 @@ export const api = {
   setServerIcon: (image: string) => invoke<string | null>('set_server_icon', { image }),
   useProjectLogoAsServerIcon: () => invoke<string | null>('use_project_logo_as_server_icon'),
   removeServerIcon: () => invoke<void>('remove_server_icon'),
+  serverReadme: () => invoke<ServerReadme>('server_readme'),
+  customizeServerReadme: () => invoke<void>('customize_server_readme'),
   serverLaunch: () => invoke<{ windows: string; unix: string }>('server_launch'),
   getWebhook: () => invoke<string | null>('get_webhook'),
   setWebhook: (url: string) => invoke<void>('set_webhook', { url }),

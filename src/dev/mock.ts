@@ -2,6 +2,7 @@
 // We load data from src/dev/fixtures.json when present (gitignored; you generate it from a real instance),
 // and otherwise from the committed demo-fixtures.json, a snapshot of a real pack.
 import demoFixtures from './demo-fixtures.json'
+import defaultServerReadme from '../../src-tauri/resources/server-readme.txt?raw'
 import { changedParts } from '../lib/fileNames'
 import type { PendingStep, Platform, ReleaseStatus, ServerPackUpload, UpdateType } from '../lib/api'
 
@@ -731,6 +732,23 @@ function mockServerIcon() {
 }
 
 let serverIcon: string | null = scenario === 'empty' ? null : 'pending'
+let serverReadme = false
+
+// We fill the default template the app ships, the way the backend does, so the preview can't drift from it.
+function mockServerReadme() {
+  const values: Record<string, string> = {
+    name: pack.name,
+    version: String(fx.version),
+    minecraft: String(fx.minecraft),
+    loader: 'NeoForge',
+    loader_version: String(fx.loader).replace(/^neoforge-/, ''),
+    setup: 'downloads our mods and installs NeoForge and Minecraft',
+    packraven_folder: 'The packraven folder holds the files the run scripts use to set up the server.',
+  }
+  const lines = defaultServerReadme.split(/\r?\n/).filter((line) => !line.trimStart().startsWith('//'))
+  const filled = lines.join('\n').replace(/\{([a-z_]+)\}/g, (found, key: string) => values[key] ?? found)
+  return `${filled.trim().replace(/\n/g, '\r\n')}\r\n`
+}
 // A fresh setup hasn't accepted the Minecraft EULA or signed in to Minecraft yet.
 let eulaAccepted = scenario !== 'empty'
 const javaByMajor: Record<string, string> = {}
@@ -1104,6 +1122,10 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   set_server_icon: () => (serverIcon = mockServerIcon()),
   use_project_logo_as_server_icon: () => (serverIcon = mockServerIcon()),
   remove_server_icon: () => (serverIcon = null),
+  server_readme: () => ({ text: mockServerReadme(), custom: serverReadme, unknownPlaceholders: [] }),
+  customize_server_readme: () => {
+    serverReadme = true
+  },
   server_launch: () => {
     const args = `@libraries/net/neoforged/neoforge/${fx.loader.replace(/^neoforge-/, '')}`
     return { windows: `${args}/win_args.txt`, unix: `${args}/unix_args.txt` }

@@ -469,7 +469,7 @@ test('server properties and startup save as you change them', async ({ page }) =
   await expect(page.getByText('Set the heap size under Memory instead')).toBeVisible()
   await page.getByRole('textbox', { name: 'Server arguments' }).fill('--world\nMy World')
   await page.getByRole('textbox', { name: 'Server arguments' }).blur()
-  await expect(page.getByRole('complementary', { name: 'What hosts run' })).toContainText('nogui --world "My World"')
+  await expect(page.getByRole('complementary', { name: 'Files added to the Server Pack' })).toContainText('nogui --world "My World"')
   expect(problems).toEqual([])
 })
 

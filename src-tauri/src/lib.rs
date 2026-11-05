@@ -261,6 +261,8 @@ pub fn run() {
             pack_commands::set_server_icon,
             pack_commands::use_project_logo_as_server_icon,
             pack_commands::remove_server_icon,
+            pack_commands::server_readme,
+            pack_commands::customize_server_readme,
             pack_commands::server_launch,
             git_commands::git_overview,
             git_commands::git_status,

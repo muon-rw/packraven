@@ -126,18 +126,18 @@
   <li>
     <div class="step">
       <button disabled={busy} onclick={openUploadPage}>Open CurseForge's upload page</button>
-      <span class="muted small">
-        Upload the zip there as an additional file of {clientName}{#if upload.displayName}, named "{upload.displayName}".
+      <span class="muted small measure">
+        Upload the zip there as an additional file of {clientName}, with <span class="ui-label">Additional File Info</span> set to <span class="ui-label">Server Pack</span>{#if upload.displayName}, named "{upload.displayName}".
           <button type="button" class="link" onclick={copyName}>{copied ? 'Copied' : 'Copy name'}</button>{:else}.{/if}
       </span>
-      {#if tooLarge}<span class="muted small">CurseForge appears to cap uploads at 1 GB, so its website will likely turn this file down too.</span>{/if}
+      {#if tooLarge}<span class="muted small measure">CurseForge appears to cap uploads at 1 GB, so its website will likely turn this file down too.</span>{/if}
     </div>
   </li>
   <li>
     <div class="step">
       <button disabled={busy} onclick={markUploaded}>I uploaded it</button>
       <span class="muted small measure">
-        We stop offering to upload it. CurseForge only links the server pack once the client pack is public, and Releases shows it then.
+        We stop offering to upload it. Once you tag it as a server pack and CurseForge approves the client pack, Releases shows it.
       </span>
     </div>
   </li>
@@ -190,5 +190,10 @@
   /* ch is the width of a 0, wider than this font's average letter, so 52ch keeps small lines near 80 characters. */
   .measure {
     max-width: 52ch;
+  }
+
+  .ui-label {
+    color: var(--text);
+    font-weight: 600;
   }
 </style>

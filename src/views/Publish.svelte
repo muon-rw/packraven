@@ -11,6 +11,8 @@
   import Twisty from '../components/Twisty.svelte'
   import OverrideDecisions from '../components/OverrideDecisions.svelte'
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
+  import ServerPackTagDialog from '../components/ServerPackTagDialog.svelte'
+  import ServerPackTagStep from '../components/ServerPackTagStep.svelte'
   import { nav, showInFiles } from '../lib/nav.svelte'
   import { asReleaseType, asUpdateType, curseforgeProblem, releaseTag, repoName, UPDATE_TYPES, updateTypeEffect } from '../lib/format'
 
@@ -143,6 +145,9 @@
   let resumable = $derived(unfinished.find((release) => release.version === trimmed) ?? null)
   // The release a Finish button is finishing, so its result gets a notice of its own.
   let finishing = $state<string | null>(null)
+  let finishingServerPack = $state(false)
+  let finishedServerPackPage = $state<string | null>(null)
+  let tagModalPage = $state<string | null>(null)
   let manualOpen = $state<Record<string, boolean>>({})
 
   function loadUnfinished() {
@@ -189,7 +194,24 @@
     renaming = { client: false, server: false }
     loadChangelog()
     loadUnfinished()
-    if (published) api.publishedTo(published.version).then((to) => (landed = to ?? 'unknown'), () => (landed = 'unknown'))
+    if (published) {
+      api.publishedTo(published.version).then(
+        (to) => {
+          landed = to ?? 'unknown'
+          if (to && !to.serverPackMissing && to.serverPackPage) tagModalPage = to.serverPackPage
+        },
+        () => (landed = 'unknown'),
+      )
+    }
+    if (finishing && finishingServerPack) {
+      api.publishedTo(finishing).then(
+        (to) => {
+          finishedServerPackPage = to?.serverPackPage ?? null
+          if (to?.serverPackPage) tagModalPage = to.serverPackPage
+        },
+        () => (finishedServerPackPage = null),
+      )
+    }
   })
 
   async function previewInDiscohook() {
@@ -395,6 +417,9 @@
       error = null
       retriedServerPack = false
       finishing = null
+      finishingServerPack = false
+      finishedServerPackPage = null
+      tagModalPage = null
       landed = 'pending'
       published = { version: trimmed, pushed: push, clientName: client.displayName }
       await api.publish({
@@ -418,6 +443,22 @@
     await tick()
     const target = document.getElementById(`unfinished-${version}`) ?? document.getElementById('publish-title')
     target?.focus()
+  }
+
+  async function markedPublishedUploaded(version: string) {
+    const to = await api.publishedTo(version).catch(() => null)
+    landed = to ?? 'unknown'
+    await tick()
+    const target = document.getElementById('published-notice') ?? document.getElementById('publish-title')
+    target?.focus()
+  }
+
+  function closeTagModal() {
+    tagModalPage = null
+    tick().then(() => {
+      const target = document.getElementById('published-notice') ?? document.getElementById('finished-notice') ?? document.getElementById('publish-title')
+      target?.focus()
+    })
   }
 
   async function finish(release: UnfinishedRelease) {
@@ -450,10 +491,14 @@
       published = null
       retriedServerPack = false
       finishing = release.version
+      finishingServerPack = !!release.serverPackMissing
+      finishedServerPackPage = null
+      tagModalPage = null
       await api.finishRelease(release.version)
       onchange()
     } catch (e) {
       finishing = null
+      finishingServerPack = false
       error = `Couldn't finish ${release.version}: ${errorText(e)}`
     }
   }
@@ -542,29 +587,44 @@
             upload={landed.serverPackMissing}
             version={published.version}
             clientName={published.clientName}
-            onretry={() => (retriedServerPack = true)}
-            onmarked={() => published && api.publishedTo(published.version).then((to) => (landed = to ?? 'unknown'))}
+            onretry={() => {
+              retriedServerPack = true
+              finishing = null
+              finishingServerPack = false
+              finishedServerPackPage = null
+              tagModalPage = null
+            }}
+            onmarked={() => published && markedPublishedUploaded(published.version)}
           />
           {#if announces}<p class="muted small">packraven holds the Discord announcement until CurseForge has the server pack.</p>{/if}
         </Notice>
       {/if}
       {#if modrinthFailed}
-        <Notice tone="warn">
-          <p>
-            <strong>{overview?.name} {published.version} is on CurseForge, but the Modrinth upload failed.</strong>
-            {landed.serverPackMissing ? 'packraven' : `${tagged}, and`} kept the Modrinth pack it built.
-          </p>
-          {#if landed.modrinthError}<p class="muted"><LinkedText text={landed.modrinthError} /></p>{/if}
-          <p><button onclick={onreleases}>Upload it from Releases</button></p>
-        </Notice>
+        {@const modrinthHeadline = `${overview?.name} ${published.version} is on CurseForge, but the Modrinth upload failed.`}
+        <div id="published-notice" tabindex="-1">
+          <Notice tone="warn" live={false}>
+            <p role="status">
+              <strong>{modrinthHeadline}</strong>
+              {landed.serverPackMissing ? 'packraven' : `${tagged}, and`} kept the Modrinth pack it built.
+            </p>
+            {#if landed.modrinthError}<p class="muted"><LinkedText text={landed.modrinthError} /></p>{/if}
+            <p><button onclick={onreleases}>Upload it from Releases</button></p>
+            {#if !landed.serverPackMissing && landed.serverPackPage && !tagModalPage}<ServerPackTagStep page={landed.serverPackPage} />{/if}
+          </Notice>
+        </div>
       {:else if !landed.serverPackMissing}
-        <Notice tone="ok">
-          <p><strong>{overview?.name} {published.version} is on {landedOn}.</strong> {tagged}.</p>
-          <p class="muted">
-            packraven archived its notes to <span class="file">changelogs/{published.version}.md</span> and cleared changelog.md for the next release. {publishJob.message}
-            <button class="link" onclick={onreleases}>Follow its review in Releases</button>.
-          </p>
-        </Notice>
+        {@const okHeadline = `${overview?.name} ${published.version} is on ${landedOn}.`}
+        {@const jobSummary = publishJob.message && !publishJob.message.includes('without its server pack') ? `${publishJob.message.replace(/\.$/, '')}.` : ''}
+        <div id="published-notice" tabindex="-1">
+          <Notice tone="ok" live={!landed.serverPackPage}>
+            <p role={landed.serverPackPage ? 'status' : undefined}><strong>{okHeadline}</strong> {tagged}.</p>
+            <p class="muted">
+              packraven archived its notes to <span class="file">changelogs/{published.version}.md</span> and cleared changelog.md for the next release.{jobSummary ? ` ${jobSummary}` : ''}
+              <button class="link" onclick={onreleases}>Follow its review in Releases</button>.
+            </p>
+            {#if landed.serverPackPage && !tagModalPage}<ServerPackTagStep page={landed.serverPackPage} />{/if}
+          </Notice>
+        </div>
       {/if}
     {/if}
   {/if}
@@ -613,11 +673,12 @@
     </Notice>
   {/each}
   {#if publishJob.phase === 'done' && finishing && publishJob.message}
-    <Notice tone="ok"><p>{publishJob.message}. CurseForge links a new server pack once the client pack is public, so Releases shows it then.</p></Notice>
-  {/if}
-  <!-- A retried upload from a notice above runs as a publish job too, with no publish of its own to report it. -->
-  {#if publishJob.phase === 'done' && retriedServerPack && !published && publishJob.message}
-    <Notice tone="ok"><p>{publishJob.message}.</p></Notice>
+    <div id="finished-notice" tabindex="-1">
+      <Notice tone="ok" live={!finishedServerPackPage}>
+        <p role={finishedServerPackPage ? 'status' : undefined}>{publishJob.message}.</p>
+        {#if finishedServerPackPage && !tagModalPage}<ServerPackTagStep page={finishedServerPackPage} />{/if}
+      </Notice>
+    </div>
   {/if}
   {#each [publishJob, ...builds] as failed, index (index)}
     {#if failed.phase === 'failed' && !(index === 0 && retriedServerPack)}<Notice tone="error"><p><LinkedText text={failed.message ?? ''} /></p></Notice>{/if}
@@ -729,7 +790,7 @@
               </span>
               <span class="rename"><Twisty {open} />Rename<span class="visually-hidden"> the {title.toLowerCase()}</span></span>
             </button>
-            {#if side === 'server'}<span class="muted small">We upload it as an additional file of the client pack.</span>{/if}
+            {#if side === 'server'}<span class="muted small">We upload it as an additional file of the client pack; it's not currently possible to tag it as a server pack automatically, so you'll tag it on CurseForge afterwards.</span>{/if}
             {#if open}
               <div class="names" id="{side}-rename">
                 <label for="{side}-display-name"><span class="visually-hidden">{title} </span>Display name</label>
@@ -979,6 +1040,7 @@
       </button>
     {/if}
   </div>
+  <ServerPackTagDialog page={tagModalPage} onclose={closeTagModal} />
 </div>
 
 <!-- A group of more than one file collapses to a line with its count, so a long list doesn't push the
@@ -1399,5 +1461,10 @@
 
   .manual[open] summary {
     margin-bottom: 8px;
+  }
+
+  #published-notice,
+  #finished-notice {
+    border-radius: var(--radius-panel);
   }
 </style>

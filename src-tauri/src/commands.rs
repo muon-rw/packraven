@@ -716,6 +716,7 @@ pub struct PublishedTo {
     curseforge: bool,
     modrinth: bool,
     server_pack_missing: Option<publish::ServerPackUpload>,
+    server_pack_page: Option<String>,
     modrinth_error: Option<String>,
 }
 
@@ -764,6 +765,7 @@ pub fn published_to(state: State<'_, AppState>, version: String) -> Option<Publi
         curseforge: release.curseforge.is_some(),
         modrinth: release.modrinth.is_some(),
         server_pack_missing: publish::awaiting_server_pack(state.pack().ok().as_ref(), &pack_data, release),
+        server_pack_page: release.curseforge.as_ref().and_then(|c| c.server_file_id.map(|id| curseforge::file_page(c.project_id, id))),
         modrinth_error: release.modrinth.is_none().then(|| release.modrinth_error.clone()).flatten(),
     })
 }
@@ -1052,13 +1054,16 @@ pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus
                     (None, true) => ("Uploaded by you".into(), None),
                     (None, false) => ("Not uploaded".into(), None),
                 };
+                let server_file = server_lookup.as_ref().and_then(|l| l.as_ref().ok()).and_then(Option::as_ref);
                 let uploaded = |lookup: Option<&Result<Option<curseforge::CfFile>>>| lookup.and_then(|l| l.as_ref().ok()).and_then(Option::as_ref).map(|f| f.file_date.clone()).filter(|d| !d.is_empty());
                 Some(CurseforgeStatus {
                     project_id: published.project_id,
                     file_id: published.file_id,
                     status,
                     server_status,
-                    server_pack_linked: published.server_file_id.and_then(|server_id| linked_server.map(|id| id == server_id)),
+                    server_pack_linked: published.server_file_id.and_then(|server_id| {
+                        linked_server.map(|id| id == server_id).or_else(|| server_file.and_then(|f| f.is_server_pack))
+                    }),
                     state,
                     server_state,
                     uploaded: uploaded(Some(&file_lookup)),

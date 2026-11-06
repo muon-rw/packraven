@@ -2,6 +2,10 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Changed
+- Warn that the serverpack additional file is not tagged as a Server Pack, and offer a link to the file to change it. (It's currently impossible to set the Server Pack flag with the API)
+
 ## [0.4.7] - 2026-11-05
 ### Added
 - Improved the serverpack readme to be easier to understand. 

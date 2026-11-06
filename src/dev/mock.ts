@@ -1287,7 +1287,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     mockJob('publish', ['Uploading the server pack', 'Uploaded the server pack as file 7300001'], `Uploaded the ${a.version} server pack to CurseForge as file 7300001`, () => {
       const release = releases.find((r) => r.version === a.version)!
       release.serverPackMissing = null
-      release.curseforge = { ...release.curseforge!, serverStatus: 'Not public yet' }
+      release.curseforge = { ...release.curseforge!, serverStatus: 'Not public yet', serverPackLinked: false, serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7300001' }
     }),
   upload_release_to_modrinth: (a) =>
     mockJob('publish', ['Uploading the pack to Modrinth', 'Uploaded Modrinth version'], `Uploaded ${a.version} to Modrinth`, () => {
@@ -1339,7 +1339,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   replace_curseforge_file: (a) =>
     mockJob('publish', ['CurseForge no longer has the old file', 'Building the server pack again', 'Uploaded the server pack as file 7300002'], `Uploaded the ${a.version} server pack to CurseForge as file 7300002`, () => {
       const release = releases.find((r) => r.version === a.version)!
-      release.curseforge = { ...release.curseforge!, serverStatus: 'Processing', serverState: 'processing', serverUploaded: new Date().toISOString(), serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7300002' }
+      release.curseforge = { ...release.curseforge!, serverStatus: 'Processing', serverPackLinked: false, serverState: 'processing', serverUploaded: new Date().toISOString(), serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7300002' }
     }),
   mark_server_pack_uploaded: (a) => {
     const release = releases.find((r) => r.version === a.version)!
@@ -1349,7 +1349,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   finish_release: (a) =>
     mockJob('publish', ['Uploading the server pack', 'Uploaded the server pack as file 7300001', `Committed "Release ${a.version}" and tagged v${a.version}`, 'Pushed the release commit and tag'], `Finished publishing ${a.version}`, () => {
       const release = releases.find((r) => r.version === a.version)!
-      if (release.serverPackMissing) release.curseforge = { ...release.curseforge!, serverStatus: 'Not public yet' }
+      if (release.serverPackMissing) release.curseforge = { ...release.curseforge!, serverStatus: 'Not public yet', serverPackLinked: false, serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7300001' }
       if (release.modrinthMissing) release.modrinth = modrinthRelease(String(a.version))
       release.serverPackMissing = null
       release.modrinthMissing = null
@@ -1357,7 +1357,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     }),
   published_to: (a) => {
     const release = releases.find((r) => r.version === a.version)
-    return release ? { curseforge: !!release.curseforge, modrinth: !!release.modrinth, serverPackMissing: release.serverPackMissing, modrinthError: null } : null
+    return release ? { curseforge: !!release.curseforge, modrinth: !!release.modrinth, serverPackMissing: release.serverPackMissing, serverPackPage: release.curseforge?.serverPage ?? null, modrinthError: null } : null
   },
   publish: (a) => {
     const version = (a.options as { version: string }).version
@@ -1378,7 +1378,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
           modrinth: config.modrinth.project_id ? modrinthRelease(version) : null,
           modrinthMissing: null,
           serverPackMissing: serverPackFails ? unsentServerPack(version, fileId, 'CurseForge rejected the upload (502 Bad Gateway)') : null,
-          curseforge: { projectId: 1234567, fileId, status: 'Not public yet', serverStatus: serverPackFails ? 'Not uploaded' : 'Not public yet', serverPackLinked: null, state: null, serverState: null, uploaded: null, serverUploaded: null, page: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}`, serverPage: null },
+          curseforge: { projectId: 1234567, fileId, status: 'Not public yet', serverStatus: serverPackFails ? 'Not uploaded' : 'Not public yet', serverPackLinked: serverPackFails ? null : false, state: null, serverState: null, uploaded: null, serverUploaded: null, page: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}`, serverPage: serverPackFails ? null : `https://authors.curseforge.com/#/projects/1234567/files/${fileId + 1}` },
           packChanged: false,
           clientZipPresent: true,
           updateChecker: (a.options as { updateChecker: UpdateType | null }).updateChecker ? { updateType: (a.options as { updateChecker: UpdateType }).updateChecker } : null,

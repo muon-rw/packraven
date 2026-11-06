@@ -5,6 +5,8 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { api, errorText, type FileState, type PackFile, type ReleaseStatus, type UpdateCheckerSetup, type UpdateType } from '../lib/api'
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
+  import ServerPackTagDialog from '../components/ServerPackTagDialog.svelte'
+  import ServerPackTagStep from '../components/ServerPackTagStep.svelte'
   import Notice from '../components/Notice.svelte'
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import { asReleaseType, asUpdateType, curseforgeProblem, repoName, updateTypeLabel } from '../lib/format'
@@ -29,10 +31,12 @@
   let checkerAnnouncement = $state('')
   // The file we're replacing or checking, as "version:client" or "version:server", and what came of it.
   let replacing = $state<string | null>(null)
+  let retryingServer = $state<string | null>(null)
   let checking = $state<string | null>(null)
   let replaceErrors = $state<Record<string, string>>({})
-  let replaced = $state<string | null>(null)
+  let replaced = $state<{ text: string; serverPage: string | null } | null>(null)
   let replacedNotice = $state<HTMLElement>()
+  let tagModalPage = $state<string | null>(null)
 
   type Problem = { title: string; detail: string; before: string[]; deleteFirst: boolean; waitable: boolean }
 
@@ -122,23 +126,47 @@
 
   // Retrying a Modrinth upload or replacing a file runs as a publish job, so we hear how it went the same way.
   onJobEnd('publish', async (phase) => {
-    if (replacing) {
-      const key = replacing
-      replaceErrors = { ...replaceErrors, [key]: phase === 'failed' ? (job('publish').message ?? 'The upload failed') : '' }
+    const replacedKey = replacing
+    const retriedVersion = retryingServer
+    if (replacedKey) {
+      replaceErrors = { ...replaceErrors, [replacedKey]: phase === 'failed' ? (job('publish').message ?? 'The upload failed') : '' }
       replacing = null
-      if (phase === 'done') {
-        const [version, file] = key.split(':')
-        replaced = file === 'client' ? `Uploaded a new ${version} client pack and its server pack. CurseForge will review them again.` : `Uploaded a new ${version} server pack. CurseForge will review it again.`
-        await tick()
-        replacedNotice?.focus()
-      }
     }
+    if (retriedVersion) retryingServer = null
     if (uploading) {
       const failure = phase === 'failed' ? `Couldn't upload it: ${job('publish').message ?? 'the upload failed'}` : null
       uploadErrors = { ...uploadErrors, [uploading]: failure ?? '' }
       uploading = null
     }
-    if (phase === 'done') loadReleases()
+    if (phase === 'done') {
+      await loadReleases()
+      if (replacedKey) {
+        const [version, file] = replacedKey.split(':')
+        const serverPage = releases.find((r) => r.version === version)?.curseforge?.serverPage ?? null
+        replaced = {
+          text: file === 'client' ? `Uploaded a new ${version} client pack and its server pack. CurseForge will review them again.` : `Uploaded a new ${version} server pack. CurseForge will review it again.`,
+          serverPage,
+        }
+        if (serverPage) {
+          tagModalPage = serverPage
+        } else {
+          await tick()
+          replacedNotice?.focus()
+        }
+      } else if (retriedVersion) {
+        const serverPage = releases.find((r) => r.version === retriedVersion)?.curseforge?.serverPage ?? null
+        replaced = {
+          text: `Uploaded the ${retriedVersion} server pack to CurseForge.`,
+          serverPage,
+        }
+        if (serverPage) {
+          tagModalPage = serverPage
+        } else {
+          await tick()
+          replacedNotice?.focus()
+        }
+      }
+    }
   })
 
   // An upload is public and can't be taken back, so we say what goes up before it does.
@@ -198,6 +226,7 @@
     const key = `${version}:${file}`
     replaceErrors = { ...replaceErrors, [key]: '' }
     replaced = null
+    tagModalPage = null
     replacing = key
     try {
       await api.replaceCurseforgeFile(version, file)
@@ -242,6 +271,7 @@
     return [
       curseforge && fileTone(curseforge.state) !== 'ok' ? `CurseForge still lists the file as "${curseforge.status}"` : null,
       release.serverPackMissing ? "its server pack isn't on CurseForge yet" : null,
+      curseforge && !release.serverPackMissing && curseforge.serverPackLinked === false ? "its server pack isn't tagged on CurseForge yet" : null,
       curseforge && fileProblems(release).some((p) => p.file === 'server') ? 'CurseForge has a problem with its server pack' : null,
       release.modrinthMissing ? "it isn't on Modrinth yet" : null,
       modrinth && statusTone(modrinth.status) !== 'ok' ? `Modrinth lists it as "${modrinth.status}"` : null,
@@ -314,6 +344,13 @@
     } finally {
       loading = false
     }
+  }
+
+  async function markedReleaseUploaded(version: string) {
+    await loadReleases()
+    replaced = { text: `Recorded that you uploaded the ${version} server pack.`, serverPage: null }
+    await tick()
+    replacedNotice?.focus()
   }
 
   // An announcement is public and can ping a whole role, so we ask first and say when CurseForge
@@ -389,7 +426,10 @@
   <!-- The problem notice you acted on goes away, so this takes its place and takes focus. -->
   {#if replaced}
     <div class="replaced" tabindex="-1" bind:this={replacedNotice}>
-      <Notice tone="ok"><p>{replaced}</p></Notice>
+      <Notice tone="ok" live={!replaced.serverPage}>
+        <p role={replaced.serverPage ? 'status' : undefined}>{replaced.text}</p>
+        {#if replaced.serverPage && !tagModalPage}<ServerPackTagStep page={replaced.serverPage} />{/if}
+      </Notice>
     </div>
   {/if}
 
@@ -421,10 +461,14 @@
                     <dt>Client pack</dt>
                     <dd><span class="chip {fileTone(curseforge.state)}">{curseforge.status}</span></dd>
                     <dt>Server pack</dt>
-                    <dd>
+                    <dd class="server-cell">
                       <!-- A missing server pack waits on you, not on CurseForge's review. -->
                       <span class="chip {release.serverPackMissing ? 'fail' : fileTone(curseforge.serverState)}">{curseforge.serverStatus}</span>
-                      {#if curseforge.serverPackLinked === false}<span class="chip pending">Not linked as the server pack</span>{/if}
+                      {#if curseforge.serverPackLinked === false}
+                        <span class="untagged small">
+                          <span class="untagged-label">Not tagged as a server pack</span>{#if curseforge.serverPage} · <a href={curseforge.serverPage} onclick={(e) => { e.preventDefault(); openUrl(curseforge.serverPage!) }}>Tag on CurseForge<span class="visually-hidden"> ({release.version} server pack)</span></a>{/if}
+                        </span>
+                      {/if}
                     </dd>
                   </dl>
                 {:else}
@@ -576,7 +620,17 @@
                 <section class="server-upload" aria-labelledby="server-upload-{release.version}">
                   <Notice tone="warn" live={false}>
                     <h3 id="server-upload-{release.version}">Upload the {release.version} server pack</h3>
-                    <ServerPackSteps upload={release.serverPackMissing} version={release.version} clientName={release.displayName ?? release.version} onmarked={loadReleases} />
+                    <ServerPackSteps
+                      upload={release.serverPackMissing}
+                      version={release.version}
+                      clientName={release.displayName ?? release.version}
+                      onretry={() => {
+                        replaced = null
+                        tagModalPage = null
+                        retryingServer = release.version
+                      }}
+                      onmarked={() => markedReleaseUploaded(release.version)}
+                    />
                   </Notice>
                 </section>
               </td>
@@ -594,6 +648,14 @@
   {:else if !releasesError}
     <p class="muted">Releases you publish from packraven show up here with their status on each platform.</p>
   {/if}
+
+  <ServerPackTagDialog
+    page={tagModalPage}
+    onclose={() => {
+      tagModalPage = null
+      tick().then(() => replacedNotice?.focus())
+    }}
+  />
 </div>
 
 <style>
@@ -681,6 +743,26 @@
 
   .statuses dd {
     margin: 0;
+  }
+
+  .replaced {
+    max-width: 80ch;
+    border-radius: var(--radius-panel);
+  }
+
+  .server-cell {
+    display: grid;
+    justify-items: start;
+    gap: 2px;
+  }
+
+  .untagged {
+    color: var(--muted);
+  }
+
+  .untagged-label {
+    color: var(--warn);
+    font-weight: 600;
   }
 
   /* The steps span the row under their release, so the table keeps its columns narrow. */

@@ -439,6 +439,7 @@ export interface PublishedTo {
   curseforge: boolean
   modrinth: boolean
   serverPackMissing: ServerPackUpload | null
+  serverPackPage: string | null
   modrinthError: string | null
 }
 

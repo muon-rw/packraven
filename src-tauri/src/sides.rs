@@ -137,7 +137,7 @@ impl MetadataCache {
     }
 
     pub async fn ensure_names(&mut self, keys: &[ModKey]) -> Result<()> {
-        let missing: Vec<&ModKey> = keys.iter().filter(|key| self.names.get(key).is_none_or(|n| n.authors.is_none() || n.license.is_none())).collect();
+        let missing: Vec<&ModKey> = keys.iter().filter(|key| self.names.get(key).is_none_or(|n| n.authors.is_none() || n.license.is_none() || n.logo.as_deref() == Some(""))).collect();
         let from_curseforge: Vec<u64> = missing.iter().filter_map(|key| key.curseforge_id()).collect();
         let from_modrinth: Vec<String> = missing
             .iter()
@@ -150,7 +150,7 @@ impl MetadataCache {
             for (id, m) in curseforge::mods(&from_curseforge).await? {
                 let authors = Some(m.authors.into_iter().map(|a| a.name).collect());
                 let license = Some(m.license_type.unwrap_or_default());
-                self.names.insert(ModKey::Curseforge(id), ProjectName { name: m.name, url: m.links.website_url, authors, logo: m.logo.map(|l| l.thumbnail_url), license });
+                self.names.insert(ModKey::Curseforge(id), ProjectName { name: m.name, url: m.links.website_url, authors, logo: m.logo.as_ref().and_then(curseforge::CfLogo::url), license });
             }
         }
         if !from_modrinth.is_empty() {

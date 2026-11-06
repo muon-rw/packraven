@@ -31,8 +31,8 @@ pub async fn project_logo(project_id: u64) -> Result<Vec<u8>> {
         anyhow::bail!("Set the CurseForge project ID in Pack settings first");
     }
     let project = crate::curseforge::mods(&[project_id]).await?.remove(&project_id).context("CurseForge has no project with this pack's ID")?;
-    let logo = project.logo.context("The CurseForge project has no logo yet")?;
-    Ok(crate::http::CLIENT.get(&logo.thumbnail_url).send().await?.error_for_status()?.bytes().await?.to_vec())
+    let logo = project.logo.as_ref().and_then(crate::curseforge::CfLogo::url).context("The CurseForge project has no logo yet")?;
+    Ok(crate::http::CLIENT.get(logo).send().await?.error_for_status()?.bytes().await?.to_vec())
 }
 
 #[cfg(test)]

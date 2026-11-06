@@ -84,6 +84,15 @@ pub struct CfAuthor {
 #[serde(rename_all = "camelCase")]
 pub struct CfLogo {
     pub thumbnail_url: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+impl CfLogo {
+    // CurseForge generates no thumbnail for an animated WebP logo and leaves thumbnailUrl empty.
+    pub fn url(&self) -> Option<String> {
+        [&self.thumbnail_url, &self.url].into_iter().find(|u| !u.is_empty()).cloned()
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug, Default)]
@@ -486,7 +495,19 @@ pub fn additional_file_page(project_id: u64, parent_file_id: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_upload_size, UPLOAD_LIMIT};
+    use super::{check_upload_size, CfLogo, UPLOAD_LIMIT};
+
+    #[test]
+    fn falls_back_to_original_logo_when_curseforge_made_no_thumbnail() {
+        let webp: CfLogo = serde_json::from_value(serde_json::json!({
+            "thumbnailUrl": "",
+            "url": "https://media.forgecdn.net/avatars/2175/222/639294287596107499.webp",
+        }))
+        .unwrap();
+        assert_eq!(webp.url().as_deref(), Some("https://media.forgecdn.net/avatars/2175/222/639294287596107499.webp"));
+        let png = CfLogo { thumbnail_url: "https://thumb".into(), url: "https://full".into() };
+        assert_eq!(png.url().as_deref(), Some("https://thumb"));
+    }
 
     #[test]
     fn every_documented_file_status_has_a_name_and_a_meaning() {

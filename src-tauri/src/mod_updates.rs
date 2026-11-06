@@ -259,7 +259,7 @@ async fn curseforge_checks(pack: &Pack, target: &Target) -> Result<Vec<ModCheck>
             ModCheck {
                 path: entry.path.clone(),
                 key: ModKey::Curseforge(file.project_id).to_string(),
-                logo: project.and_then(|p| p.logo.as_ref()).map(|l| l.thumbnail_url.clone()),
+                logo: project.and_then(|p| p.logo.as_ref()).and_then(curseforge::CfLogo::url),
                 release_type: installed.map(|f| release_type(f.release_type)),
                 requires: installed.map(|f| f.required_projects().map(|id| ModKey::Curseforge(id).to_string()).collect()).unwrap_or_default(),
                 newer,
@@ -549,7 +549,7 @@ async fn search_curseforge(pack: &Pack, request: &SearchRequest) -> Result<Searc
             Some(SearchResult {
                 key: ModKey::Curseforge(project.id).to_string(),
                 authors: project.authors.iter().map(|a| a.name.clone()).collect(),
-                logo: project.logo.map(|l| l.thumbnail_url),
+                logo: project.logo.as_ref().and_then(curseforge::CfLogo::url),
                 url: project.links.website_url,
                 name: project.name,
                 summary: project.summary,

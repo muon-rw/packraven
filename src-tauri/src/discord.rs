@@ -129,7 +129,7 @@ pub fn message(announcement: &Announcement, config: &DiscordConfig) -> Value {
         "footer": { "text": announcement.game },
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
-    if let Some(logo) = &announcement.project.logo {
+    if let Some(logo) = announcement.project.logo.as_deref().filter(|u| !u.is_empty()) {
         embed["thumbnail"] = json!({ "url": logo });
     }
     if let Some(author) = announcement.project.author.as_ref().filter(|_| config.show_author) {
@@ -262,7 +262,7 @@ pub async fn project(project_id: u64, preferred_author: &str) -> Project {
             .and_then(|m| m.links.website_url.as_deref())
             .map(|url| url.trim_end_matches('/').to_string())
             .unwrap_or_else(|| format!("https://www.curseforge.com/projects/{project_id}")),
-        logo: found.as_ref().and_then(|m| m.logo.as_ref()).map(|logo| logo.thumbnail_url.clone()),
+        logo: found.as_ref().and_then(|m| m.logo.as_ref()).and_then(curseforge::CfLogo::url),
         name: found.map(|m| m.name),
     }
 }

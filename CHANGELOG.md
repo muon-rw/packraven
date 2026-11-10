@@ -2,6 +2,15 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.9]
+### Added
+- Added an option to include whole mod files inside Server Packs, instead of downloading them on server start.
+- Since CurseForge rejects API uploads over 1GB, if your server pack is larger than that, you'll be prompted to open the authors portal to upload it.
+- Uploads now show their progress, are streamed directly from files rather than loaded into memory, and alert you if there's an error. This was necessary, since you can now have huge uploads.
+
+### Changed
+- Minor tweaks to serverpacks' default README for clarity, and to accomodate the changes above
+
 ## [0.4.8] - 2026-11-06
 
 ### Changed

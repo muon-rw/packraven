@@ -144,7 +144,7 @@ async fn server_pack_boots() {
     let mut cache = MetadataCache::load(&scratch().join("metadata-cache.json"));
     let sides = sides::classify(&pack, &mut cache).await.unwrap();
     let out = scratch().join("build");
-    export::server_pack(&pack, &sides, "test", export::ServerMods::DownloadedOnStart, &out, &scratch(), &log).await.unwrap();
+    export::server_pack(&pack, &sides, "test", &out, &scratch(), &log).await.unwrap();
     let zip = export::zip_server_pack(&pack, "test", &out, &log).await.unwrap();
     println!("zip {} ({} MB)", zip.display(), std::fs::metadata(&zip).unwrap().len() / 1_000_000);
 
@@ -198,9 +198,10 @@ async fn loader_test_servers_boot() {
 async fn server_pack_scripts_boot() {
     let name = std::env::var("PACKRAVEN_SCRIPT_INSTANCE").unwrap_or_else(|_| "MMC4Forge".into());
     let source = Settings::default().instances_root().join(&name);
-    let pack = Pack::open(&modless_pack(&source).await).unwrap();
+    let mut pack = Pack::open(&modless_pack(&source).await).unwrap();
+    pack.config.server.bundle_mods = true;
     let out = scratch().join(format!("scripts-{name}"));
-    let dir = export::server_pack(&pack, &[], "test", export::ServerMods::Bundled, &out, &scratch(), &Log::console(&name)).await.unwrap();
+    let dir = export::server_pack(&pack, &[], "test", &out, &scratch(), &Log::console(&name)).await.unwrap();
     std::fs::write(dir.join("eula.txt"), "eula=true\n").unwrap();
 
     let mut bat = Command::new("cmd");

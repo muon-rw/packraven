@@ -4,7 +4,7 @@ use serde::Serialize;
 use tauri::{AppHandle, State};
 
 use crate::commands::AppState;
-use crate::export::{ServerMods, ServerReadme};
+use crate::export::ServerReadme;
 use crate::join;
 use crate::pack::{DEFAULT_SERVER_README, SERVER_ICON, SERVER_README};
 use crate::server_icon;
@@ -182,7 +182,7 @@ pub fn customize_server_readme(state: State<'_, AppState>) -> CmdResult<()> {
 pub fn server_readme(state: State<'_, AppState>) -> CmdResult<ServerReadme> {
     let pack = state.pack().map_err(err)?;
     let version = pack.version().unwrap_or_else(|| "{version}".into());
-    crate::export::server_readme(&pack, &version, ServerMods::DownloadedOnStart).map_err(err)
+    crate::export::server_readme(&pack, &version).map_err(err)
 }
 
 #[derive(Serialize)]

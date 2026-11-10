@@ -3,7 +3,7 @@
   import { onMount, tick } from 'svelte'
   import { ask } from '@tauri-apps/plugin-dialog'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type OverrideFileView, type Overview, type PackConfig, type PublishedTo, type UnfinishedRelease, type Untested, type UpdateCheckerSetup, type UpdateType, type UploadNames } from '../lib/api'
+  import { api, errorText, type OverrideFileView, type Overview, type PackConfig, type PublishedTo, type ServerPackUpload, type UnfinishedRelease, type Untested, type UpdateCheckerSetup, type UpdateType, type UploadNames } from '../lib/api'
   import { job, onJobEnd, testState } from '../lib/jobs.svelte'
   import RenderedChangelog from '../components/RenderedChangelog.svelte'
   import JobLog from '../components/JobLog.svelte'
@@ -13,7 +13,7 @@
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
   import ServerPackTagDialog from '../components/ServerPackTagDialog.svelte'
   import ServerPackTagStep from '../components/ServerPackTagStep.svelte'
-  import { nav, showInFiles } from '../lib/nav.svelte'
+  import { nav, serverView, showInFiles } from '../lib/nav.svelte'
   import { asReleaseType, asUpdateType, curseforgeProblem, releaseTag, repoName, UPDATE_TYPES, updateTypeEffect } from '../lib/format'
 
   let {
@@ -24,6 +24,7 @@
     onreleases,
     onrun,
     onappsettings,
+    onserver,
   }: {
     overview: Overview | null
     onchange: () => void
@@ -32,6 +33,7 @@
     onreleases: () => void
     onrun: () => void
     onappsettings: () => void
+    onserver: () => void
   } = $props()
 
   let push = $state(true)
@@ -141,8 +143,30 @@
   // Once we know where a publish landed, its notice covers that release, even while you retry its server pack.
   let reported = $derived.by(() => (published && typeof landed === 'object' ? published.version : null))
   let earlierUnfinished = $derived(unfinished.filter((release) => release.version !== reported))
+  // Only you can upload a server pack too large for CurseForge's upload API, or check whether CurseForge kept one it
+  // never confirmed, so when that's all a release still needs, packraven has nothing left to finish.
+  function serverPackLeftToYou(upload: ServerPackUpload | null) {
+    return !!upload && (upload.tooLarge || upload.unconfirmed)
+  }
+
+  function packravenCanFinish(release: UnfinishedRelease) {
+    return (!!release.serverPackMissing && !serverPackLeftToYou(release.serverPackMissing)) || !!release.modrinthMissing || release.pending.length > 0
+  }
   // When the version you're on is a release packraven didn't finish, Publish finishes it instead of publishing it again.
-  let resumable = $derived(unfinished.find((release) => release.version === trimmed) ?? null)
+  let resumable = $derived(unfinished.find((release) => release.version === trimmed && packravenCanFinish(release)) ?? null)
+  let waitingOnYou = $derived(unfinished.find((release) => release.version === trimmed && !!release.serverPackMissing && !packravenCanFinish(release)) ?? null)
+  // The version whose server pack you said you uploaded, which only your word confirms until CurseForge links it.
+  let uploadedByYou = $state<string | null>(null)
+
+  function leftToYouStep(upload: ServerPackUpload) {
+    const reason = upload.error?.trim().replace(/[.!]+$/, '')
+    if (upload.unconfirmed) return `${reason ? `${reason}. ` : ''}Check the client pack on CurseForge before you upload the server pack again.`
+    return `${reason ? `${reason}, so upload it` : 'Upload the server pack'} yourself on CurseForge's website, where CurseForge accepts modpack files up to about 5 GB.`
+  }
+
+  function focusServerPackSteps(version: string) {
+    ;(document.getElementById('server-pack-notice') ?? document.getElementById(`unfinished-${version}`))?.focus()
+  }
   // The release a Finish button is finishing, so its result gets a notice of its own.
   let finishing = $state<string | null>(null)
   let finishingServerPack = $state(false)
@@ -199,6 +223,8 @@
         (to) => {
           landed = to ?? 'unknown'
           if (to && !to.serverPackMissing && to.serverPackPage) tagModalPage = to.serverPackPage
+          // We disable the Publish button once it's done, which drops focus, so we move focus to what's left for you.
+          if (to?.serverPackMissing) tick().then(() => document.getElementById('server-pack-notice')?.focus())
         },
         () => (landed = 'unknown'),
       )
@@ -379,6 +405,7 @@
 
   let rolePing = $derived(!!config?.discord.role_id.trim())
   let announces = $derived(hasWebhook && !!config?.discord.announce_on_approval)
+  let serverPackMods = $derived(config?.server.bundle_mods ? 'with its mods in the zip' : "with its mods downloaded on the server's first start")
   let approvalWait = $derived(toCurseforge ? 'CurseForge approves it' : "it's on Modrinth")
 
   async function publish() {
@@ -387,7 +414,12 @@
     const asType = asReleaseType(config?.curseforge.release_type ?? 'release')
     const consequences = [
       toCurseforge
-        ? `Upload "${client.displayName}" (${client.fileName}) and its server pack "${server.displayName}" (${server.fileName}), which downloads its mods on first start, to CurseForge as ${asType}${config?.curseforge.manual_release ? ', held until you release it' : ''}.`
+        ? `Upload "${client.displayName}" (${client.fileName}) and its server pack "${server.displayName}" (${server.fileName}) to CurseForge as ${asType}${config?.curseforge.manual_release ? ', held until you release it' : ''}.`
+        : null,
+      toCurseforge
+        ? config?.server.bundle_mods
+          ? "We'll put the mods in the server pack. If it's over about 1 GB, packraven can't upload it, so you'll upload it yourself on CurseForge's website after we upload the client pack."
+          : "Our run scripts will download the server pack's mods when a host first starts the server."
         : null,
       toCurseforge && curseforgeShipped.length
         ? `Include ${curseforgeShipped.length === 1 ? 'a jar' : `${curseforgeShipped.length} jars`} CurseForge doesn't host inside the client pack: ${curseforgeShipped.map(describe).join(', ')}.`
@@ -416,6 +448,7 @@
     try {
       error = null
       retriedServerPack = false
+      uploadedByYou = null
       finishing = null
       finishingServerPack = false
       finishedServerPackPage = null
@@ -446,6 +479,8 @@
   }
 
   async function markedPublishedUploaded(version: string) {
+    uploadedByYou = version
+    loadUnfinished()
     const to = await api.publishedTo(version).catch(() => null)
     landed = to ?? 'unknown'
     await tick()
@@ -463,11 +498,12 @@
 
   async function finish(release: UnfinishedRelease) {
     const tagging = release.pending.find((step) => step.step === 'tag')
-    const rebuild = !!release.serverPackMissing?.rebuild
+    const uploadsServerPack = !!release.serverPackMissing && !serverPackLeftToYou(release.serverPackMissing)
+    const rebuild = uploadsServerPack && !!release.serverPackMissing?.rebuild
     const steps = [
-      release.serverPackMissing
+      uploadsServerPack
         ? rebuild
-          ? 'Build the server pack again from the pack as it is now, with its mods downloaded on first start, and upload it to CurseForge.'
+          ? `Build the server pack again from the pack as it is now, ${serverPackMods}, and upload it to CurseForge.${config?.server.bundle_mods ? " If it's over about 1 GB, more than packraven can upload, you'll upload it yourself." : ''}`
           : 'Upload the server pack to CurseForge.'
         : null,
       release.modrinthMissing ? `Upload ${release.modrinthMissing} to Modrinth.` : null,
@@ -491,7 +527,7 @@
       published = null
       retriedServerPack = false
       finishing = release.version
-      finishingServerPack = !!release.serverPackMissing
+      finishingServerPack = uploadsServerPack
       finishedServerPackPage = null
       tagModalPage = null
       await api.finishRelease(release.version)
@@ -518,6 +554,14 @@
 
   let publishJob = $derived(job('publish'))
   let publishing = $derived(publishJob.phase === 'running')
+  // Screen readers can skip a status region that arrives with its text, so we keep the headline's region mounted.
+  let serverPackHeadline = $derived.by(() =>
+    published && (publishJob.phase === 'done' || reported) && typeof landed === 'object' && landed.serverPackMissing
+      ? landed.serverPackMissing.unconfirmed
+        ? `${overview?.name} ${published.version} is on ${landedOn}, but CurseForge never confirmed its server pack.`
+        : `${overview?.name} ${published.version} is on ${landedOn}, but its server pack isn't.`
+      : '',
+  )
   let serverJob = $derived(job('server-pack'))
   let clientJob = $derived(job('client-export'))
   let modrinthJob = $derived(job('modrinth-export'))
@@ -566,6 +610,8 @@
   {#if checking && !checkedOnce}
     <p class="loading muted" role="status"><span class="spinner" aria-hidden="true"></span>Checking the pack before you publish</p>
   {/if}
+  <!-- The server pack notice holds controls, so only its headline is announced. -->
+  <p class="visually-hidden" role="status">{serverPackHeadline}</p>
   {#if published && (publishJob.phase === 'done' || reported)}
     {@const tagged = `packraven tagged the release commit ${releaseTag(published.version)}${published.pushed ? ' and pushed it' : " but hasn't pushed it yet"}`}
     {#if landed === 'pending'}
@@ -578,26 +624,25 @@
     {:else}
       {@const modrinthFailed = toModrinth && landed.curseforge && !landed.modrinth}
       {#if landed.serverPackMissing}
-        {@const headline = `${overview?.name} ${published.version} is on ${landedOn}, but its server pack isn't.`}
-        <!-- The notice holds controls, so only its headline is announced. -->
-        <p class="visually-hidden" role="status">{headline}</p>
-        <Notice tone="warn" live={false}>
-          <p><strong>{headline}</strong> {tagged}, and archived its notes to <span class="file">changelogs/{published.version}.md</span>.</p>
-          <ServerPackSteps
-            upload={landed.serverPackMissing}
-            version={published.version}
-            clientName={published.clientName}
-            onretry={() => {
-              retriedServerPack = true
-              finishing = null
-              finishingServerPack = false
-              finishedServerPackPage = null
-              tagModalPage = null
-            }}
-            onmarked={() => published && markedPublishedUploaded(published.version)}
-          />
-          {#if announces}<p class="muted small">packraven holds the Discord announcement until CurseForge has the server pack.</p>{/if}
-        </Notice>
+        <div id="server-pack-notice" tabindex="-1">
+          <Notice tone="warn" live={false}>
+            <p><strong>{serverPackHeadline}</strong> {tagged}, and archived its notes to <span class="file">changelogs/{published.version}.md</span>.</p>
+            <ServerPackSteps
+              upload={landed.serverPackMissing}
+              version={published.version}
+              clientName={published.clientName}
+              onretry={() => {
+                retriedServerPack = true
+                finishing = null
+                finishingServerPack = false
+                finishedServerPackPage = null
+                tagModalPage = null
+              }}
+              onmarked={() => published && markedPublishedUploaded(published.version)}
+            />
+            {#if announces}<p class="muted small">packraven holds the Discord announcement until CurseForge has the server pack.</p>{/if}
+          </Notice>
+        </div>
       {/if}
       {#if modrinthFailed}
         {@const modrinthHeadline = `${overview?.name} ${published.version} is on CurseForge, but the Modrinth upload failed.`}
@@ -620,6 +665,7 @@
             <p role={landed.serverPackPage ? 'status' : undefined}><strong>{okHeadline}</strong> {tagged}.</p>
             <p class="muted">
               packraven archived its notes to <span class="file">changelogs/{published.version}.md</span> and cleared changelog.md for the next release.{jobSummary ? ` ${jobSummary}` : ''}
+              {#if uploadedByYou === published.version}You uploaded its server pack yourself, so you'll see it in Releases once CurseForge approves the client pack.{/if}
               <button class="link" onclick={onreleases}>Follow its review in Releases</button>.
             </p>
             {#if landed.serverPackPage && !tagModalPage}<ServerPackTagStep page={landed.serverPackPage} />{/if}
@@ -633,25 +679,40 @@
     {@const tag = releaseTag(release.version)}
     {@const tagging = release.pending.some((step) => step.step === 'tag')}
     {@const pushing = release.pending.some((step) => step.step === 'push')}
-    {@const rebuilding = !!release.serverPackMissing?.rebuild}
+    {@const leftToYou = serverPackLeftToYou(release.serverPackMissing)}
+    {@const rebuilding = !leftToYou && !!release.serverPackMissing?.rebuild}
+    {@const canFinish = packravenCanFinish(release)}
     <!-- The notice holds controls, so it isn't a live region; its heading lets you jump between unfinished releases. -->
     <Notice tone="warn" live={false}>
-      <h3 class="notice-title" id="unfinished-{release.version}" tabindex="-1">{name} is out, but we didn't finish publishing it</h3>
-      <ul class="remaining" aria-label="Left to do for {release.version}">
-        {#if release.serverPackMissing}
-          <li>
-            Upload the server pack to CurseForge{rebuilding ? ', after building it again with its mods downloaded on first start' : ''}.
-            {#if release.serverPackMissing.error}<span class="muted"><LinkedText text={`${release.serverPackMissing.error.trim().replace(/[.!]+$/, '')}.`} /></span>{/if}
-          </li>
+      <h3 class="notice-title" id="unfinished-{release.version}" tabindex="-1">
+        {#if canFinish}
+          {name} is out, but we didn't finish publishing it
+        {:else if release.serverPackMissing?.unconfirmed}
+          {name} is out, but CurseForge never confirmed its server pack
+        {:else}
+          {name} is out, but its server pack isn't on CurseForge yet
         {/if}
-        {#if release.modrinthMissing}
-          <li>
-            Upload <span class="file">{release.modrinthMissing}</span> to Modrinth.
-            {#if release.modrinthError}<span class="muted">The last try failed: <LinkedText text={`${release.modrinthError.trim().replace(/[.!]+$/, '')}.`} /></span>{/if}
-          </li>
-        {/if}
-        {#if tagging}<li>Commit the release and tag it <span class="file">{tag}</span>{pushing ? ', then push' : ''}.</li>{:else if pushing}<li>Push <span class="file">{tag}</span>.</li>{/if}
-      </ul>
+      </h3>
+      <!-- When only you can upload the server pack and nothing else is left, we skip the list, since the steps cover it. -->
+      {#if canFinish}
+        <ul class="remaining" aria-label="Left to do for {release.version}">
+          {#if release.serverPackMissing && leftToYou}
+            <li><LinkedText text={leftToYouStep(release.serverPackMissing)} /></li>
+          {:else if release.serverPackMissing}
+            <li>
+              Upload the server pack to CurseForge{rebuilding ? ', after building it again' : ''}.
+              {#if release.serverPackMissing.error}<span class="muted"><LinkedText text={`${release.serverPackMissing.error.trim().replace(/[.!]+$/, '')}.`} /></span>{/if}
+            </li>
+          {/if}
+          {#if release.modrinthMissing}
+            <li>
+              Upload <span class="file">{release.modrinthMissing}</span> to Modrinth.
+              {#if release.modrinthError}<span class="muted">The last try failed: <LinkedText text={`${release.modrinthError.trim().replace(/[.!]+$/, '')}.`} /></span>{/if}
+            </li>
+          {/if}
+          {#if tagging}<li>Commit the release and tag it <span class="file">{tag}</span>{pushing ? ', then push' : ''}.</li>{:else if pushing}<li>Push <span class="file">{tag}</span>.</li>{/if}
+        </ul>
+      {/if}
       {#if release.packChanged && (tagging || rebuilding)}
         <p class="muted">
           Your mods changed since {release.version} shipped. If you finish now, {[tagging ? 'the tag' : null, rebuilding ? 'the rebuilt server pack' : null].filter(Boolean).join(' and ')}
@@ -659,12 +720,15 @@
         </p>
       {/if}
       <!-- When you're on this version, the button at the bottom of Publish finishes it, so we don't offer a second one. -->
-      {#if release.version === trimmed}
+      {#if canFinish && release.version === trimmed}
         <p class="muted">Finish it with the button at the bottom of Publish.</p>
-      {:else}
+      {:else if canFinish}
         <p><button class="primary" class:busy={publishing && finishing === release.version} disabled={publishing} onclick={() => finish(release)}>Finish publishing {release.version}</button></p>
       {/if}
-      {#if release.serverPackMissing}
+      {#if release.serverPackMissing && leftToYou}
+        <!-- With other steps left, we give the reason in the list above, so we leave it out of the steps. -->
+        <ServerPackSteps upload={release.serverPackMissing} version={release.version} clientName={name} retry={!canFinish} tagged={!tagging} onmarked={() => markedUploaded(release.version)} />
+      {:else if release.serverPackMissing}
         <details class="manual" bind:open={manualOpen[release.version]}>
           <summary class="muted small"><Twisty open={!!manualOpen[release.version]} />Upload the server pack yourself</summary>
           <ServerPackSteps upload={release.serverPackMissing} version={release.version} clientName={name} retry={false} tagged={!tagging} onmarked={() => markedUploaded(release.version)} />
@@ -790,7 +854,15 @@
               </span>
               <span class="rename"><Twisty {open} />Rename<span class="visually-hidden"> the {title.toLowerCase()}</span></span>
             </button>
-            {#if side === 'server'}<span class="muted small">We upload it as an additional file of the client pack; it's not currently possible to tag it as a server pack automatically, so you'll tag it on CurseForge afterwards.</span>{/if}
+            {#if side === 'server'}
+              <span class="small">
+                {config?.server.bundle_mods ? 'Its mods are in the zip.' : "Its mods are downloaded on the server's first start."}
+                <button type="button" class="link" onclick={() => ((serverView.tab = 'startup'), onserver())}>Change<span class="visually-hidden"> how the server pack gets its mods</span></button>
+              </span>
+              <span class="muted small">
+                We upload it as an additional file of the client pack; it's not currently possible to tag it as a server pack automatically, so you'll tag it on CurseForge afterwards.
+              </span>
+            {/if}
             {#if open}
               <div class="names" id="{side}-rename">
                 <label for="{side}-display-name"><span class="visually-hidden">{title} </span>Display name</label>
@@ -1033,6 +1105,10 @@
       <button class="primary" class:busy={publishing} disabled={publishing} onclick={() => finish(release)}>
         {publishing ? 'Finishing' : `Finish publishing ${trimmed}`}
       </button>
+    {:else if waitingOnYou}
+      {@const version = waitingOnYou.version}
+      <p class="check">{version} is out, but you still need to upload its server pack.</p>
+      <button class="primary" onclick={() => focusServerPackSteps(version)}>Go to the server pack steps</button>
     {:else}
       <label class="check"><input type="checkbox" bind:checked={push} /> Push the release commit and tag</label>
       <button class="primary" class:busy={publishing} disabled={!canPublish} aria-describedby="publish-checks" onclick={publish}>
@@ -1464,6 +1540,7 @@
   }
 
   #published-notice,
+  #server-pack-notice,
   #finished-notice {
     border-radius: var(--radius-panel);
   }

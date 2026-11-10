@@ -6,9 +6,11 @@
     jvmArgs,
     args,
     graalvm,
+    bundleMods,
     minecraft,
     launch,
     testPort,
+    savedCount,
     onchange,
     onfiles,
   }: {
@@ -16,12 +18,27 @@
     jvmArgs: string[]
     args: string[]
     graalvm: string
+    bundleMods: boolean
     minecraft: string | null
     launch: { windows: string; unix: string } | null
     testPort: number
-    onchange: (changes: { memory?: string; jvm_args?: string[]; args?: string[]; graalvm?: string }) => void
+    savedCount: number
+    onchange: (changes: { memory?: string; jvm_args?: string[]; args?: string[]; graalvm?: string; bundle_mods?: boolean }) => void
     onfiles: (path: string) => void
   } = $props()
+
+  const modsOptions = [
+    {
+      bundle: false,
+      label: 'Download on first start',
+      hint: "The zip will stay very small. On server startup, we'll download each mod from CurseForge or Modrinth and check it's intact. We still put mods that aren't on either site in the zip.",
+    },
+    {
+      bundle: true,
+      label: 'Include them in the zip',
+      hint: "The zip will include every jar file, to better support hosts who expect them. If the zip is over 1 GB, packraven can't upload it, so we'll open the Authors Portal for you.",
+    },
+  ]
 
   type GraalvmChoice = 'auto' | '21' | '25' | 'exact'
 
@@ -104,6 +121,22 @@
 
 <div class="startup">
   <div class="form">
+    <section aria-labelledby="mods-title">
+      <h3 id="mods-title">Server Mod Files</h3>
+      <div class="options" role="radiogroup" aria-labelledby="mods-title" aria-describedby="mods-hint">
+        {#each modsOptions as option (option.bundle)}
+          {@const id = `mods-${option.bundle ? 'bundled' : 'downloaded'}`}
+          <!-- Clicking the hint picks its option, so it sits inside the label, and aria-labelledby keeps it out of the radio's name. -->
+          <label class="option">
+            <input type="radio" name="server-mods" checked={bundleMods === option.bundle} aria-labelledby="{id}-label" aria-describedby="{id}-hint" onchange={() => onchange({ bundle_mods: option.bundle })} />
+            <span class="option-label" id="{id}-label">{option.label}{#if !option.bundle}{' '}<span class="muted">(recommended)</span>{/if}</span>
+            <span class="hint" id="{id}-hint">{option.hint}</span>
+          </label>
+        {/each}
+      </div>
+      <p class="hint" id="mods-hint">We use this for the server packs you build from now on. Either way, we copy the mods on this computer into test runs.</p>
+    </section>
+
     <section aria-labelledby="memory-title">
       <h3 id="memory-title">Memory</h3>
       <label class="field short">
@@ -201,7 +234,7 @@
       Test runs use the same flags and arguments with this machine's Java, on port {testPort}, open only to this computer. They also get any extra launch
       arguments you set for debugging in App settings or Pack settings.
     </p>
-    <ServerReadme onedit={onfiles} />
+    <ServerReadme onedit={onfiles} {savedCount} />
   </aside>
 </div>
 
@@ -238,6 +271,29 @@
     max-width: 200px;
   }
 
+  .options {
+    display: grid;
+    gap: 10px;
+  }
+
+  .option {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: 8px;
+    row-gap: 2px;
+    align-items: baseline;
+    max-width: 70ch;
+    cursor: pointer;
+  }
+
+  .option input {
+    margin: 0;
+  }
+
+  .option .hint {
+    grid-column: 2;
+  }
+
   .inline {
     display: flex;
     flex-wrap: wrap;
@@ -261,6 +317,7 @@
   }
 
   .hint {
+    max-width: 75ch;
     color: var(--muted);
     font-size: var(--step--1);
   }

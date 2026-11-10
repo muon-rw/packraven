@@ -193,6 +193,7 @@ pub struct ServerConfig {
     pub args: Vec<String>,
     pub graalvm: String,
     pub properties: BTreeMap<String, String>,
+    pub bundle_mods: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -249,6 +250,7 @@ impl Default for ServerConfig {
             jvm_args: Vec::new(),
             args: Vec::new(),
             graalvm: String::new(),
+            bundle_mods: false,
             properties: [("allow-flight", "true"), ("max-tick-time", "60000"), ("difficulty", "normal")]
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))

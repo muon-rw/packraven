@@ -473,6 +473,26 @@ test('server properties and startup save as you change them', async ({ page }) =
   expect(problems).toEqual([])
 })
 
+test('server packs download their mods unless you include them in the zip', async ({ page }) => {
+  await openApp(page, 'server', 'dirty')
+  await page.getByRole('tab', { name: 'Startup' }).click()
+  const mods = page.getByRole('radiogroup', { name: 'Mod files' })
+  const readme = page.getByRole('figure', { name: /PLEASE READ/ })
+  await expect(mods.getByRole('radio', { name: /^Downloaded on first start/ })).toBeChecked()
+  await expect(readme).toContainText('WHERE ARE THE MODS?')
+  await expect(readme).toContainText('then downloads our mods and installs NeoForge and Minecraft.')
+
+  await mods.getByRole('radio', { name: /^Included in the zip/ }).check()
+  await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible()
+  await expect(readme).not.toContainText('WHERE ARE THE MODS?')
+  await expect(readme).toContainText('then installs NeoForge and Minecraft.')
+
+  await page.getByRole('navigation', { name: 'Pack' }).getByRole('button', { name: /^Publish/ }).click()
+  await expect(page.locator('.ships')).toContainText('Its mods are in the zip')
+  await page.getByRole('button', { name: 'Change how the server pack gets its mods' }).click()
+  await expect(page.getByRole('radio', { name: /^Included in the zip/ })).toBeChecked()
+})
+
 test("installing a mod marks the dependencies it brings as installing", async ({ page }) => {
   await openApp(page, 'mods', 'ready')
   await page.getByRole('button', { name: 'Add from CurseForge' }).click()
@@ -1013,6 +1033,55 @@ test('a server pack that failed to upload can be uploaded again from Publish', a
   await expect(page.getByRole('button', { name: 'Open the server pack on CurseForge' })).toBeVisible()
   await expect(page.locator('#published-notice')).toBeFocused()
   await expect(page.getByText("but its server pack isn't")).toHaveCount(0)
+})
+
+test('a server pack too large for the upload API is left to you to upload on the website', async ({ page }) => {
+  page.on('dialog', (dialog) => dialog.accept())
+  await page.goto('/?view=publish&scenario=ready&serverpacklarge')
+  const publish = page.locator('.go .primary')
+  await expect(publish).toBeEnabled({ timeout: 10000 })
+  await publish.click()
+  const notice = page.locator('.notice', { hasText: "but its server pack isn't" })
+  await expect(notice).toContainText("The server pack is 1.42 GB, more than packraven can upload to CurseForge, but CurseForge accepts modpack files up to about 5 GB on its website.")
+  await expect(page.locator('#server-pack-notice')).toBeFocused()
+  await expect(notice.getByRole('button', { name: /Upload it again|Build it again/ })).toHaveCount(0)
+  await expect(notice.getByRole('button', { name: /^Open CurseForge's upload page/ })).toBeVisible()
+  // packraven can't upload it, so the bottom bar offers the steps instead of Finish or Publish.
+  const go = page.locator('.go')
+  await expect(go).toContainText('is out, but you still need to upload its server pack.')
+  await expect(go.getByRole('button', { name: /^(Finish publishing|Publish)/ })).toHaveCount(0)
+  await page.locator('#publish-title').focus()
+  await go.getByRole('button', { name: 'Go to the server pack steps' }).click()
+  await expect(page.locator('#server-pack-notice')).toBeFocused()
+
+  await notice.getByRole('button', { name: /^I uploaded it/ }).click()
+  await expect(page.getByText("but its server pack isn't")).toHaveCount(0)
+  await expect(page.locator('#published-notice')).toContainText('You uploaded its server pack yourself')
+})
+
+test('a server pack CurseForge never confirmed asks you to check before uploading it again', async ({ page }) => {
+  const warnings: string[] = []
+  page.on('dialog', (dialog) => {
+    // Cancel the warning, as when you find the server pack already on CurseForge, and accept the Publish confirm.
+    if (dialog.message().includes('may have kept it')) {
+      warnings.push(dialog.message())
+      dialog.dismiss()
+    } else dialog.accept()
+  })
+  await page.goto('/?view=publish&scenario=ready&serverpackunconfirmed')
+  const publish = page.locator('.go .primary')
+  await expect(publish).toBeEnabled({ timeout: 10000 })
+  await publish.click()
+  const notice = page.locator('.notice', { hasText: 'but CurseForge never confirmed its server pack' })
+  await expect(notice).toContainText('so it may have kept the file anyway')
+  await expect(notice.getByRole('button', { name: 'Open the client pack on CurseForge' })).toBeVisible()
+  // Finishing would upload it without checking, so the bottom bar offers the steps instead.
+  await expect(page.locator('.go')).toContainText('you still need to upload its server pack')
+
+  await notice.getByRole('button', { name: 'Upload it again' }).click()
+  await expect.poll(() => warnings.length).toBe(1)
+  await expect(notice.getByRole('button', { name: 'Upload it again' })).toBeEnabled()
+  await expect(notice).toBeVisible()
 })
 
 test('a release packraven left unfinished can be finished from Publish', async ({ page }) => {

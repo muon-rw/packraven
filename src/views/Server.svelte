@@ -15,7 +15,7 @@
   let { overview, onfiles }: { overview: Overview | null; onfiles: (path: string) => void } = $props()
 
   type Tab = typeof serverView.tab
-  type Settings = Pick<PackConfig['server'], 'memory' | 'jvm_args' | 'args' | 'graalvm' | 'properties'>
+  type Settings = Pick<PackConfig['server'], 'memory' | 'jvm_args' | 'args' | 'graalvm' | 'properties' | 'bundle_mods'>
 
   const tabs: [Tab, string][] = [
     ['mods', 'Mods'],
@@ -55,13 +55,14 @@
   let icon = $state<string | null>(null)
   let launch = $state<{ windows: string; unix: string } | null>(null)
   let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle')
+  let savedCount = $state(0)
   let saveError = $state('')
 
   async function loadSettings() {
     try {
       const config = await api.getPackConfig()
-      const { memory, jvm_args, args, graalvm, properties } = config.server
-      settings = { memory, jvm_args, args, graalvm, properties }
+      const { memory, jvm_args, args, graalvm, properties, bundle_mods } = config.server
+      settings = { memory, jvm_args, args, graalvm, properties, bundle_mods }
       testPort = config.test.port
       settingsError = null
     } catch (error) {
@@ -95,6 +96,7 @@
         await api.savePackConfig(config)
         markChanged()
         saveState = 'saved'
+        savedCount++
       } catch (error) {
         saveError = errorText(error)
         saveState = 'failed'
@@ -189,7 +191,7 @@
         {#if serverView.tab === 'properties'}
           Written to <span class="file">server.properties</span> in every server pack and test run. All other values fall back to vanilla or modded defaults.
         {:else if serverView.tab === 'startup'}
-          Startup settings for the published server pack. We'll write these into the pack's <span class="file">user_jvm_args.txt</span>, run scripts and <span class="file">PLEASE READ - IMPORTANT!.txt</span>.
+          Choose how hosts get the server pack's mods and how its server starts. We'll write these settings into the pack's <span class="file">user_jvm_args.txt</span>, run scripts and <span class="file">PLEASE READ - IMPORTANT!.txt</span>.
         {:else if loading && !mods.length}
           Reading which mods the server needs.
         {:else if !mods.length}
@@ -246,6 +248,8 @@
         jvmArgs={settings.jvm_args}
         args={settings.args}
         graalvm={settings.graalvm}
+        bundleMods={settings.bundle_mods}
+        {savedCount}
         minecraft={overview?.minecraft ?? null}
         {launch}
         {testPort}

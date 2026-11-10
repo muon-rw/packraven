@@ -97,6 +97,8 @@ const config = {
     jvm_args: scenario === 'empty' ? [] : ['-XX:+UseG1GC', '-Dfml.readTimeout=180'],
     args: [] as string[],
     graalvm: '',
+    // Add `bundlemods` to the URL to have the pack's server packs include their mods.
+    bundle_mods: new URLSearchParams(location.search).has('bundlemods'),
     properties: (scenario === 'empty'
       ? { 'allow-flight': 'true', 'max-tick-time': '60000', difficulty: 'normal' }
       : { motd: '§6{name} §e{version}§r\\n§7Dragons, dungeons and §aspells', 'allow-flight': 'true', difficulty: 'hard', 'max-players': '12', 'view-distance': '12', 'max-tick-time': '-1', 'pause-when-empty-seconds': '0' }) as Record<string, string>,
@@ -109,21 +111,28 @@ const config = {
 
 const modrinthRelease = (version: string) => ({ status: 'Listed', url: `https://modrinth.com/project/ravens-high-fantasy/version/${version}` })
 const zipStem = (version: string) => `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-${version}`
-// packraven rebuilds a server pack CurseForge turned down as too large before it tries again.
-const tooLarge = "CurseForge turned down the 1.29 GB file as too large"
-const unsentServerPack = (version: string, fileId: number, error = tooLarge, packChanged = false): ServerPackUpload => ({
-  zip: `C:/Users/you/AppData/Roaming/dev.muon.packraven/packs/ravens-high-fantasy/builds/${version}/${zipStem(version)}-server.zip`,
+const tooLargeForApi = "The server pack is 1.42 GB, more than packraven can upload to CurseForge"
+const unconfirmedUpload = 'CurseForge received the whole file, but the connection dropped before it answered (error sending request), so it may have kept the file anyway'
+const unsentServerPack = (version: string, fileId: number, error: string, { packChanged = false, zipGone = false, tooLarge = false, unconfirmed = false } = {}): ServerPackUpload => ({
+  zip: zipGone ? null : `C:/Users/you/AppData/Roaming/dev.muon.packraven/packs/ravens-high-fantasy/builds/${version}/${zipStem(version)}-server.zip`,
   uploadPage: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}/create-additional-file`,
   displayName: `Server Pack ${version}`,
   fileName: `${zipStem(version)}-server.zip`,
   error,
-  retryable: true,
-  rebuild: error === tooLarge,
+  retryable: !tooLarge,
+  rebuild: zipGone,
+  tooLarge,
+  unconfirmed,
+  clientPage: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}`,
   packChanged,
   tag: `v${version}`,
 })
 // Add `serverpackfails` to the URL to have a mock publish fail its server pack upload.
 const serverPackFails = new URLSearchParams(location.search).has('serverpackfails')
+// Add `serverpacklarge` to have a mock publish build a server pack too large for CurseForge's upload API.
+const serverPackLarge = new URLSearchParams(location.search).has('serverpacklarge')
+// Add `serverpackunconfirmed` to have the server pack upload lose CurseForge's answer after sending the whole file.
+const serverPackUnconfirmed = new URLSearchParams(location.search).has('serverpackunconfirmed')
 // Add `clientheld` to have CurseForge hold the newest release's client pack for manual review.
 const clientHeld = new URLSearchParams(location.search).has('clientheld')
 // Add `serverdeleted` to have the newest release's server pack gone from CurseForge, as after you delete it.
@@ -137,7 +146,7 @@ const releases: ReleaseStatus[] = scenario === 'empty' ? [] : [
     updateChecker: { updateType: 'minor_breaking', addedAt: '2026-10-03T19:02:00Z' } },
   { version: fx.version === '0.1.0' ? '0.1.1' : fx.version, publishedAt: '2026-10-12T21:40:00Z', announce: true, announcedAt: null,
     displayName: `${pack.name} 0.1.1`, releaseType: 'beta', modrinth: scenario === 'dirty' ? null : modrinthRelease('0.1.1'), modrinthMissing: scenario === 'dirty' ? `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-0.1.1.mrpack` : null,
-    serverPackMissing: scenario === 'dirty' ? unsentServerPack('0.1.1', 7105511, tooLarge, true) : null,
+    serverPackMissing: scenario === 'dirty' ? unsentServerPack('0.1.1', 7105511, 'packraven stopped before it finished this upload', { packChanged: true, zipGone: true }) : null,
     // In the ready scenario CurseForge holds its server pack for manual review, so Releases offers to replace it.
     curseforge: {
       projectId: 1234567,
@@ -736,18 +745,35 @@ let serverReadme = false
 
 // We fill the default template the app ships, the way the backend does, so the preview can't drift from it.
 function mockServerReadme() {
+  const downloads = !config.server.bundle_mods
+  const loaderVersion = String(fx.loader).replace(/^neoforge-/, '')
+  const pickLoader = `In your host's startup settings, select NeoForge ${loaderVersion} for Minecraft ${fx.minecraft}.`
   const values: Record<string, string> = {
     name: pack.name,
     version: String(fx.version),
     minecraft: String(fx.minecraft),
     loader: 'NeoForge',
-    loader_version: String(fx.loader).replace(/^neoforge-/, ''),
-    setup: 'downloads our mods and installs NeoForge and Minecraft',
-    packraven_folder: 'The packraven folder holds the files the run scripts use to set up the server.',
+    loader_version: loaderVersion,
+    setup: downloads ? 'downloads our mods and installs NeoForge and Minecraft' : 'installs NeoForge and Minecraft',
+    where_are_the_mods: downloads ? 'WHERE ARE THE MODS?\nThey get downloaded automatically when you start the server.' : '',
+    jar_only_hosts: downloads
+      ? `1. Start the server on your own computer once (see HOW TO START above) so the mods download, then stop it.\n2. Upload everything in this folder, mods included, to your host's server folder.\n3. ${pickLoader}`
+      : `1. Upload everything in this folder to your host's server folder.\n2. ${pickLoader}`,
+    packraven_folder: 'The run scripts use the files in the packraven folder to set up the server.',
   }
-  const lines = defaultServerReadme.split(/\r?\n/).filter((line) => !line.trimStart().startsWith('//'))
-  const filled = lines.join('\n').replace(/\{([a-z_]+)\}/g, (found, key: string) => values[key] ?? found)
-  return `${filled.trim().replace(/\n/g, '\r\n')}\r\n`
+  const placeholder = /\{([a-z_]+)\}/g
+  const out: string[] = []
+  let dropped = false
+  for (const line of defaultServerReadme.split(/\r?\n/).filter((line) => !line.trimStart().startsWith('//'))) {
+    if (dropped && !line.trim()) {
+      dropped = false
+      continue
+    }
+    const filled = line.replace(placeholder, (found, key: string) => values[key] ?? found)
+    dropped = !filled.trim() && /\{[a-z_]+\}/.test(line) &&!line.replace(placeholder, '').trim()
+    if (!dropped) out.push(filled)
+  }
+  return `${out.join('\n').trim().replace(/\n/g, '\r\n')}\r\n`
 }
 // A fresh setup hasn't accepted the Minecraft EULA or signed in to Minecraft yet.
 let eulaAccepted = scenario !== 'empty'
@@ -1346,15 +1372,24 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     release.serverPackMissing = null
     release.curseforge = { ...release.curseforge!, serverStatus: 'Uploaded by you' }
   },
-  finish_release: (a) =>
-    mockJob('publish', ['Uploading the server pack', 'Uploaded the server pack as file 7300001', `Committed "Release ${a.version}" and tagged v${a.version}`, 'Pushed the release commit and tag'], `Finished publishing ${a.version}`, () => {
-      const release = releases.find((r) => r.version === a.version)!
-      if (release.serverPackMissing) release.curseforge = { ...release.curseforge!, serverStatus: 'Not public yet', serverPackLinked: false, serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7300001' }
+  finish_release: (a) => {
+    const release = releases.find((r) => r.version === a.version)!
+    // Like the backend, finishing leaves a server pack too large for the upload API to you.
+    const leftToYou = !!release.serverPackMissing?.tooLarge
+    const message = leftToYou
+      ? `Finished publishing ${a.version}, except its server pack, which is more than packraven can upload to CurseForge. Upload it yourself on CurseForge's website`
+      : `Finished publishing ${a.version}`
+    const serverLines = release.serverPackMissing && !leftToYou ? ['Uploading the server pack', 'Uploaded the server pack as file 7300001'] : []
+    return mockJob('publish', [...serverLines, `Committed "Release ${a.version}" and tagged v${a.version}`, 'Pushed the release commit and tag'], message, () => {
+      if (release.serverPackMissing && !leftToYou) {
+        release.curseforge = { ...release.curseforge!, serverStatus: 'Not public yet', serverPackLinked: false, serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7300001' }
+        release.serverPackMissing = null
+      }
       if (release.modrinthMissing) release.modrinth = modrinthRelease(String(a.version))
-      release.serverPackMissing = null
       release.modrinthMissing = null
       unfinishedSteps.delete(String(a.version))
-    }),
+    })
+  },
   published_to: (a) => {
     const release = releases.find((r) => r.version === a.version)
     return release ? { curseforge: !!release.curseforge, modrinth: !!release.modrinth, serverPackMissing: release.serverPackMissing, serverPackPage: release.curseforge?.serverPage ?? null, modrinthError: null } : null
@@ -1362,11 +1397,21 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   publish: (a) => {
     const version = (a.options as { version: string }).version
     const fileId = 7200000 + releases.length
-    const serverLine = serverPackFails ? "Couldn't upload the server pack" : `Uploaded the server pack as file ${fileId + 1}`
+    const serverFails = serverPackFails || serverPackUnconfirmed
+    const serverMissing = serverFails || serverPackLarge
+    const failure = serverPackUnconfirmed ? unconfirmedUpload : 'CurseForge rejected the upload (502 Bad Gateway)'
+    const serverLines = serverPackLarge
+      ? [`${tooLargeForApi}, so you'll upload it on CurseForge's website`]
+      : ['Uploading the server pack', serverFails ? "Couldn't upload the server pack" : `Uploaded the server pack as file ${fileId + 1}`]
+    const summary = serverPackLarge
+      ? `Published ${version}: CurseForge file ${fileId}, without its server pack. ${tooLargeForApi}, so upload it yourself as an additional file on CurseForge's website, where CurseForge accepts modpack files up to about 5 GB.`
+      : serverFails
+        ? `Published ${version}: CurseForge file ${fileId}, without its server pack. The server pack upload failed, so upload it yourself as an additional file on CurseForge: ${failure}`
+        : `Published ${version}: CurseForge file ${fileId}, server pack ${fileId + 1}.`
     mockJob(
       'publish',
-      ['Uploading the client pack', `Uploaded the client pack as file ${fileId}`, 'Uploading the server pack', serverLine, `Committed "Release ${version}" and tagged v${version}`],
-      serverPackFails ? `Published ${version}: CurseForge file ${fileId}, without its server pack.` : `Published ${version}: CurseForge file ${fileId}, server pack ${fileId + 1}.`,
+      ['Uploading the client pack', `Uploaded the client pack as file ${fileId}`, ...serverLines, `Committed "Release ${version}" and tagged v${version}`],
+      summary,
       () => {
         releases.push({
           version,
@@ -1377,8 +1422,12 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
           releaseType: config.curseforge.release_type,
           modrinth: config.modrinth.project_id ? modrinthRelease(version) : null,
           modrinthMissing: null,
-          serverPackMissing: serverPackFails ? unsentServerPack(version, fileId, 'CurseForge rejected the upload (502 Bad Gateway)') : null,
-          curseforge: { projectId: 1234567, fileId, status: 'Not public yet', serverStatus: serverPackFails ? 'Not uploaded' : 'Not public yet', serverPackLinked: serverPackFails ? null : false, state: null, serverState: null, uploaded: null, serverUploaded: null, page: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}`, serverPage: serverPackFails ? null : `https://authors.curseforge.com/#/projects/1234567/files/${fileId + 1}` },
+          serverPackMissing: serverPackLarge
+            ? unsentServerPack(version, fileId, tooLargeForApi, { tooLarge: true })
+            : serverFails
+              ? unsentServerPack(version, fileId, failure, { unconfirmed: serverPackUnconfirmed })
+              : null,
+          curseforge: { projectId: 1234567, fileId, status: 'Not public yet', serverStatus: serverMissing ? 'Not uploaded' : 'Not public yet', serverPackLinked: serverMissing ? null : false, state: null, serverState: null, uploaded: null, serverUploaded: null, page: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}`, serverPage: serverMissing ? null : `https://authors.curseforge.com/#/projects/1234567/files/${fileId + 1}` },
           packChanged: false,
           clientZipPresent: true,
           updateChecker: (a.options as { updateChecker: UpdateType | null }).updateChecker ? { updateType: (a.options as { updateChecker: UpdateType }).updateChecker } : null,

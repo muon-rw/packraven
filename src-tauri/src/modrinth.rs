@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 
 use crate::credentials::{self, Credential};
 use crate::http::CLIENT;
+use crate::jobs::Log;
 use crate::pack::ModrinthFile;
 
 const API: &str = "https://api.modrinth.com/v2";
@@ -359,14 +360,14 @@ pub fn token() -> Option<String> {
     credentials::get(Credential::Modrinth)
 }
 
-pub async fn create_version(mut data: Value, path: &Path, file_name: String) -> Result<Version> {
+pub async fn create_version(mut data: Value, path: &Path, file_name: String, log: &Log) -> Result<Version> {
     let token = token().context(NO_TOKEN)?;
     data["file_parts"] = json!(["pack"]);
     data["primary_file"] = json!("pack");
-    let bytes = tokio::fs::read(path).await?;
-    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str("application/x-modrinth-modpack+zip")?;
-    let form = reqwest::multipart::Form::new().text("data", data.to_string()).part("pack", part);
-    let response = CLIENT.post(format!("{API}/version")).header("Authorization", token).multipart(form).send().await?;
+    let request = CLIENT.post(format!("{API}/version")).header("Authorization", token);
+    let form = reqwest::multipart::Form::new().text("data", data.to_string());
+    let file = crate::http::UploadFile { field: "pack", path, file_name, mime: "application/x-modrinth-modpack+zip" };
+    let response = crate::http::send_upload(request, form, file, "Modrinth", log).await?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     if !status.is_success() {

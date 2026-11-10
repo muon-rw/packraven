@@ -47,6 +47,13 @@ pub enum ServerMods {
     DownloadedOnStart,
 }
 
+impl ServerMods {
+    /// Returns how the pack's release server packs get their mods: downloaded on first start, unless you chose to bundle them.
+    pub fn for_release(pack: &Pack) -> Self {
+        if pack.config.server.bundle_mods { Self::Bundled } else { Self::DownloadedOnStart }
+    }
+}
+
 fn globs(patterns: &[String]) -> Result<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     for pattern in patterns {
@@ -517,15 +524,17 @@ pub async fn test_server_plan(pack: &Pack, sides: &[ModSide], version: &str, jav
             plan.insert(relative, Planned::Copy(entry.into_path()));
         }
     }
-    plan.extend(pack_server_files(pack, sides, version, ServerMods::Bundled, log).await?);
+    plan.extend(pack_server_files(pack, sides, version, ServerMods::Bundled, &[], log).await?);
     Ok(plan)
 }
 
 // The Minecraft EULA doesn't let us redistribute vanilla's server, so release server packs carry the
 // loader's installer (or Fabric's server launcher) instead, and that downloads it from Mojang on first start.
-async fn release_server_plan(pack: &Pack, sides: &[ModSide], version: &str, mods: ServerMods, data_dir: &Path, log: &Log) -> Result<FilePlan> {
-    let mut plan = pack_server_files(pack, sides, version, mods, log).await?;
-    let readme = server_readme(pack, version, mods)?;
+// We upload release server packs to CurseForge beside the client pack, so we leave out the files you kept off it.
+async fn release_server_plan(pack: &Pack, sides: &[ModSide], version: &str, data_dir: &Path, log: &Log) -> Result<FilePlan> {
+    let mods = ServerMods::for_release(pack);
+    let mut plan = pack_server_files(pack, sides, version, mods, &literal_paths(&pack.config.curseforge.exclude), log).await?;
+    let readme = server_readme(pack, version)?;
     if !readme.unknown_placeholders.is_empty() {
         log.stream("err", &format!("{SERVER_README} has {}, which packraven doesn't fill in, so hosts will see it as written", readme.unknown_placeholders.join(", ")));
     }
@@ -567,16 +576,21 @@ fn server_download_url(entry: &LockEntry) -> Option<String> {
     Some(url.to_string()).filter(|url| url.starts_with("https://") && !url.contains(['\t', '\n']))
 }
 
-async fn pack_server_files(pack: &Pack, sides: &[ModSide], version: &str, mods: ServerMods, log: &Log) -> Result<FilePlan> {
-    let mut plan = FilePlan::new();
-    let client_only: HashSet<&str> = sides.iter().filter(|m| m.side == Side::Client).map(|m| m.path.as_str()).collect();
-    let server_files: Vec<&LockEntry> = pack
+fn server_mod_files<'a>(pack: &'a Pack, client_only: &HashSet<&str>, kept_off: &[String]) -> Result<Vec<&'a LockEntry>> {
+    let left_out = globs(kept_off)?;
+    Ok(pack
         .lock
         .files
         .iter()
-        .filter(|e| !e.path.ends_with(".disabled") && !client_only.contains(e.path.as_str()))
+        .filter(|e| !e.path.ends_with(".disabled") && !client_only.contains(e.path.as_str()) && !left_out.is_match(&e.path))
         .filter(|e| e.path.starts_with("mods/") || e.path.starts_with("datapacks/"))
-        .collect();
+        .collect())
+}
+
+async fn pack_server_files(pack: &Pack, sides: &[ModSide], version: &str, mods: ServerMods, kept_off: &[String], log: &Log) -> Result<FilePlan> {
+    let mut plan = FilePlan::new();
+    let client_only: HashSet<&str> = sides.iter().filter(|m| m.side == Side::Client).map(|m| m.path.as_str()).collect();
+    let server_files = server_mod_files(pack, &client_only, kept_off)?;
     log.info(format!("Including {} server files ({} client-only skipped)", server_files.len(), client_only.len()));
     let mut download_list = String::new();
     for entry in &server_files {
@@ -588,11 +602,11 @@ async fn pack_server_files(pack: &Pack, sides: &[ModSide], version: &str, mods: 
         }
     }
     if mods == ServerMods::DownloadedOnStart {
-        log.info(format!("The server downloads {} of them on first start", download_list.lines().count()));
+        log.info(format!("The run scripts download {} of them on the server's first start", download_list.lines().count()));
         plan.insert(DOWNLOAD_LIST.into(), Planned::Write(download_list));
     }
 
-    let overrides = override_files(pack, &[server_pack_sources(), pack.config.server.exclude.clone()].concat())?;
+    let overrides = override_files(pack, &[server_pack_sources(), pack.config.server.exclude.clone(), kept_off.to_vec()].concat())?;
     log.info(format!("Including {} config and override files", overrides.len()));
     for file in overrides {
         let source = pack.dir.join(&file);
@@ -653,40 +667,73 @@ fn server_readme_template(pack: &Pack) -> Result<(String, bool)> {
 
 // We fill each placeholder in one pass, so a pack name that happens to contain {version} stays as written.
 // Hosts often open the README in Notepad, so we give it CRLF endings whatever the template has.
-pub fn server_readme(pack: &Pack, version: &str, mods: ServerMods) -> Result<ServerReadme> {
+// We leave out a line holding only placeholders that fill in as nothing, and the blank line after it, so the
+// sections around it keep one blank line between them.
+pub fn server_readme(pack: &Pack, version: &str) -> Result<ServerReadme> {
     let (template, custom) = server_readme_template(pack)?;
+    let mods = ServerMods::for_release(pack);
     let minecraft = pack.lock.minecraft()?;
     let loader = pack.lock.mod_loader()?;
     let has_folder = mods == ServerMods::DownloadedOnStart || forge_installer_url(minecraft, &loader).is_some();
     let loader_version = loader.version();
     let loader = loader.name();
-    let setup = match mods {
-        ServerMods::DownloadedOnStart => format!("downloads our mods and installs {loader} and Minecraft"),
-        ServerMods::Bundled => format!("installs {loader} and Minecraft"),
+    let pick_loader = format!("In your host's startup settings, select {loader} {loader_version} for Minecraft {minecraft}.");
+    let (setup, where_are_the_mods, jar_only_hosts) = match mods {
+        ServerMods::DownloadedOnStart => (
+            format!("downloads our mods and installs {loader} and Minecraft"),
+            "WHERE ARE THE MODS?\nThey get downloaded automatically when you start the server.",
+            format!(
+                "1. Start the server on your own computer once (see HOW TO START above) so the mods download, then stop it.\n2. Upload everything in this folder, mods included, to your host's server folder.\n3. {pick_loader}"
+            ),
+        ),
+        ServerMods::Bundled => (
+            format!("installs {loader} and Minecraft"),
+            "",
+            format!("1. Upload everything in this folder to your host's server folder.\n2. {pick_loader}"),
+        ),
     };
-    let folder = if has_folder { "The packraven folder holds the files the run scripts use to set up the server." } else { "" };
+    let folder = if has_folder { "The run scripts use the files in the packraven folder to set up the server." } else { "" };
     let name = pack.name();
     let mut unknown_placeholders: Vec<String> = Vec::new();
     let placeholder = regex::Regex::new(r"\{([a-z_]+)\}").expect("valid placeholder pattern");
-    let filled = placeholder.replace_all(&template, |found: &regex::Captures| {
-        let value = match &found[1] {
-            "name" => name.as_str(),
-            "version" => version,
-            "minecraft" => minecraft,
-            "loader" => loader,
-            "loader_version" => loader_version,
-            "setup" => setup.as_str(),
-            "packraven_folder" => folder,
-            _ => {
-                if !unknown_placeholders.iter().any(|seen| seen == &found[0]) {
-                    unknown_placeholders.push(found[0].to_string());
-                }
-                &found[0]
-            }
-        };
-        value.to_string()
-    });
-    let text = format!("{}\r\n", filled.trim_start_matches('\n').trim_end().replace('\n', "\r\n"));
+    let mut fill = |text: &str| {
+        placeholder
+            .replace_all(text, |found: &regex::Captures| {
+                let value = match &found[1] {
+                    "name" => name.as_str(),
+                    "version" => version,
+                    "minecraft" => minecraft,
+                    "loader" => loader,
+                    "loader_version" => loader_version,
+                    "setup" => setup.as_str(),
+                    "where_are_the_mods" => where_are_the_mods,
+                    "jar_only_hosts" => jar_only_hosts.as_str(),
+                    "packraven_folder" => folder,
+                    _ => {
+                        if !unknown_placeholders.iter().any(|seen| seen == &found[0]) {
+                            unknown_placeholders.push(found[0].to_string());
+                        }
+                        &found[0]
+                    }
+                };
+                value.to_string()
+            })
+            .into_owned()
+    };
+    let mut lines = Vec::new();
+    let mut dropped_line = false;
+    for line in template.lines() {
+        if dropped_line && line.trim().is_empty() {
+            dropped_line = false;
+            continue;
+        }
+        let filled = fill(line);
+        dropped_line = filled.trim().is_empty() && placeholder.is_match(line) && placeholder.replace_all(line, "").trim().is_empty();
+        if !dropped_line {
+            lines.push(filled);
+        }
+    }
+    let text = format!("{}\r\n", lines.join("\n").trim_start_matches('\n').trim_end().replace('\n', "\r\n"));
     Ok(ServerReadme { text, custom, unknown_placeholders })
 }
 
@@ -789,9 +836,9 @@ fn start_script(template: &str, download: &str, install: &str, launch: &str, gra
         .replace("{{ARGS}}", args)
 }
 
-pub async fn server_pack(pack: &Pack, sides: &[ModSide], version: &str, mods: ServerMods, out_dir: &Path, data_dir: &Path, log: &Log) -> Result<PathBuf> {
+pub async fn server_pack(pack: &Pack, sides: &[ModSide], version: &str, out_dir: &Path, data_dir: &Path, log: &Log) -> Result<PathBuf> {
     let dir = out_dir.join("server");
-    let plan = release_server_plan(pack, sides, version, mods, data_dir, log).await?;
+    let plan = release_server_plan(pack, sides, version, data_dir, log).await?;
     log.info(mirror(&dir, &plan, &[], false)?.to_string());
     Ok(dir)
 }
@@ -911,6 +958,11 @@ mod tests {
         assert_eq!(names, ["manifest.json", "overrides/config/a.toml", "overrides/mods/only-modrinth.jar", "overrides/mods/own.jar", "overrides/resourcepacks/fa.zip"]);
         let manifest: serde_json::Value = serde_json::from_reader(archive.by_name("manifest.json").unwrap()).unwrap();
         assert_eq!(manifest["files"][0]["projectID"], 5);
+        let kept_off = literal_paths(&pack.config.curseforge.exclude);
+        let server: Vec<&str> = server_mod_files(&pack, &HashSet::new(), &kept_off).unwrap().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(server, ["mods/only-modrinth.jar", "mods/create.jar"], "the server pack ships the client pack's mods");
+        let server: Vec<&str> = server_mod_files(&pack, &HashSet::from(["mods/create.jar"]), &kept_off).unwrap().iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(server, ["mods/only-modrinth.jar"], "minus client-only ones");
         let modrinth = override_files_for(&pack, &cache, Platform::Modrinth).unwrap();
         assert!(modrinth.undecided.contains(&"mods/own.jar".to_string()), "a choice on CurseForge doesn't decide the Modrinth pack");
         std::fs::remove_dir_all(&dir).unwrap();
@@ -1026,22 +1078,26 @@ mod tests {
         let mut pack = loader_pack("1.21.1", "neoforge-21.1.259");
         pack.dir = dir.clone();
 
-        let default = server_readme(&pack, "1.2", ServerMods::DownloadedOnStart).unwrap();
+        let default = server_readme(&pack, "1.2").unwrap();
         let text = &default.text;
         assert!(!default.custom && default.unknown_placeholders.is_empty(), "{default:?}");
-        assert!(text.starts_with("Raven Pack 1.2 server\r\n\r\n"), "the placeholder notes stay out: {text}");
-        assert!(text.contains("The run script installs Java, downloads our mods and installs NeoForge and Minecraft.\r\n"), "{text}");
-        assert!(text.contains("select NeoForge 21.1.259 for Minecraft 1.21.1."), "{text}");
-        assert!(text.ends_with("The packraven folder holds the files the run scripts use to set up the server.\r\n"), "{text}");
+        assert!(text.starts_with("Raven Pack 1.2 server\r\n\r\nWHERE ARE THE MODS?\r\n"), "the placeholder notes stay out: {text}");
+        assert!(text.contains("On its first start, the run script installs Java, then downloads our mods and installs NeoForge and Minecraft.\r\n"), "{text}");
+        assert!(text.contains("3. Start the server. The first time, the run script downloads our mods and installs NeoForge and Minecraft.\r\n"), "{text}");
+        assert!(text.contains("CAN'T RUN run.sh\r\n1. Start the server on your own computer once"), "{text}");
+        assert!(text.contains("\r\n3. In your host's startup settings, select NeoForge 21.1.259 for Minecraft 1.21.1.\r\n\r\n\r\nSETTINGS"), "{text}");
+        assert!(text.ends_with("The run scripts use the files in the packraven folder to set up the server.\r\n"), "{text}");
         assert!(!text.replace("\r\n", "").contains('\n'), "only CRLF endings: {text:?}");
 
-        let fabric = Pack { dir: dir.clone(), ..loader_pack("1.21.1", "fabric-0.16.14-1.21.1") };
-        let bundled = server_readme(&fabric, "1.2", ServerMods::Bundled).unwrap().text;
-        assert!(bundled.contains("installs Fabric and Minecraft.\r\n"), "{bundled}");
+        let mut fabric = Pack { dir: dir.clone(), ..loader_pack("1.21.1", "fabric-0.16.14-1.21.1") };
+        fabric.config.server.bundle_mods = true;
+        let bundled = server_readme(&fabric, "1.2").unwrap().text;
+        assert!(bundled.starts_with("Raven Pack 1.2 server\r\n\r\nOn its first start, the run script installs Java, then installs Fabric and Minecraft.\r\n"), "no mods section: {bundled}");
+        assert!(bundled.contains("CAN'T RUN run.sh\r\n1. Upload everything in this folder to your host's server folder.\r\n2. In your host's startup settings, select Fabric 0.16.14 for Minecraft 1.21.1.\r\n\r\n\r\nSETTINGS"), "{bundled}");
         assert!(bundled.ends_with("in a new file named java.txt in this folder.\r\n"), "no folder note without a packraven folder: {bundled:?}");
 
         std::fs::write(dir.join(SERVER_README), "\u{feff}// a note\nWelcome to {name} {version} on {loader} {loader_version} for {minecraft}!\n{verison} {verison}\n\n{packraven_folder}\n\n").unwrap();
-        let custom = server_readme(&fabric, "1.2", ServerMods::Bundled).unwrap();
+        let custom = server_readme(&fabric, "1.2").unwrap();
         assert!(custom.custom);
         assert_eq!(custom.text, "Welcome to Raven Pack 1.2 on Fabric 0.16.14 for 1.21.1!\r\n{verison} {verison}\r\n");
         assert_eq!(custom.unknown_placeholders, ["{verison}"]);

@@ -824,7 +824,7 @@
       {#if loadError}<div class="banner">{@render loadNotice(index)}</div>{/if}
       <Git onchange={refresh} />
     {:else if pane === 'publish'}
-      <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFrom('pack', index)} onreleases={() => showFrom('releases', index)} onrun={() => openBesideIfRoom('test', index)} onappsettings={() => showFrom('settings', index)} />
+      <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFrom('pack', index)} onreleases={() => showFrom('releases', index)} onrun={() => openBesideIfRoom('test', index)} onappsettings={() => showFrom('settings', index)} onserver={() => showFrom('server', index)} />
     {:else if pane === 'releases'}
       <Releases onsettings={() => showFrom('pack', index)} onappsettings={() => showFrom('settings', index)} />
     {:else if pane === 'pack' && packs?.active}

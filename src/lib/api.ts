@@ -94,6 +94,7 @@ export interface PackConfig {
     args: string[]
     graalvm: string
     properties: Record<string, string>
+    bundle_mods: boolean
   }
   test: { port: number; client_memory: string }
   discord: { role_id: string; color: string; announce_on_approval: boolean; title: string; show_author: boolean; header: string; footer: string }
@@ -408,8 +409,13 @@ export interface ServerPackUpload {
   error: string | null
   // Whether packraven can try the upload again.
   retryable: boolean
-  // Whether a retry builds the server pack again first, because the zip is gone or was too large.
+  // Whether a retry builds the server pack again first, because the zip is gone.
   rebuild: boolean
+  // Whether the zip is too large for CurseForge's upload API, so only CurseForge's website takes it.
+  tooLarge: boolean
+  // Whether CurseForge received the whole last upload without confirming it, so it may already have the server pack.
+  unconfirmed: boolean
+  clientPage: string
   // Whether the mods changed since the release shipped, so a rebuilt server pack wouldn't match it.
   packChanged: boolean
   // The release's tag, which you check out to rebuild a server pack that's gone from the builds folder.

@@ -521,7 +521,7 @@ pub fn build_modrinth_export(app: AppHandle, state: State<'_, AppState>) -> CmdR
 pub fn upload_release_server_pack(app: AppHandle, state: State<'_, AppState>, version: String) -> CmdResult<()> {
     let pack = state.pack().map_err(err)?;
     let paths = release_paths(&state);
-    state.jobs.start(&app, "publish", move |log| async move { publish::upload_release_server_pack(&pack, &paths, &version, false, &log).await })
+    state.jobs.start(&app, "publish", move |log| async move { Ok(publish::upload_release_server_pack(&pack, &paths, &version, false, &log).await?.summary(&version)) })
 }
 
 #[tauri::command]
@@ -781,7 +781,7 @@ async fn build_server(state_data: (PathBuf, PathBuf, PathBuf), pack: &Pack, log:
     let (data_dir, pack_data, cache_path) = state_data;
     let version = pack.version().unwrap_or_else(|| "dev".into());
     let sides = classify_cached(&cache_path, pack).await?;
-    export::server_pack(pack, &sides, &version, export::ServerMods::Bundled, &pack_data.join("builds").join(&version), &data_dir, log).await
+    export::server_pack(pack, &sides, &version, &pack_data.join("builds").join(&version), &data_dir, log).await
 }
 
 #[tauri::command]

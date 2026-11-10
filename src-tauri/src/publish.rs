@@ -7,6 +7,7 @@ use serde_json::json;
 use crate::changelog;
 use crate::curseforge;
 use crate::export;
+use crate::http;
 use crate::modrinth;
 use crate::git;
 use crate::jobs::Log;
@@ -95,8 +96,26 @@ impl CurseforgeRelease {
 pub struct UnsentServerPack {
     pub names: UploadNames,
     pub error: String,
+    /// The zip is over the upload API's limit, or the API turned it down as too large.
     #[serde(default)]
     pub too_large: bool,
+    /// CurseForge received the whole zip but never confirmed it, so it may hold the server pack already.
+    #[serde(default)]
+    pub unconfirmed: bool,
+}
+
+pub enum ServerPackOutcome {
+    Uploaded(u64),
+    TooLarge(u64),
+}
+
+impl ServerPackOutcome {
+    pub fn summary(&self, version: &str) -> String {
+        match self {
+            Self::Uploaded(file_id) => format!("Uploaded the {version} server pack to CurseForge as file {file_id}"),
+            Self::TooLarge(size) => format!("The {version} server pack is {}, more than packraven can upload to CurseForge, so upload it yourself on CurseForge's website", curseforge::gigabytes(*size)),
+        }
+    }
 }
 
 /// What you need to upload a release's server pack yourself, after packraven's upload failed.
@@ -111,8 +130,13 @@ pub struct ServerPackUpload {
     pub error: Option<String>,
     /// Whether packraven can try the upload again.
     pub retryable: bool,
-    /// Whether a retry builds the server pack again first, because the zip is gone or was too large.
+    /// Whether a retry builds the server pack again first, because the zip is gone.
     pub rebuild: bool,
+    /// Whether the zip is too large for CurseForge's upload API, so only CurseForge's website takes it.
+    pub too_large: bool,
+    /// Whether CurseForge may already have the last upload, so you check before uploading again.
+    pub unconfirmed: bool,
+    pub client_page: String,
     /// Whether the mods changed since the release shipped, so a rebuilt server pack wouldn't match it.
     pub pack_changed: bool,
     /// The release's tag, which you check out to rebuild a server pack that's gone from the builds folder.
@@ -427,14 +451,15 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
     };
 
     if let Some(client_zip) = client_zip {
-        export::server_pack(&pack, &sides, &version, export::ServerMods::DownloadedOnStart, &out_dir, &data_dir, &log).await?;
+        export::server_pack(&pack, &sides, &version, &out_dir, &data_dir, &log).await?;
         let server_zip = export::zip_server_pack(&pack, &version, &out_dir, &log).await?;
         curseforge::check_upload_size(&client_zip, "client pack")?;
-        curseforge::check_upload_size(&server_zip, "server pack")?;
+        // A server pack too large for the upload API can still go up through CurseForge's website.
+        curseforge::check_website_upload_size(&server_zip, "server pack")?;
         let file_id = upload_client_pack(&pack, &client_zip, client_names.clone(), &notes, &log).await?;
         // We record the release the moment CurseForge has it, so a publish that stops later leaves a release to
         // finish rather than one we'd upload twice.
-        let unsent = UnsentServerPack { names: server_names.clone(), error: STOPPED_EARLY.into(), too_large: false };
+        let unsent = UnsentServerPack { names: server_names.clone(), error: STOPPED_EARLY.into(), too_large: false, unconfirmed: false };
         let mut curseforge = CurseforgeRelease { project_id: pack.config.curseforge.project_id, file_id, server_file_id: None, unsent_server_pack: Some(unsent), server_pack_uploaded_by_you: false, last_upload: Some(chrono::Utc::now().to_rfc3339()) };
         release.curseforge = Some(curseforge.clone());
         record(&pack, &releases_path, &release, &notes, &baseline_path)?;
@@ -444,7 +469,7 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
         release.curseforge = Some(curseforge);
         save_release(&releases_path, &release)?;
     }
-    let server_failure = release.curseforge.as_ref().and_then(|c| c.unsent_server_pack.as_ref()).map(|unsent| unsent.error.clone());
+    let server_failure = release.curseforge.as_ref().and_then(|c| c.unsent_server_pack.clone());
     // A CurseForge release already happened by now, so a failed Modrinth upload mustn't keep us from finishing it.
     let modrinth_failure = match &modrinth_pack {
         Some(path) => match upload_to_modrinth(&pack, &version, path, &client_names.display_name, &release_type, &notes, &log).await {
@@ -480,7 +505,10 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
 
     run_pending(&pack, &identity, &releases_path, &mut release, &log).await?;
     // The release happened, so the job succeeds, and Publish finds the missing uploads from releases.json.
-    let server_failure = server_failure.map(|error| format!(" The server pack upload failed, so upload it yourself as an additional file on CurseForge: {error}"));
+    let server_failure = server_failure.map(|unsent| match unsent.too_large {
+        true => format!(" {}, so upload it yourself as an additional file on CurseForge's website, where CurseForge accepts modpack files up to about 5 GB.", unsent.error),
+        false => format!(" The server pack upload failed, so upload it yourself as an additional file on CurseForge: {}", unsent.error),
+    });
     let modrinth_failure = modrinth_failure.map(|error| format!(" The Modrinth upload failed, so upload it again from Releases: {error:#}"));
     Ok(format!("Published {version}: {summary}.{}{}", server_failure.unwrap_or_default(), modrinth_failure.unwrap_or_default()))
 }
@@ -572,32 +600,51 @@ async fn upload_client_pack(pack: &Pack, zip: &Path, names: UploadNames, notes: 
             "releaseType": pack.config.curseforge.release_type,
             "isMarkedForManualRelease": pack.config.curseforge.manual_release,
         }),
+        log,
     )
-    .await?;
+    .await
+    .map_err(|error| warn_if_unconfirmed(error, pack.config.curseforge.project_id, "client pack"))?;
     log.info(format!("Uploaded the client pack as file {file_id}"));
     Ok(file_id)
 }
 
+// We never record a client pack CurseForge didn't confirm, so trying again would upload a second copy if it kept this one.
+fn warn_if_unconfirmed(error: anyhow::Error, project_id: u64, what: &str) -> anyhow::Error {
+    match error.is::<http::UploadUnconfirmed>() {
+        true => anyhow::anyhow!("{error:#}. Check {} for the {what} before you try again, and delete it there if CurseForge kept it.", curseforge::files_page(project_id)),
+        false => error,
+    }
+}
+
 // Either way the outcome goes on the release: the server file, or why it isn't there.
-async fn upload_server_pack(curseforge: &mut CurseforgeRelease, zip: &Path, names: UploadNames, release_type: &str, log: &Log) -> Result<u64> {
+async fn upload_server_pack(curseforge: &mut CurseforgeRelease, zip: &Path, names: UploadNames, release_type: &str, log: &Log) -> Result<ServerPackOutcome> {
+    let size = std::fs::metadata(zip)?.len();
+    if size > curseforge::UPLOAD_LIMIT {
+        let error = format!("The server pack is {}, more than packraven can upload to CurseForge", curseforge::gigabytes(size));
+        log.info(format!("{error}, so you'll upload it on CurseForge's website"));
+        curseforge.unsent_server_pack = Some(UnsentServerPack { names, error, too_large: true, unconfirmed: false });
+        return Ok(ServerPackOutcome::TooLarge(size));
+    }
     log.info(format!("Uploading {} as {}", zip.display(), names.file_name));
     // We put the release notes on the client pack only; repeating them here just clutters the file list.
     let metadata = json!({
         "changelog": "",
         "displayName": names.display_name,
-        "parentFileID": curseforge.file_id,        "releaseType": release_type,
+        "parentFileID": curseforge.file_id,
+        "releaseType": release_type,
     });
-    match curseforge::upload(curseforge.project_id, zip, names.file_name.clone(), metadata).await {
+    match curseforge::upload(curseforge.project_id, zip, names.file_name.clone(), metadata, log).await {
         Ok(server_file_id) => {
             log.info(format!("Uploaded the server pack as file {server_file_id}"));
             curseforge.server_file_id = Some(server_file_id);
             curseforge.unsent_server_pack = None;
             curseforge.last_upload = Some(chrono::Utc::now().to_rfc3339());
-            Ok(server_file_id)
+            Ok(ServerPackOutcome::Uploaded(server_file_id))
         }
         Err(error) => {
-            let too_large = error.downcast_ref::<curseforge::UploadTooLarge>().is_some();
-            curseforge.unsent_server_pack = Some(UnsentServerPack { names, error: format!("{error:#}"), too_large });
+            let too_large = error.is::<curseforge::UploadTooLarge>();
+            let unconfirmed = error.is::<http::UploadUnconfirmed>();
+            curseforge.unsent_server_pack = Some(UnsentServerPack { names, error: format!("{error:#}"), too_large, unconfirmed });
             Err(error)
         }
     }
@@ -609,9 +656,14 @@ pub fn awaiting_server_pack(pack: Option<&Pack>, pack_data: &Path, release: &Rel
     let curseforge = release.curseforge.as_ref().filter(|c| c.awaits_server_pack())?;
     let unsent = curseforge.unsent_server_pack.as_ref();
     let zip = pack.map(|pack| server_zip(pack, pack_data, &release.version)).filter(|zip| zip.exists());
+    let size = zip.as_ref().and_then(|zip| std::fs::metadata(zip).ok()).map(|m| m.len());
+    let too_large = size.is_some_and(|size| size > curseforge::UPLOAD_LIMIT || unsent.is_some_and(|u| u.too_large));
     Some(ServerPackUpload {
-        retryable: pack.is_some(),
-        rebuild: zip.is_none() || unsent.is_some_and(|u| u.too_large),
+        retryable: pack.is_some() && !too_large,
+        rebuild: zip.is_none(),
+        too_large,
+        unconfirmed: !too_large && unsent.is_some_and(|u| u.unconfirmed),
+        client_page: curseforge::file_page(curseforge.project_id, curseforge.file_id),
         pack_changed: pack.is_some_and(|pack| changed_since(pack, release)),
         zip,
         upload_page: curseforge::additional_file_page(curseforge.project_id, curseforge.file_id),
@@ -626,9 +678,9 @@ fn server_zip(pack: &Pack, pack_data: &Path, version: &str) -> PathBuf {
     pack_data.join("builds").join(version).join(pack.server_zip_name(version))
 }
 
-/// Uploads a release's server pack after the publish that built it couldn't. When the zip is gone or was too large
-/// to upload, we build it again from the pack as it is now.
-pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, version: &str, rebuild: bool, log: &Log) -> Result<String> {
+/// Uploads a release's server pack after the publish that built it couldn't. When the zip is gone, we build it again
+/// from the pack as it is now.
+pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, version: &str, rebuild: bool, log: &Log) -> Result<ServerPackOutcome> {
     let releases_path = paths.pack_data.join("releases.json");
     let mut release = load_releases(&releases_path).into_iter().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"))?;
     let release_type = release.release_type.clone().unwrap_or_else(|| pack.config.curseforge.release_type.clone());
@@ -637,21 +689,21 @@ pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, versi
         bail!("{version} already has its server pack on CurseForge.");
     }
     let zip = server_zip(pack, &paths.pack_data, version);
-    if rebuild || !zip.exists() || curseforge.unsent_server_pack.as_ref().is_some_and(|u| u.too_large) {
-        log.info("Building the server pack again from the pack as it is now, with its mods downloaded on first start");
+    if rebuild || !zip.exists() {
+        log.info("Building the server pack again from the pack as it is now");
         let mut cache = MetadataCache::load(&paths.cache_path);
         let sides = sides::classify(pack, &mut cache).await?;
         cache.save(&paths.cache_path)?;
         let out_dir = paths.pack_data.join("builds").join(version);
-        export::server_pack(pack, &sides, version, export::ServerMods::DownloadedOnStart, &out_dir, &paths.data_dir, log).await?;
+        export::server_pack(pack, &sides, version, &out_dir, &paths.data_dir, log).await?;
         export::zip_server_pack(pack, version, &out_dir, log).await?;
     }
-    curseforge::check_upload_size(&zip, "server pack")?;
+    curseforge::check_website_upload_size(&zip, "server pack")?;
     let names = curseforge.unsent_server_pack.as_ref().map_or_else(|| default_server_names(pack), |u| u.names.clone());
     let names = UploadNames { display_name: names.display_name.replace(VERSION_TOKEN, version), file_name: names.file_name.replace(VERSION_TOKEN, version) };
-    let uploaded = upload_server_pack(curseforge, &zip, names, &release_type, log).await;
+    let outcome = upload_server_pack(curseforge, &zip, names, &release_type, log).await;
     save_release(&releases_path, &release)?;
-    Ok(format!("Uploaded the {version} server pack to CurseForge as file {}", uploaded?))
+    outcome
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq)]
@@ -705,7 +757,7 @@ pub async fn replace_curseforge_file(pack: &Pack, paths: &ReleasePaths, version:
     curseforge.server_pack_uploaded_by_you = false;
     // We save the new client file before the server pack goes up, so a failed server upload leaves it to retry.
     save_release(&releases_path, &release)?;
-    summary.push(upload_release_server_pack(pack, paths, version, true, log).await?);
+    summary.push(upload_release_server_pack(pack, paths, version, true, log).await?.summary(version));
     Ok(summary.join(". "))
 }
 
@@ -722,10 +774,20 @@ pub async fn finish_release(pack: &Pack, identity: &Identity, paths: &ReleasePat
     let find = || load_releases(&releases_path).into_iter().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"));
     let release = find()?;
     let mut failures = Vec::new();
-    if awaiting_server_pack(Some(pack), &paths.pack_data, &release).is_some()
-        && let Err(error) = upload_release_server_pack(pack, paths, version, false, log).await
-    {
-        failures.push(format!("The server pack upload failed: {error:#}."));
+    // Only you can upload a server pack too large for the upload API, and only you can check whether CurseForge kept
+    // an unconfirmed one, so finishing leaves those to you.
+    let mut left_to_you = None;
+    let too_large = "which is more than packraven can upload to CurseForge. Upload it yourself on CurseForge's website";
+    let unconfirmed = "which CurseForge may already have. Check the client pack on CurseForge before you upload it again";
+    match awaiting_server_pack(Some(pack), &paths.pack_data, &release) {
+        Some(upload) if upload.too_large => left_to_you = Some(too_large),
+        Some(upload) if upload.unconfirmed => left_to_you = Some(unconfirmed),
+        Some(_) => match upload_release_server_pack(pack, paths, version, false, log).await {
+            Ok(ServerPackOutcome::TooLarge(_)) => left_to_you = Some(too_large),
+            Ok(ServerPackOutcome::Uploaded(_)) => {}
+            Err(error) => failures.push(format!("The server pack upload failed: {error:#}.")),
+        },
+        None => {}
     }
     if awaiting_modrinth(pack, &paths.pack_data, &release).is_some()
         && let Err(error) = upload_release_to_modrinth(pack, &paths.pack_data, version, log).await
@@ -739,7 +801,10 @@ pub async fn finish_release(pack: &Pack, identity: &Identity, paths: &ReleasePat
     if !failures.is_empty() {
         bail!("{}", failures.join(" "));
     }
-    Ok(format!("Finished publishing {version}"))
+    Ok(match left_to_you {
+        Some(why) => format!("Finished publishing {version}, except its server pack, {why}"),
+        None => format!("Finished publishing {version}"),
+    })
 }
 
 /// Records that you uploaded a release's server pack yourself, so we stop offering to upload it.
@@ -799,6 +864,7 @@ async fn upload_to_modrinth(pack: &Pack, version: &str, path: &Path, display_nam
         }),
         path,
         file_name,
+        log,
     )
     .await?;
     log.info(format!("Uploaded Modrinth version {}", uploaded.id));
@@ -810,6 +876,12 @@ async fn upload_to_modrinth(pack: &Pack, version: &str, path: &Path, display_nam
 pub fn awaiting_modrinth(pack: &Pack, pack_data: &Path, release: &Release) -> Option<PathBuf> {
     let path = pack_data.join("builds").join(&release.version).join(pack.modrinth_pack_name(&release.version));
     (pack.config.targets_modrinth() && release.modrinth.is_none() && path.exists()).then_some(path)
+}
+
+async fn uploaded_modrinth_version(pack: &Pack, version: &str) -> Result<Option<ModrinthRelease>> {
+    let Some(project) = modrinth::project(pack.config.modrinth.project_id.trim()).await? else { return Ok(None) };
+    let versions = modrinth::project_versions(&project.id, &[], pack.lock.minecraft()?).await?;
+    Ok(versions.into_iter().find(|v| v.version_number == version).map(|v| ModrinthRelease { project_id: project.id.clone(), version_id: v.id }))
 }
 
 /// Uploads a release's Modrinth pack after the publish that built it couldn't.
@@ -824,11 +896,23 @@ pub async fn upload_release_to_modrinth(pack: &Pack, pack_data: &Path, version: 
     if !path.exists() {
         bail!("The Modrinth pack packraven built for {version} is gone from {}, so packraven can't upload it.", path.display());
     }
-    let notes = std::fs::read_to_string(pack.dir.join(CHANGELOG_ARCHIVE).join(format!("{version}.md"))).unwrap_or_default();
-    let display_name = release.display_name.clone().unwrap_or_else(|| default_client_names(pack).display_name.replace(VERSION_TOKEN, version));
-    let release_type = release.release_type.clone().unwrap_or_else(|| pack.config.curseforge.release_type.clone());
-    let uploaded = upload_to_modrinth(pack, version, &path, &display_name, &release_type, &notes, log).await?;
-    let message = format!("Uploaded {version} to Modrinth as version {}", uploaded.version_id);
+    // An earlier upload may have reached Modrinth before its answer got lost, and Modrinth lists a version as soon as it
+    // has it, so we adopt that one rather than upload a second.
+    let (uploaded, message) = match uploaded_modrinth_version(pack, version).await? {
+        Some(found) => {
+            let message = format!("Modrinth already had {version} as version {}, so packraven recorded it", found.version_id);
+            (found, message)
+        }
+        None => {
+            let notes = std::fs::read_to_string(pack.dir.join(CHANGELOG_ARCHIVE).join(format!("{version}.md"))).unwrap_or_default();
+            let display_name = release.display_name.clone().unwrap_or_else(|| default_client_names(pack).display_name.replace(VERSION_TOKEN, version));
+            let release_type = release.release_type.clone().unwrap_or_else(|| pack.config.curseforge.release_type.clone());
+            let uploaded = upload_to_modrinth(pack, version, &path, &display_name, &release_type, &notes, log).await?;
+            let message = format!("Uploaded {version} to Modrinth as version {}", uploaded.version_id);
+            (uploaded, message)
+        }
+    };
+    log.info(&message);
     release.modrinth = Some(uploaded);
     release.modrinth_error = None;
     save_releases(&releases_path, &releases)?;
@@ -913,6 +997,20 @@ mod tests {
         super::adopt_server_pack(&mut release, 7);
         assert!(super::awaiting_server_pack(None, std::path::Path::new("."), &release).is_none());
         assert!(release.curseforge.unwrap().unsent_server_pack.is_none());
+    }
+
+    #[tokio::test]
+    async fn leaves_a_server_pack_too_large_for_the_upload_api_to_you() {
+        let path = std::env::temp_dir().join(format!("packraven-large-server-{}.zip", std::process::id()));
+        std::fs::File::create(&path).unwrap().set_len(crate::curseforge::UPLOAD_LIMIT + 1).unwrap();
+        let mut curseforge = super::CurseforgeRelease { project_id: 5, file_id: 6, server_file_id: None, unsent_server_pack: None, server_pack_uploaded_by_you: false, last_upload: None };
+        let names = super::UploadNames { display_name: "Server Pack 1.0".into(), file_name: "pack-server.zip".into() };
+        let outcome = super::upload_server_pack(&mut curseforge, &path, names, "release", &crate::jobs::Log::console("test")).await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(outcome, super::ServerPackOutcome::TooLarge(size) if size == crate::curseforge::UPLOAD_LIMIT + 1));
+        let unsent = curseforge.unsent_server_pack.as_ref().unwrap();
+        assert!(unsent.too_large && unsent.error == "The server pack is 1.07 GB, more than packraven can upload to CurseForge", "{}", unsent.error);
+        assert!(curseforge.awaits_server_pack());
     }
 
     #[test]

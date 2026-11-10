@@ -31,8 +31,6 @@
   let zipName = $derived(upload.zip?.split(/[\\/]/).pop() ?? null)
   // CurseForge's messages sometimes end in their own period.
   let reason = $derived(upload.error?.trim().replace(/[.!]+$/, '') ?? null)
-  // packraven rebuilds a zip that's still there only when CurseForge turned it down as too large.
-  let tooLarge = $derived(upload.rebuild && !!upload.zip)
   // Any publish job uses the same uploads, so none of these controls should start a second one.
   let busy = $derived(job('publish').phase === 'running')
 
@@ -44,6 +42,15 @@
   })
 
   async function retryUpload() {
+    if (upload.unconfirmed) {
+      const confirmed = await ask(`CurseForge received the whole ${version} server pack last time but never confirmed it, so it may have kept it. If it did and you upload again, the client pack will have two server packs.`, {
+        title: `Upload the ${version} server pack again`,
+        kind: 'warning',
+        okLabel: "It's not there, upload it",
+        cancelLabel: 'Cancel',
+      })
+      if (!confirmed) return
+    }
     if (upload.rebuild && upload.packChanged) {
       const confirmed = await ask(`Your mods changed since ${version} shipped, so a server pack built now won't match the client pack on CurseForge.`, {
         title: `Build the ${version} server pack again`,
@@ -81,6 +88,10 @@
     openUrl(upload.uploadPage).catch((e) => (error = `Couldn't open CurseForge: ${errorText(e)}`))
   }
 
+  function openClientPage() {
+    openUrl(upload.clientPage).catch((e) => (error = `Couldn't open CurseForge: ${errorText(e)}`))
+  }
+
   async function copyName() {
     try {
       await navigator.clipboard.writeText(upload.displayName!)
@@ -92,11 +103,23 @@
   }
 </script>
 
-{#if retry}
+{#if retry && upload.tooLarge}
+  <p class="muted">
+    <LinkedText text={`${reason ? `${reason}, but ` : ''}CurseForge accepts modpack files up to about 5 GB on its website.`} />
+    Upload it there yourself, so server owners can download {version} from CurseForge:
+  </p>
+{:else if retry}
   <p class="muted">
     {#if reason}<LinkedText text={`${reason}.`} />{/if}
     Server owners can't download {version} from CurseForge until its server pack is there.
   </p>
+  {#if upload.unconfirmed}
+    <p class="muted small measure">
+      Check the client pack's files on CurseForge before you upload it again, so you don't end up with two. If the server pack is there, click
+      <span class="ui-label">I uploaded it</span>.
+      <button type="button" class="link" onclick={openClientPage}>Open the client pack on CurseForge</button>
+    </p>
+  {/if}
   {#if upload.retryable}
     <p class="retry">
       <button class:busy={retrying} disabled={busy} onclick={retryUpload}>{retrying ? 'Uploading' : upload.rebuild ? 'Build it again and upload it' : 'Upload it again'}</button>
@@ -105,8 +128,7 @@
   {/if}
   {#if upload.rebuild}
     <p class="muted small measure">
-      {upload.zip ? 'That zip is too large to upload' : `packraven no longer has the server pack it built for ${version}`}, so we build it again from the pack as it is now, with its
-      mods downloaded on first start.
+      packraven no longer has the server pack it built for {version}, so we build it again from the pack as it is now.
       {#if upload.packChanged && tagged}Your mods changed since {version} shipped, so check out <span class="file">{upload.tag}</span> in Git first if the server pack has to match.{/if}
     </p>
   {/if}
@@ -115,7 +137,7 @@
   {#if upload.zip}
     <li>
       <div class="step">
-        <button disabled={busy} onclick={showZip}>Show server pack</button>
+        <button disabled={busy} onclick={showZip}>Show server pack<span class="visually-hidden"> {version}</span></button>
         <span class="file">{zipName}</span>
         {#if upload.fileName && upload.fileName !== zipName}
           <span class="muted small">packraven would have uploaded it as <span class="file">{upload.fileName}</span>.</span>
@@ -125,20 +147,17 @@
   {/if}
   <li>
     <div class="step">
-      <button disabled={busy} onclick={openUploadPage}>Open CurseForge's upload page</button>
+      <button disabled={busy} onclick={openUploadPage}>Open CurseForge's upload page<span class="visually-hidden"> for {version}</span></button>
       <span class="muted small measure">
-        Upload the zip there as an additional file of {clientName}, with <span class="ui-label">Additional File Info</span> set to <span class="ui-label">Server Pack</span>{#if upload.displayName}, named "{upload.displayName}".
-          <button type="button" class="link" onclick={copyName}>{copied ? 'Copied' : 'Copy name'}</button>{:else}.{/if}
+        Upload the zip there as an additional file of {clientName}, with <span class="ui-label">Additional File Info</span> set to <span class="ui-label">Server Pack</span>{#if upload.displayName}, named
+          <span class="name-pair">"{upload.displayName}". <button type="button" class="link" onclick={copyName}>{copied ? 'Copied' : 'Copy name'}</button></span>{:else}.{/if}
       </span>
-      {#if tooLarge}<span class="muted small measure">CurseForge appears to cap uploads at 1 GB, so its website will likely turn this file down too.</span>{/if}
     </div>
   </li>
   <li>
     <div class="step">
-      <button disabled={busy} onclick={markUploaded}>I uploaded it</button>
-      <span class="muted small measure">
-        We stop offering to upload it. Once you tag it as a server pack and CurseForge approves the client pack, Releases shows it.
-      </span>
+      <button disabled={busy} onclick={markUploaded}>I uploaded it<span class="visually-hidden"> ({version} server pack)</span></button>
+      <span class="muted small measure">Then we stop asking you to upload it. You'll see it in Releases once CurseForge approves the client pack.</span>
     </div>
   </li>
 </ol>
@@ -181,6 +200,11 @@
 
   .link {
     margin-left: 4px;
+  }
+
+  /* Browsers wrap an inline block as one piece, so Copy name stays on the same line as the name. */
+  .name-pair {
+    display: inline-block;
   }
 
   .small {

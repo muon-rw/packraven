@@ -3,7 +3,8 @@
   import { listen } from '@tauri-apps/api/event'
   import { api, errorText, type ServerReadme } from '../lib/api'
 
-  let { onedit }: { onedit: (path: string) => void } = $props()
+  // savedCount goes up with each save to packraven.toml, which can change what the readme says.
+  let { onedit, savedCount }: { onedit: (path: string) => void; savedCount: number } = $props()
 
   const FILE = 'server-readme.txt'
   const placeholders: [string, string][] = [
@@ -12,7 +13,9 @@
     ['{minecraft}', 'the Minecraft version'],
     ['{loader}', 'NeoForge, Forge or Fabric'],
     ['{loader_version}', "the loader's version"],
-    ['{setup}', 'what the first start does'],
+    ['{setup}', 'what the run script does on first start'],
+    ['{where_are_the_mods}', 'a note that the run script downloads the mods, when it does'],
+    ['{jar_only_hosts}', 'the steps for a host that only lets you pick a loader version'],
     ['{packraven_folder}', 'a note on the packraven folder, when the server pack has one'],
   ]
 
@@ -30,8 +33,12 @@
     }
   }
 
-  onMount(() => {
+  $effect(() => {
+    void savedCount
     load()
+  })
+
+  onMount(() => {
     // You edit or delete server-readme.txt in Files, often beside this view, so we follow the file.
     const unlisten = listen<{ paths: string[] }>('fs-change', ({ payload }) => {
       if (payload.paths.some((path) => path === FILE || path === '')) load()

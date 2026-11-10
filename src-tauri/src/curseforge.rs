@@ -8,6 +8,7 @@ use serde_json::{json, Value};
 
 use crate::credentials::{self, Credential};
 use crate::http::{CLIENT, USER_AGENT};
+use crate::jobs::Log;
 use crate::pack::ModLoader;
 
 const CORE_API: &str = "https://api.curseforge.com/v1";
@@ -381,18 +382,13 @@ pub async fn game_version_ids(minecraft: &str, loader: &str) -> Result<Vec<u64>>
     Ok(vec![minecraft_id, loader_id])
 }
 
-pub async fn upload(project_id: u64, path: &Path, file_name: String, metadata: Value) -> Result<u64> {
+pub async fn upload(project_id: u64, path: &Path, file_name: String, metadata: Value, log: &Log) -> Result<u64> {
     let token = upload_token().context(NO_UPLOAD_TOKEN)?;
-    let bytes = tokio::fs::read(path).await?;
-    let size = bytes.len() as u64;
-    let part = reqwest::multipart::Part::bytes(bytes).file_name(file_name).mime_str("application/zip")?;
-    let form = reqwest::multipart::Form::new().text("metadata", metadata.to_string()).part("file", part);
-    let response = CLIENT
-        .post(format!("{UPLOAD_API}/projects/{project_id}/upload-file"))
-        .header("X-Api-Token", token)
-        .multipart(form)
-        .send()
-        .await?;
+    let size = std::fs::metadata(path)?.len();
+    let request = CLIENT.post(format!("{UPLOAD_API}/projects/{project_id}/upload-file")).header("X-Api-Token", token);
+    let form = reqwest::multipart::Form::new().text("metadata", metadata.to_string());
+    let file = crate::http::UploadFile { field: "file", path, file_name, mime: "application/zip" };
+    let response = crate::http::send_upload(request, form, file, "CurseForge", log).await?;
     let status = response.status();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     if status == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
@@ -412,17 +408,30 @@ pub async fn upload(project_id: u64, path: &Path, file_name: String, metadata: V
 // file CurseForge would take; one between 1 GB and 1 GiB still gets the 413.
 pub const UPLOAD_LIMIT: u64 = 1 << 30;
 
+// CurseForge's authors console uploads files in 5 MB chunks and checks their size itself: 1 GB for most projects, and
+// 5000 MB for games and classes on CurseForge's large-file list, which includes Minecraft modpacks.
+pub const WEBSITE_UPLOAD_LIMIT: u64 = 5000 * 1024 * 1024;
+
 /// Fails when a file is too large for the upload API, so a publish can stop before any upload makes it public.
 pub fn check_upload_size(path: &Path, what: &str) -> Result<()> {
+    check_size(path, what, UPLOAD_LIMIT, "CurseForge accepts files up to about 1 GB through its upload API")
+}
+
+/// Fails when a modpack file is too large even for CurseForge's website.
+pub fn check_website_upload_size(path: &Path, what: &str) -> Result<()> {
+    check_size(path, what, WEBSITE_UPLOAD_LIMIT, "CurseForge accepts modpack files up to about 5 GB on its website")
+}
+
+fn check_size(path: &Path, what: &str, limit: u64, takes: &str) -> Result<()> {
     let size = std::fs::metadata(path)?.len();
-    if size > UPLOAD_LIMIT {
-        bail!(
-            "The {what} is {:.2} GB, and CurseForge's upload API takes files up to about 1 GB, so packraven stopped before uploading anything. Check what fills {}, then publish again.",
-            size as f64 / 1e9,
-            path.display()
-        );
+    if size > limit {
+        bail!("The {what} is {}, and {takes}, so packraven stopped before uploading anything. Check what's in {}, then publish again.", gigabytes(size), path.display());
     }
     Ok(())
+}
+
+pub fn gigabytes(size: u64) -> String {
+    format!("{:.2} GB", size as f64 / 1e9)
 }
 
 /// A 413 from the upload API, so callers can tell a file that will never go through from a failure worth retrying.
@@ -431,7 +440,7 @@ pub struct UploadTooLarge(pub u64);
 
 impl std::fmt::Display for UploadTooLarge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "CurseForge turned down the {:.2} GB file as too large", self.0 as f64 / 1e9)
+        write!(f, "CurseForge turned down the {} file as more than packraven can upload", gigabytes(self.0))
     }
 }
 
@@ -485,6 +494,10 @@ pub fn file_state(status: u32) -> FileState {
 }
 
 /// Returns the file's page in CurseForge's author dashboard, where you can delete it.
+pub fn files_page(project_id: u64) -> String {
+    format!("https://authors.curseforge.com/#/projects/{project_id}/files")
+}
+
 pub fn file_page(project_id: u64, file_id: u64) -> String {
     format!("https://authors.curseforge.com/#/projects/{project_id}/files/{file_id}")
 }

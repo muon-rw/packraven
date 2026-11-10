@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.9]
+## [0.4.9] - 2026-11-10
 ### Added
 - Added an option to include whole mod files inside Server Packs, instead of downloading them on server start.
 - Since CurseForge rejects API uploads over 1GB, if your server pack is larger than that, you'll be prompted to open the authors portal to upload it.
@@ -271,7 +271,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 - Mod updates skip jars Minecraft is currently holding open instead of stopping partway
 - Failed downloads will retry up to three times
 
-[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.4.8...HEAD
+[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.4.9...HEAD
+[0.4.9]: https://github.com/muon-rw/packraven/compare/v0.4.8...v0.4.9
 [0.4.8]: https://github.com/muon-rw/packraven/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/muon-rw/packraven/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/muon-rw/packraven/compare/v0.4.5...v0.4.6

@@ -353,9 +353,10 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building packraven")
-        .run(|app, event| {
-            if let RunEvent::ExitRequested { .. } = event {
-                self_update::install_on_exit(app);
-            }
+        .run(|app, event| match event {
+            RunEvent::ExitRequested { .. } => self_update::install_on_exit(app),
+            #[cfg(target_os = "macos")]
+            RunEvent::Reopen { .. } => show_main_window(app),
+            _ => {}
         });
 }

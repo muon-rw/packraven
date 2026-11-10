@@ -11,6 +11,9 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 ### Changed
 - Minor tweaks to serverpacks' default README for clarity, and to accomodate the changes above
 
+### Fixed
+- On MacOS, the app not being reopenable from the Dock after you closed the window, even though it stayed in the Dock
+
 ## [0.4.8] - 2026-11-06
 
 ### Changed

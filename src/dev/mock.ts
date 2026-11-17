@@ -104,7 +104,7 @@ const config = {
       : { motd: '§6{name} §e{version}§r\\n§7Dragons, dungeons and §aspells', 'allow-flight': 'true', difficulty: 'hard', 'max-players': '12', 'view-distance': '12', 'max-tick-time': '-1', 'pause-when-empty-seconds': '0' }) as Record<string, string>,
   },
   test: { port: 25565, client_memory: '8G' },
-  discord: { role_id: '112233445566778899', color: '#4d6b2f', announce_on_approval: true, title: '{project_name} - v{version}', show_author: true, header: '', footer: '[Install]({file_url})' },
+  discord: { role_id: '112233445566778899', color: '#4d6b2f', announce_on_approval: true, title: '{project_name} - v{version}', show_author: true, header: '', footer: '**[Install]({file_url})** <:raven:1180529370371141742>\n-# Back up your world before updating. Stuck? Ask in <#998877665544332211>.', condense_mod_updates: false },
   updates: { channel: 'alpha', locked: [] as string[] },
   update_checker: { add_releases: true, update_type: 'minor_breaking' as UpdateType },
 }
@@ -141,10 +141,10 @@ const serverDeleted = new URLSearchParams(location.search).has('serverdeleted')
 const firstHeld = new URLSearchParams(location.search).has('firstheld')
 // The newest release missed Modrinth and its server pack in the dirty scenario, so Releases offers to upload them.
 const releases: ReleaseStatus[] = scenario === 'empty' ? [] : [
-  { version: '0.1.0', publishedAt: '2026-10-03T18:20:00Z', announce: true, announcedAt: '2026-10-03T19:02:00Z', displayName: `${pack.name} 0.1.0`, releaseType: 'beta', modrinth: modrinthRelease('0.1.0'), modrinthMissing: null, serverPackMissing: null,
+  { version: '0.1.0', publishedAt: '2026-10-03T18:20:00Z', announce: true, announcedAt: '2026-10-03T19:02:00Z', announcementImages: [], displayName: `${pack.name} 0.1.0`, releaseType: 'beta', modrinth: modrinthRelease('0.1.0'), modrinthMissing: null, serverPackMissing: null,
     curseforge: { projectId: 1234567, fileId: 7001001, status: 'Approved', serverStatus: 'Approved', serverPackLinked: true, state: 'approved', serverState: firstHeld ? 'manualReview' : 'approved', uploaded: '2026-10-03T18:20:00Z', serverUploaded: '2026-10-03T18:22:00Z', page: 'https://authors.curseforge.com/#/projects/1234567/files/7001001', serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7001002' }, packChanged: false, clientZipPresent: true,
     updateChecker: { updateType: 'minor_breaking', addedAt: '2026-10-03T19:02:00Z' } },
-  { version: fx.version === '0.1.0' ? '0.1.1' : fx.version, publishedAt: '2026-10-12T21:40:00Z', announce: true, announcedAt: null,
+  { version: fx.version === '0.1.0' ? '0.1.1' : fx.version, publishedAt: '2026-10-12T21:40:00Z', announce: true, announcedAt: null, announcementImages: scenario === 'ready' ? [`${pack.dir}/screenshots/spawn.png`, `${pack.dir}/screenshots/nether hub.webp`] : [],
     displayName: `${pack.name} 0.1.1`, releaseType: 'beta', modrinth: scenario === 'dirty' ? null : modrinthRelease('0.1.1'), modrinthMissing: scenario === 'dirty' ? `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-0.1.1.mrpack` : null,
     serverPackMissing: scenario === 'dirty' ? unsentServerPack('0.1.1', 7105511, 'packraven stopped before it finished this upload', { packChanged: true, zipGone: true }) : null,
     // In the ready scenario CurseForge holds its server pack for manual review, so Releases offers to replace it.
@@ -793,6 +793,55 @@ let minecraftAccount: { name: string; uuid: string } | null = scenario === 'empt
 const SIGN_IN_FIRST = 'Sign in to Minecraft to launch the client.'
 let autoUpdate = true
 let discordShowsPack = true
+let pickedImages = 0
+let pendingAnnouncementImages: string[] = []
+// The ready scenario's changelog is too long with its links, so Publish and Releases show the note about it.
+// Mirrors discord::compose in the backend, without its length limits.
+const composedAnnouncement = (version: string, images: string[]) => {
+  const { discord } = config
+  const fileUrl = `https://www.curseforge.com/minecraft/modpacks/ravens-high-fantasy/files/${7100000 + version.length}`
+  const fill = (template: string) => template.replaceAll('{project_name}', pack.name).replaceAll('{name}', pack.name).replaceAll('{version}', version).replaceAll('{file_url}', fileUrl).replaceAll('{project_url}', 'https://www.curseforge.com/minecraft/modpacks/ravens-high-fantasy').trim()
+  const linksStripped = scenario === 'ready'
+  let rawMarkdown = renderChangelog().trim()
+  if (discord.condense_mod_updates) {
+    rawMarkdown = rawMarkdown.replace(/### Updated\n((?:- [^\n]+\n?)+)/, (_, items: string) => {
+      const n = items.trim().split('\n').filter(Boolean).length
+      return `Updated ${n} ${n === 1 ? 'mod' : 'mods'}\n`
+    }).trimEnd()
+  }
+  const markdown = rawMarkdown.split('\n').map((line) => line.replace(/^#+ (.*)$/, '**$1**')).join('\n')
+  const changelog = linksStripped ? markdown.replace(/\[([^\[\]\n]+)\]\([^()\s]+\)/g, '$1') : markdown
+  const description = [fill(discord.header), changelog || 'A new version is out.', fill(discord.footer)].filter(Boolean).join('\n\n')
+  const attachments = images.map((path) => ({ path, filename: (path.split(/[\\/]/).pop() ?? path).replace(/[^\w.-]/g, '_') }))
+  const role = discord.role_id.trim()
+  const embed = {
+    title: fill(discord.title) || `${pack.name} ${version}`,
+    url: fileUrl,
+    description,
+    color: parseInt(discord.color.replace('#', ''), 16) || 0x4d6b2f,
+    footer: { text: `Minecraft ${fx.minecraft}, NeoForge` },
+    timestamp: new Date().toISOString(),
+    thumbnail: { url: logo('R', '#4d6b2f') },
+    ...(discord.show_author ? { author: { name: 'MuonR', url: 'https://www.curseforge.com/members/muonr', icon_url: logo('M', '#694d0b') } } : {}),
+    ...(attachments[0] ? { image: { url: `attachment://${attachments[0].filename}` } } : {}),
+  }
+  const embeds = [
+    embed,
+    ...attachments.slice(1, 4).map((a) => ({ url: fileUrl, image: { url: `attachment://${a.filename}` } })),
+  ]
+  return {
+    payload: {
+      username: pack.name,
+      content: role ? `<@&${role}>` : '',
+      allowed_mentions: { parse: [], roles: role ? [role] : [] },
+      embeds,
+      ...(attachments.length ? { attachments: attachments.map((a, id) => ({ id, filename: a.filename })) } : {}),
+    },
+    attachments,
+    linksStripped,
+    truncated: false,
+  }
+}
 // The dirty scenario has an update waiting, so screenshots cover the rail's restart button.
 const mockPackravenReleases = [
   {
@@ -1418,6 +1467,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
           publishedAt: new Date().toISOString(),
           announce: true,
           announcedAt: null,
+          announcementImages: ((a.options as { announcementImages?: string[] }).announcementImages ?? []).slice(),
           displayName: `${pack.name} ${version}`,
           releaseType: config.curseforge.release_type,
           modrinth: config.modrinth.project_id ? modrinthRelease(version) : null,
@@ -1569,6 +1619,24 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   },
   discohook_link: () => 'https://discohook.app/?share=example',
   discohook_preview: () => 'https://discohook.app/?share=example',
+  compose_announcement: (a) => composedAnnouncement(a.version as string, releases.find((r) => r.version === a.version)?.announcementImages ?? []),
+  compose_draft_announcement: (a) => composedAnnouncement(a.version as string, a.images as string[]),
+  check_announcement_images: () => null,
+  get_pending_announcement_images: () => pendingAnnouncementImages.slice(),
+  set_pending_announcement_images: (a) => {
+    pendingAnnouncementImages = (a.images as string[]).slice()
+    return pendingAnnouncementImages.slice()
+  },
+  set_announcement_images: (a) => {
+    const release = releases.find((r) => r.version === a.version)
+    if (release) release.announcementImages = (a.images as string[]).slice()
+    return (a.images as string[]).slice()
+  },
+  'plugin:dialog|open': (a) => {
+    const options = a.options as { multiple?: boolean; filters?: { extensions: string[] }[] } | undefined
+    const wantsImages = options?.multiple && options.filters?.some((f) => f.extensions.includes('png'))
+    return wantsImages ? [`${pack.dir}/screenshots/picked ${++pickedImages}.png`] : null
+  },
   get_pack_java: () => null,
   get_run_args: () => runArgs,
   set_run_args: (a) => (runArgs = a.args as typeof runArgs),

@@ -93,11 +93,21 @@ pub struct DiscordConfig {
     pub show_author: bool,
     pub header: String,
     pub footer: String,
+    pub condense_mod_updates: bool,
 }
 
 impl Default for DiscordConfig {
     fn default() -> Self {
-        Self { role_id: String::new(), color: "#4d6b2f".into(), announce_on_approval: true, title: "{project_name} - v{version}".into(), show_author: true, header: String::new(), footer: String::new() }
+        Self {
+            role_id: String::new(),
+            color: "#4d6b2f".into(),
+            announce_on_approval: true,
+            title: "{project_name} - v{version}".into(),
+            show_author: true,
+            header: String::new(),
+            footer: String::new(),
+            condense_mod_updates: false,
+        }
     }
 }
 

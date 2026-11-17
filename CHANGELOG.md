@@ -2,6 +2,16 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+### Added
+- In-app discord webhook viewer
+- Attach images to discord webhooks
+
+### Changed
+- Discord header/footer editing is now more visible 
+- Footers are now always preserved when a changelog is cutoff
+- Settings pages were split into tabs
+
 ## [0.4.9] - 2026-11-10
 ### Added
 - Added an option to include whole mod files inside Server Packs, instead of downloading them on server start.

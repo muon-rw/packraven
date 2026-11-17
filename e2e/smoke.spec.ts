@@ -333,6 +333,7 @@ test('the client only launches once you sign in to Minecraft', async ({ page }) 
 
 test('signing in beside Run unblocks the client there too', async ({ page }) => {
   await openApp(page, 'test', 'empty', 'settings')
+  await page.getByRole('tab', { name: 'Accounts & Tokens' }).click()
   await page.locator('#minecraft-account').getByRole('button', { name: 'Sign in with Microsoft' }).click()
   await expect(page.getByRole('region', { name: 'Run, left pane' }).getByRole('button', { name: 'Launch client' })).toHaveAttribute('aria-disabled', 'false')
 })
@@ -423,6 +424,7 @@ test("starting a test clears the last run's logs", async ({ page }) => {
 
 test('you can sign in to Minecraft and out again', async ({ page }) => {
   await openApp(page, 'settings', 'empty')
+  await page.getByRole('tab', { name: 'Accounts & Tokens' }).click()
   const section = page.locator('#minecraft-account')
   await section.getByRole('button', { name: 'Sign in with Microsoft' }).click()
   await expect(section).toContainText('Finish signing in with Microsoft in your browser')
@@ -436,6 +438,7 @@ test('you can sign in to Minecraft and out again', async ({ page }) => {
 
 test('cancelling a Minecraft sign-in is not an error', async ({ page }) => {
   await openApp(page, 'settings', 'empty')
+  await page.getByRole('tab', { name: 'Accounts & Tokens' }).click()
   const section = page.locator('#minecraft-account')
   await section.getByRole('button', { name: 'Sign in with Microsoft' }).click()
   await section.getByRole('button', { name: 'Cancel' }).click()
@@ -504,6 +507,7 @@ test("installing a mod marks the dependencies it brings as installing", async ({
 
 test('downloading GraalVM fills a Java version nobody has installed', async ({ page }) => {
   await openApp(page, 'settings', 'dirty')
+  await page.getByRole('tab', { name: 'Java & Test runs' }).click()
   const slot = page.locator('.java', { has: page.locator('#java-25') })
   await expect(page.locator('#java-25 option:checked')).toHaveText('Automatic: no Java 25 found')
   await expect(slot).toContainText('None of your packs need it yet.')
@@ -514,6 +518,7 @@ test('downloading GraalVM fills a Java version nobody has installed', async ({ p
 
 test('extra launch arguments check what Java will receive', async ({ page }) => {
   await openApp(page, 'pack', 'dirty')
+  await page.getByRole('tab', { name: 'Test runs' }).click()
   const flags = page.getByRole('textbox', { name: 'Client JVM flags' })
   await expect(flags).toBeHidden()
   await page.getByText('Extra launch arguments', { exact: true }).click()
@@ -531,14 +536,16 @@ test('extra launch arguments check what Java will receive', async ({ page }) => 
   await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible()
 
   // Pack and app settings save as you edit them, without a Save button.
+  await page.getByRole('tab', { name: 'Publishing' }).click()
   await page.getByLabel('Author', { exact: true }).fill('Raven')
   await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible()
 
   // Saved arguments keep the fields open the next time you look.
   await page.getByRole('button', { name: 'Run', exact: true }).click()
   await page.getByRole('button', { name: 'Pack settings', exact: true }).click()
-  await expect(page.getByRole('textbox', { name: 'Server arguments' })).toHaveValue('--world\nDebug World')
   await expect(page.getByLabel('Author', { exact: true })).toHaveValue('Raven')
+  await page.getByRole('tab', { name: 'Test runs' }).click()
+  await expect(page.getByRole('textbox', { name: 'Server arguments' })).toHaveValue('--world\nDebug World')
 
   await page.getByRole('button', { name: 'App settings', exact: true }).click()
   await page.getByLabel('Name', { exact: true }).fill('Raven Dev')
@@ -1185,4 +1192,77 @@ test('Publish adds no note when the released version is fine on CurseForge', asy
   const checks = page.locator('#publish-checks')
   await expect(checks).toContainText('You already released 0.1.0')
   await expect(checks.getByRole('button', { name: 'See it in Releases' })).toHaveCount(0)
+})
+
+const ONE_PIXEL_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII='
+
+test('the Discord post preview opens on demand and shows what we would send', async ({ page }) => {
+  await page.route('https://cdn.discordapp.com/emojis/**', (route) => route.fulfill({ contentType: 'image/png', body: Buffer.from(ONE_PIXEL_PNG, 'base64') }))
+  await openApp(page, 'publish', 'ready')
+  const toggle = page.getByRole('button', { name: 'Preview the Discord post' })
+  const preview = page.getByRole('region', { name: /^Preview of the Discord post for / })
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+  await expect(preview).toHaveCount(0)
+
+  await toggle.press('Enter')
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  const embed = preview.getByRole('article', { name: /^Embed: .* - v/ })
+  await expect(embed).toBeVisible()
+  await expect(preview.locator('.content')).toHaveText('@role')
+  await expect(embed.locator('strong', { hasText: 'Mod changes' })).toBeVisible()
+  // The ready scenario's changelog only fits without its links, so the mod names are plain text.
+  await expect(embed.getByRole('link', { name: 'Sodium' })).toHaveCount(0)
+  await expect(embed.getByRole('link', { name: 'Install' })).toHaveAttribute('href', /^https:\/\/www\.curseforge\.com\/.*\/files\//)
+  await expect(embed.getByRole('img', { name: ':raven:' })).toHaveAttribute('src', 'https://cdn.discordapp.com/emojis/1180529370371141742.webp?size=48')
+  await expect(embed.locator('.subtext')).toContainText('Back up your world before updating. Stuck? Ask in #channel.')
+  await expect(embed.locator('.footer')).toContainText(/Minecraft .*, NeoForge • Today at/)
+  await expect(embed.getByRole('img', { name: 'Thumbnail' })).toBeVisible()
+
+  // Attaching an image recomposes the open preview, and the first image fills the embed.
+  await page.getByRole('button', { name: 'Attach images' }).click()
+  await expect(embed.getByRole('img', { name: 'picked_1.png' })).toBeVisible()
+
+  await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+  await expect(preview).toHaveCount(0)
+})
+
+test("a custom emoji Discord's CDN can't serve falls back to its name", async ({ page }) => {
+  await page.route('https://cdn.discordapp.com/emojis/**', (route) => route.abort())
+  await openApp(page, 'publish', 'ready')
+  await page.getByRole('button', { name: 'Preview the Discord post' }).click()
+  const embed = page.getByRole('region', { name: /^Preview of the Discord post for / }).getByRole('article')
+  await expect(embed).toContainText('Install :raven:')
+  await expect(embed.getByRole('img', { name: ':raven:' })).toHaveCount(0)
+})
+
+test('Releases previews the Discord post of a published release with its images', async ({ page }) => {
+  await page.route('https://cdn.discordapp.com/emojis/**', (route) => route.fulfill({ contentType: 'image/png', body: Buffer.from(ONE_PIXEL_PNG, 'base64') }))
+  await openApp(page, 'releases', 'ready')
+  const toggle = page.getByRole('button', { name: /^Preview the .* Discord post$/ }).first()
+  await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  const preview = page.getByRole('region', { name: /^Preview of the Discord post for / })
+  await expect(preview).toHaveCount(1)
+  await expect(preview.getByRole('article').getByRole('img', { name: 'spawn.png' })).toBeVisible()
+  await expect(preview.getByRole('article').getByRole('img', { name: 'nether_hub.webp' })).toBeVisible()
+  await expect(page.getByText("so we'll post the linked names as plain text")).toBeVisible()
+})
+
+test('Publish jumps to Discord settings and footer, and condenses mod updates when enabled', async ({ page }) => {
+  await openApp(page, 'publish', 'ready')
+  await page.getByRole('button', { name: 'Change Discord settings' }).click()
+  await expect(page.getByRole('tab', { name: 'Discord', selected: true })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Discord announcements' })).toBeFocused()
+
+  await page.getByRole('button', { name: 'Publish', exact: true }).click()
+  await page.getByRole('button', { name: 'Edit header & footer' }).click()
+  await expect(page.getByRole('tab', { name: 'Discord', selected: true })).toBeVisible()
+  await expect(page.getByLabel('Text below the changelog')).toBeFocused()
+
+  await page.getByLabel(/Condense the mod updates list/).check()
+  await page.getByRole('button', { name: 'Publish', exact: true }).click()
+  await page.getByRole('button', { name: 'Preview the Discord post' }).click()
+  const embed = page.getByRole('region', { name: /^Preview of the Discord post for / }).getByRole('article')
+  await expect(embed).toContainText(/Updated \d+ mods?/)
 })

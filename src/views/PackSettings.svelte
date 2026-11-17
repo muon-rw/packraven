@@ -11,7 +11,7 @@
   import OverridePermissions from '../components/OverridePermissions.svelte'
   import { scanJava } from '../lib/java.svelte'
   import { trackSave } from '../lib/launch.svelte'
-  import { serverView, showInFiles } from '../lib/nav.svelte'
+  import { appSettingsView, nav, packSettingsView, serverView, showInFiles } from '../lib/nav.svelte'
 
   let {
     dir,
@@ -21,6 +21,27 @@
     onchange,
     onremoved,
   }: { dir: string; name: string; onserver: () => void; onappsettings: () => void; onchange: () => void; onremoved: () => void } = $props()
+
+  const tabs = [
+    ['publishing', 'Publishing'],
+    ['test', 'Test runs'],
+    ['discord', 'Discord'],
+  ] as const
+
+  function selectTab(tab: (typeof tabs)[number][0]) {
+    flushPending()
+    packSettingsView.tab = tab
+  }
+
+  function onTabKey(event: KeyboardEvent) {
+    const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
+    if (!step && event.key !== 'Home' && event.key !== 'End') return
+    event.preventDefault()
+    const index = tabs.findIndex(([tab]) => tab === packSettingsView.tab)
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + step + tabs.length) % tabs.length
+    selectTab(tabs[next][0])
+    document.getElementById(`pack-tab-${tabs[next][0]}`)?.focus()
+  }
 
   let config: PackConfig | null = $state(null)
   let savedConfig: PackConfig | null = $state(null)
@@ -53,12 +74,18 @@
 
   async function load() {
     try {
-      const loadedArgs = await api.getRunArgs()
+      const [loadedArgs, nextAppRunArgs, loadedConfig, loadedWebhook, loadedPackJava, loadedChecker] = await Promise.all([
+        api.getRunArgs(),
+        // Only the App settings hint depends on this, so a failed read shouldn't hide the pack's settings.
+        api.getSettings().then((settings) => activeLines(settings.runArgs), () => 0),
+        api.getPackConfig(),
+        api.getWebhook().catch(() => null),
+        api.getPackJava().catch(() => null),
+        api.updateCheckerSetup().catch(() => null),
+      ])
       runArgs = toDraft(loadedArgs)
       savedRunArgs = fromDraft(runArgs)
-      // Only the App settings hint depends on this, so a failed read shouldn't hide the pack's settings.
-      appRunArgs = await api.getSettings().then((settings) => activeLines(settings.runArgs), () => 0)
-      const loadedConfig = await api.getPackConfig()
+      appRunArgs = nextAppRunArgs
       config = loadedConfig
       savedConfig = structuredClone(loadedConfig)
       cfProjectDraft = loadedConfig.curseforge.project_id || null
@@ -66,10 +93,10 @@
       portDraft = loadedConfig.test.port
       clientMemoryDraft = loadedConfig.test.client_memory
       checkModrinthProject(loadedConfig.modrinth.project_id.trim())
-      webhook = (await api.getWebhook()) ?? ''
+      webhook = loadedWebhook ?? ''
       savedWebhook = webhook.trim()
-      packJava = (await api.getPackJava()) ?? ''
-      updateChecker = await api.updateCheckerSetup().catch(() => null)
+      packJava = loadedPackJava ?? ''
+      updateChecker = loadedChecker
       savedPackJava = packJava.trim()
       configError = null
       await loadJavaDefault()
@@ -164,13 +191,15 @@
     commit()
   }
 
-  onDestroy(() => {
+  function flushPending() {
     for (const { timer, commit } of timers.values()) {
       clearTimeout(timer)
       commit()
     }
     timers.clear()
-  })
+  }
+
+  onDestroy(flushPending)
 
   function onFormKey(event: KeyboardEvent) {
     if (event.key === 'Enter' && event.target instanceof HTMLInputElement && event.target.type !== 'checkbox' && event.target.type !== 'button') {
@@ -314,6 +343,26 @@
     <p class="muted">For {name} only. packraven stores these in <span class="file">packraven.toml</span> in the pack repo, except the Java, the extra launch arguments and the webhook.</p>
   </header>
 
+  <div class="tab-row">
+    <div class="tabs" role="tablist" aria-label="Pack settings" onkeydown={onTabKey}>
+      {#each tabs as [tab, label] (tab)}
+        <button
+          type="button"
+          role="tab"
+          id="pack-tab-{tab}"
+          aria-selected={packSettingsView.tab === tab}
+          tabindex={packSettingsView.tab === tab ? 0 : -1}
+          aria-controls="pack-panel"
+          class:on={packSettingsView.tab === tab}
+          onclick={() => selectTab(tab)}
+        >
+          {label}
+        </button>
+      {/each}
+    </div>
+  </div>
+
+  <div class="panel" id="pack-panel" role="tabpanel" aria-labelledby="pack-tab-{packSettingsView.tab}">
   {#if configError}
     <Notice tone="error">
       <p>Couldn't read packraven.toml: {configError}</p>
@@ -324,6 +373,7 @@
     <form class="form" onsubmit={(e) => e.preventDefault()} onkeydown={onFormKey}>
       {#if saveError}<p class="failed" role="alert">{saveError}</p>{/if}
 
+      {#if packSettingsView.tab === 'publishing'}
       <section aria-labelledby="publishing-title">
         <h3 id="publishing-title" tabindex="-1">Publishing</h3>
         <div class="grid">
@@ -404,9 +454,10 @@
           {@render badge('manual-release')}
         </div>
       </section>
+      {:else if packSettingsView.tab === 'test'}
 
       <section aria-labelledby="test-runs-title">
-        <h3 id="test-runs-title">Test runs</h3>
+        <h3 id="test-runs-title" tabindex="-1">Test runs</h3>
         <div class="grid">
           <div class="field">
             <div class="label-row">
@@ -468,7 +519,7 @@
             {#snippet status()}{@render badge('pack-java')}{/snippet}
           </JavaPicker>
           <p class="hint" id="pack-java-hint">
-            packraven uses this Java for the pack's test runs and server builds, and saves your choice only on this machine, never in the pack repo. To choose a Java for every pack, open <button type="button" class="link" onclick={onappsettings}>App settings</button>.
+            packraven uses this Java for the pack's test runs and server builds, and saves your choice only on this machine, never in the pack repo. To choose a Java for every pack, open <button type="button" class="link" onclick={() => { appSettingsView.tab = 'java'; nav.anchor = 'java-title'; onappsettings() }}>App settings</button>.
           </p>
         {/if}
         <ExtraLaunchArgs
@@ -482,9 +533,10 @@
           {#snippet status(key)}{@render badge(key)}{/snippet}
         </ExtraLaunchArgs>
       </section>
+      {:else if packSettingsView.tab === 'discord'}
 
       <section aria-labelledby="discord-title">
-        <h3 id="discord-title">Discord announcements</h3>
+        <h3 id="discord-title" tabindex="-1">Discord announcements</h3>
         <div class="field">
           <div class="label-row">
             <label for="webhook">Webhook URL</label>
@@ -592,16 +644,23 @@
         </div>
         <div class="check-line">
           <label class="check">
+            <input type="checkbox" bind:checked={config.discord.condense_mod_updates} onchange={() => saveDiscordField('condense-mod-updates', 'condense_mod_updates')} /> Condense the mod updates list into an "Updated N mods" line
+          </label>
+          {@render badge('condense-mod-updates')}
+        </div>
+        <div class="check-line">
+          <label class="check">
             <input type="checkbox" bind:checked={config.discord.announce_on_approval} onchange={() => saveDiscordField('announce-on-approval', 'announce_on_approval')} /> Announce each release once every platform it's on has approved it
           </label>
           {@render badge('announce-on-approval')}
         </div>
         <p class="hint">packraven checks every few minutes while it's running in the tray. You can also announce a release by hand from Releases.</p>
       </section>
+      {/if}
 
-      {#if updateChecker}
+      {#if packSettingsView.tab === 'publishing' && updateChecker}
         <section aria-labelledby="update-checker-title">
-          <h3 id="update-checker-title">Modpack Update Checker</h3>
+          <h3 id="update-checker-title" tabindex="-1">Modpack Update Checker</h3>
           {#if updateChecker.kind === 'github'}
             {@const repo = updateChecker.repo}
             <div class="hint checker-intro">
@@ -611,7 +670,7 @@
                 packraven adds each release there once every platform it's on has approved it.
               </p>
               <p>
-                packraven uses your <button type="button" class="link" onclick={onappsettings}>GitHub token from App settings</button>, which needs Contents: Read and write access to {repo.owner}/{repo.name}.
+                packraven uses your <button type="button" class="link" onclick={() => { appSettingsView.tab = 'accounts'; nav.anchor = 'github-access-title'; onappsettings() }}>GitHub token from App settings</button>, which needs Contents: Read and write access to {repo.owner}/{repo.name}.
               </p>
             </div>
             <div class="check-line">
@@ -644,12 +703,16 @@
       {/if}
     </form>
 
-    <OverridePermissions platform="curseforge" targeted={config.curseforge.project_id > 0} reloadKey={config.curseforge.project_id} {onchange} />
-    <OverridePermissions platform="modrinth" targeted={!!config.modrinth.project_id.trim()} reloadKey={config.modrinth.project_id} {onchange} />
+    {#if packSettingsView.tab === 'publishing'}
+      <OverridePermissions platform="curseforge" targeted={config.curseforge.project_id > 0} reloadKey={config.curseforge.project_id} {onchange} />
+      <OverridePermissions platform="modrinth" targeted={!!config.modrinth.project_id.trim()} reloadKey={config.modrinth.project_id} {onchange} />
+    {/if}
   {/if}
 
+  </div>
+
   <section class="removal" aria-labelledby="remove-pack-title">
-    <h3 id="remove-pack-title">Remove pack</h3>
+    <h3 id="remove-pack-title" tabindex="-1">Remove pack</h3>
     <p class="muted">Stop showing <span class="file path">{dir}</span> in packraven, without deleting anything on disk.</p>
     <div><button type="button" class="danger" onclick={removePack}>Remove pack</button></div>
     {#if removeError}<p class="failed" role="alert">{removeError}</p>{/if}
@@ -659,8 +722,49 @@
 <style>
   .settings {
     display: grid;
-    gap: 36px;
+    gap: 20px;
     max-width: 760px;
+  }
+
+  .tab-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    justify-content: space-between;
+    gap: 8px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .tabs {
+    display: flex;
+    gap: 4px;
+  }
+
+  .tabs button {
+    margin-bottom: -1px;
+    padding: 8px 14px;
+    font-weight: 400;
+    color: var(--muted);
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+  }
+
+  .tabs button:hover:not(.on) {
+    color: var(--text);
+    background: transparent;
+  }
+
+  .tabs button.on {
+    color: var(--text);
+    font-weight: 700;
+    border-bottom-color: var(--forest);
+  }
+
+  .panel {
+    display: grid;
+    gap: 36px;
   }
 
   header p {

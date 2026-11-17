@@ -97,7 +97,7 @@ export interface PackConfig {
     bundle_mods: boolean
   }
   test: { port: number; client_memory: string }
-  discord: { role_id: string; color: string; announce_on_approval: boolean; title: string; show_author: boolean; header: string; footer: string }
+  discord: { role_id: string; color: string; announce_on_approval: boolean; title: string; show_author: boolean; header: string; footer: string; condense_mod_updates: boolean }
   updates: { channel: ReleaseType; locked: StoredModKey[] }
   update_checker: { add_releases: boolean; update_type: UpdateType }
 }
@@ -365,11 +365,20 @@ export interface UpdateCheckerEntry {
   error?: string
 }
 
+// What one Discord announcement sends: the webhook's JSON payload, and the files uploaded with it.
+export interface ComposedAnnouncement {
+  payload: Record<string, unknown>
+  attachments: { path: string; filename: string }[]
+  linksStripped: boolean
+  truncated: boolean
+}
+
 export interface ReleaseStatus {
   version: string
   publishedAt: string
   announce: boolean
   announcedAt: string | null
+  announcementImages: string[]
   displayName: string | null
   releaseType: string | null
   curseforge: {
@@ -711,6 +720,12 @@ export const api = {
   addToUpdateChecker: (version: string) => invoke<string>('add_to_update_checker', { version }),
   discohookLink: (version: string) => invoke<string>('discohook_link', { version }),
   discohookPreview: (version: string) => invoke<string>('discohook_preview', { version }),
+  composeAnnouncement: (version: string) => invoke<ComposedAnnouncement>('compose_announcement', { version }),
+  composeDraftAnnouncement: (version: string, images: string[]) => invoke<ComposedAnnouncement>('compose_draft_announcement', { version, images }),
+  checkAnnouncementImages: (images: string[]) => invoke<void>('check_announcement_images', { images }),
+  getPendingAnnouncementImages: () => invoke<string[]>('get_pending_announcement_images'),
+  setPendingAnnouncementImages: (images: string[]) => invoke<string[]>('set_pending_announcement_images', { images }),
+  setAnnouncementImages: (version: string, images: string[]) => invoke<string[]>('set_announcement_images', { version, images }),
   defenderStatus: () => invoke<DefenderView>('defender_status'),
   defenderExclude: (paths: string[]) => invoke<void>('defender_exclude', { paths }),
   defenderDismiss: (dismissed: boolean) => invoke<void>('defender_dismiss', { dismissed }),
@@ -843,9 +858,16 @@ export const api = {
   startClient: (join: boolean) => invoke<void>('start_client', { join }),
   serverCommand: (line: string) => invoke<void>('server_command', { line }),
   killProcess: (which: 'server' | 'client') => invoke<void>('kill_process', { which }),
-  publish: (options: { version: string; message: string; push: boolean; client: UploadNames; server: UploadNames; updateChecker: UpdateType | null }) => invoke<void>('publish', { options }),
+  publish: (options: { version: string; message: string; push: boolean; client: UploadNames; server: UploadNames; updateChecker: UpdateType | null; announcementImages: string[] }) => invoke<void>('publish', { options }),
   releases: () => invoke<ReleaseStatus[]>('releases'),
   outputDir: () => invoke<string>('output_dir'),
+}
+
+export function changelogFitNote(composed: Pick<ComposedAnnouncement, 'linksStripped' | 'truncated'>): string | null {
+  if (composed.truncated) {
+    return `The changelog is too long for a Discord message, so we'll ${composed.linksStripped ? 'post it without its links and cut it short' : 'cut it short'}, ending with a link to the full changelog.`
+  }
+  return composed.linksStripped ? "The changelog is too long for a Discord message with its links, so we'll post the linked names as plain text." : null
 }
 
 export function errorText(error: unknown): string {

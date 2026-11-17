@@ -3,9 +3,11 @@
   import { onMount, tick } from 'svelte'
   import { ask } from '@tauri-apps/plugin-dialog'
   import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type OverrideFileView, type Overview, type PackConfig, type PublishedTo, type ServerPackUpload, type UnfinishedRelease, type Untested, type UpdateCheckerSetup, type UpdateType, type UploadNames } from '../lib/api'
+  import { api, changelogFitNote, errorText, type OverrideFileView, type Overview, type PackConfig, type PublishedTo, type ServerPackUpload, type UnfinishedRelease, type Untested, type UpdateCheckerSetup, type UpdateType, type UploadNames } from '../lib/api'
   import { job, onJobEnd, testState } from '../lib/jobs.svelte'
   import RenderedChangelog from '../components/RenderedChangelog.svelte'
+  import AnnouncementImages from '../components/AnnouncementImages.svelte'
+  import AnnouncementPreview from '../components/AnnouncementPreview.svelte'
   import JobLog from '../components/JobLog.svelte'
   import LinkedText from '../components/LinkedText.svelte'
   import Twisty from '../components/Twisty.svelte'
@@ -13,7 +15,7 @@
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
   import ServerPackTagDialog from '../components/ServerPackTagDialog.svelte'
   import ServerPackTagStep from '../components/ServerPackTagStep.svelte'
-  import { nav, serverView, showInFiles } from '../lib/nav.svelte'
+  import { appSettingsView, nav, packSettingsView, serverView, showInFiles } from '../lib/nav.svelte'
   import { asReleaseType, asUpdateType, curseforgeProblem, releaseTag, repoName, UPDATE_TYPES, updateTypeEffect } from '../lib/format'
 
   let {
@@ -68,7 +70,8 @@
     }
   }
 
-  function settingsAt(anchor: string) {
+  function settingsAt(anchor: string, tab?: 'publishing' | 'test' | 'discord') {
+    packSettingsView.tab = tab ?? (anchor.startsWith('discord') ? 'discord' : 'publishing')
     nav.anchor = anchor
     onsettings()
   }
@@ -82,6 +85,9 @@
   let changelog = $state<string | null>(null)
   let changelogError: string | null = $state(null)
   let hasWebhook = $state(false)
+  let announcementImages = $state<string[]>([])
+  let announcementFitNote = $state<string | null>(null)
+  let discordPreviewOpen = $state(false)
   let updateChecker = $state<UpdateCheckerSetup | null>(null)
   let updateType = $state<UpdateType | 'none'>('none')
   let checkerRepo = $derived(updateChecker?.kind === 'github' ? updateChecker.repo : null)
@@ -184,9 +190,7 @@
   let lastTag = $derived(overview?.lastTag ?? null)
   let lastVersion = $derived(overview?.lastVersion ?? null)
 
-  onMount(() => {
-    loadChangelog()
-    loadUnfinished()
+  function loadPackSettings() {
     api.getPackConfig().then(
       (c) => {
         config = c
@@ -194,15 +198,33 @@
       },
       () => (config = null),
     )
+    api.getWebhook().then((w) => (hasWebhook = !!w), () => (hasWebhook = false))
+  }
+
+  onMount(() => {
+    loadChangelog()
+    loadUnfinished()
+    loadPackSettings()
     api.updateCheckerSetup().then(
       (setup) => (updateChecker = setup),
       () => (updateChecker = null),
     )
-    api.getWebhook().then((w) => (hasWebhook = !!w), () => (hasWebhook = false))
+    api.getPendingAnnouncementImages().then((images) => (announcementImages = images), () => {})
     api.getSettings().then(
       (s) => (identity = [s.gitName.trim(), s.gitEmail.trim() && `<${s.gitEmail.trim()}>`].filter(Boolean).join(' ') || null),
       () => (identity = null),
     )
+  })
+
+  // Keep config and webhook fresh when Pack settings saves in an adjacent split pane.
+  let firstOverview = true
+  $effect(() => {
+    void overview
+    if (firstOverview) {
+      firstOverview = false
+      return
+    }
+    loadPackSettings()
   })
 
   function resetUpdateType() {
@@ -213,6 +235,8 @@
     loadUnfinished()
     if (phase !== 'done') return
     commitMessage = ''
+    announcementImages = []
+    announcementImages = []
     resetUpdateType()
     names = noOverrides()
     renaming = { client: false, server: false }
@@ -260,6 +284,24 @@
       changelogError = `Couldn't build the changelog preview: ${errorText(e)}`
     }
   }
+
+  $effect(() => {
+    if (!hasWebhook || changelog === null) {
+      announcementFitNote = null
+      return
+    }
+    void config?.discord
+    let stale = false
+    api.composeDraftAnnouncement(trimmed || 'next', []).then(
+      (composed) => {
+        if (!stale) announcementFitNote = changelogFitNote(composed)
+      },
+      () => {
+        if (!stale) announcementFitNote = null
+      },
+    )
+    return () => (stale = true)
+  })
 
   let trimmed = $derived(overview?.version?.trim() ?? '')
   let defaultMessage = $derived(`Release ${trimmed}`)
@@ -407,6 +449,7 @@
   let announces = $derived(hasWebhook && !!config?.discord.announce_on_approval)
   let serverPackMods = $derived(config?.server.bundle_mods ? 'with its mods in the zip' : "with its mods downloaded on the server's first start")
   let approvalWait = $derived(toCurseforge ? 'CurseForge approves it' : "it's on Modrinth")
+  let attachedImages = $derived(announcementImages.length === 0 ? '' : announcementImages.length === 1 ? 'the image you attached' : `the ${announcementImages.length} images you attached`)
 
   async function publish() {
     const client = resolvedNames('client')
@@ -433,7 +476,7 @@
         : null,
       `Commit ${uncommitted.length ? `your ${uncommitted.length} uncommitted ${uncommitted.length === 1 ? 'file' : 'files'} and ` : ''}the release as "${commitMessage.trim() || defaultMessage}", tag it ${releaseTag(trimmed)}${push ? ', then push' : ''}.`,
       'Archive the release notes and clear changelog.md for the next release.',
-      announces ? `Post to Discord once ${approvalWait}${rolePing ? ', pinging the role' : ''}.` : null,
+      announces ? `Post to Discord once ${approvalWait}${rolePing ? ', pinging the role' : ''}${attachedImages ? `, with ${attachedImages}` : ''}.` : null,
       checkerRepo && chosenUpdateType ? `Add it to ${repoName(checkerRepo)} on GitHub as ${asUpdateType(chosenUpdateType)} once ${approvalWait}, so players see it in game.` : null,
       checkerRepo && !chosenUpdateType ? `Leave it out of ${repoName(checkerRepo)}, so players won't be told about it in game.` : null,
       emptyNotes ? `The changelog on ${platforms} will be empty.` : null,
@@ -462,6 +505,7 @@
         client: trimmedNames('client'),
         server: trimmedNames('server'),
         updateChecker: chosenUpdateType,
+        announcementImages: hasWebhook ? announcementImages : [],
       })
       onchange()
     } catch (e) {
@@ -796,7 +840,7 @@
       {#if checkerProblem}
         <li class="warn">
           <svg viewBox="0 0 16 16" role="img" aria-label="Warning"><path d="M8 3v6M8 12v1" /></svg>
-          <span>packraven won't be able to add {trimmed || 'this release'} to the update checker. {checkerProblem} <button class="link" onclick={onappsettings}>Open App settings</button></span>
+          <span>packraven won't be able to add {trimmed || 'this release'} to the update checker. {checkerProblem} <button class="link" onclick={() => { appSettingsView.tab = 'accounts'; nav.anchor = 'github-access-title'; onappsettings() }}>Open App settings</button></span>
         </li>
       {/if}
       {#if untestedText}
@@ -924,7 +968,7 @@
             {#if curseforgeLeftOut.length}
               {@render fileGroup('curseforge-left-out', `Left out of the CurseForge pack${toModrinth ? ', but still in the Modrinth pack' : ''}`, curseforgeLeftOut, nameOf)}
             {/if}
-            <button class="link small" onclick={onsettings}>Change in Pack settings</button>
+            <button class="link small" onclick={() => settingsAt('curseforge-choices-title', 'publishing')}>Change in Pack settings</button>
           </dd>
         </div>
       {/if}
@@ -969,7 +1013,7 @@
             {#if modrinthLeftOut.length}
               {@render fileGroup('modrinth-left-out', 'Left out, but still in the CurseForge pack', modrinthLeftOut, nameOf)}
             {/if}
-            {#if modrinthShipped.length || modrinthLeftOut.length}<button class="link small" onclick={onsettings}>Change in Pack settings</button>{/if}
+            {#if modrinthShipped.length || modrinthLeftOut.length}<button class="link small" onclick={() => settingsAt('modrinth-choices-title', 'publishing')}>Change in Pack settings</button>{/if}
           </dd>
         </div>
       {/if}
@@ -977,7 +1021,7 @@
         <dt>Release type</dt>
         <dd>
           {releaseType ?? 'Unknown'}{config?.curseforge.manual_release ? ', held until you release it' : ''}
-          <button class="link" onclick={onsettings}>Change</button>
+          <button class="link" onclick={() => settingsAt('publishing-title', 'publishing')}>Change</button>
         </dd>
       </div>
       <div>
@@ -1010,7 +1054,7 @@
     <p class="muted small" id="commit-hint">
       Leave it empty to use "{defaultMessage}". We'll commit any remaining changes along with the new version
       and archived notes. The commit author will be {identity ?? 'the name and email in your git config'}.
-      <button class="link" onclick={onappsettings}>Change in App settings</button>
+      <button class="link" onclick={() => { appSettingsView.tab = 'general'; nav.anchor = 'commits-title'; onappsettings() }}>Change in App settings</button>
     </p>
     {#if uncommitted.length}
       <details>
@@ -1055,10 +1099,30 @@
       {:else}
         Automatic announcements are off. You can announce it from Releases.
       {/if}
-      <button class="link" onclick={onsettings}>{hasWebhook ? 'Change Discord settings' : 'Set up a webhook'}</button>
+      <button class="link" onclick={() => settingsAt('discord-title', 'discord')}>{hasWebhook ? 'Change Discord settings' : 'Set up a webhook'}</button>
     </p>
+    {#if announcementFitNote}<p class="muted" role="status">{announcementFitNote}</p>{/if}
+    {#if hasWebhook}
+      <AnnouncementImages images={announcementImages} onchange={async (images) => { announcementImages = await api.setPendingAnnouncementImages(images) }} />
+    {/if}
+    <div class="discord-preview">
+      <button type="button" class="ghost disclosure" aria-expanded={discordPreviewOpen} aria-controls="discord-preview" onclick={() => (discordPreviewOpen = !discordPreviewOpen)}>
+        <Twisty open={discordPreviewOpen} />Preview the Discord post
+      </button>
+      <div id="discord-preview">
+        {#if discordPreviewOpen}
+          <AnnouncementPreview
+            compose={() => api.composeDraftAnnouncement(trimmed || 'next', announcementImages)}
+            inputs={[trimmed, announcementImages, config?.discord, changelog]}
+            label="Preview of the Discord post for {trimmed || 'this release'}"
+          />
+        {/if}
+      </div>
+    </div>
     <div class="row-start">
-      <button class:busy={previewing} disabled={previewing} onclick={previewInDiscohook}>{previewing ? 'Opening' : 'Preview the announcement'}</button>
+      <button type="button" class="ghost" onclick={() => settingsAt('discord-footer', 'discord')}>{(config?.discord.header.trim() || config?.discord.footer.trim()) ? 'Edit header & footer' : 'Add a footer'}</button>
+      <button type="button" class="link small" class:busy={previewing} disabled={previewing} onclick={previewInDiscohook}>{previewing ? 'Opening' : 'Open in Discohook'}</button>
+      {#if announcementImages.length}<span class="muted small">Discohook can't take the images, so the preview leaves them out.</span>{/if}
     </div>
     {#if previewError}<p class="failed">{previewError}</p>{/if}
   </section>
@@ -1467,6 +1531,20 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+  }
+
+  .discord-preview {
+    display: grid;
+    gap: 6px;
+  }
+
+  .discord-preview > .disclosure {
+    justify-self: start;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: -8px;
+    color: var(--forest);
   }
 
   .reveal {

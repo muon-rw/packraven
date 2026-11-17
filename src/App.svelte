@@ -520,6 +520,13 @@
     railMenu = { x: fromKeyboard ? rect.left + 24 : event.clientX, y: fromKeyboard ? rect.bottom : event.clientY, items, scroller: event.currentTarget }
   }
 
+  function showFromWithAnchor(view: View, index: number) {
+    const anchor = nav.anchor
+    nav.anchor = null
+    showFrom(view, index)
+    if (anchor) tick().then(() => revealAnchor(anchor))
+  }
+
   // The close button leaves with its pane, so we hand focus to the pane that stays.
   async function closeAndFocus(pane: number) {
     closePane(pane)
@@ -814,7 +821,7 @@
     {:else if pane === 'server'}
       <Server {overview} onfiles={(path) => openFileBesideIfRoom(path, index)} />
     {:else if pane === 'test'}
-      <TestRun {overview} onserver={() => showFrom('server', index)} onappsettings={() => showFrom('settings', index)} />
+      <TestRun {overview} onserver={() => showFrom('server', index)} onappsettings={() => showFromWithAnchor('settings', index)} />
     {:else if pane === 'files'}
       {#if loadError}<div class="banner">{@render loadNotice(index)}</div>{/if}
       {#await loadFiles() then { default: Files }}
@@ -824,11 +831,11 @@
       {#if loadError}<div class="banner">{@render loadNotice(index)}</div>{/if}
       <Git onchange={refresh} />
     {:else if pane === 'publish'}
-      <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFrom('pack', index)} onreleases={() => showFrom('releases', index)} onrun={() => openBesideIfRoom('test', index)} onappsettings={() => showFrom('settings', index)} onserver={() => showFrom('server', index)} />
+      <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFromWithAnchor('pack', index)} onreleases={() => showFrom('releases', index)} onrun={() => openBesideIfRoom('test', index)} onappsettings={() => showFromWithAnchor('settings', index)} onserver={() => showFrom('server', index)} />
     {:else if pane === 'releases'}
-      <Releases onsettings={() => showFrom('pack', index)} onappsettings={() => showFrom('settings', index)} />
+      <Releases onsettings={() => showFromWithAnchor('pack', index)} onappsettings={() => showFromWithAnchor('settings', index)} />
     {:else if pane === 'pack' && packs?.active}
-      <PackSettings dir={packs.active} name={overview?.name ?? 'this pack'} onserver={() => showFrom('server', index)} onappsettings={() => showFrom('settings', index)} onchange={refresh} onremoved={() => { only('mods'); refresh() }} />
+      <PackSettings dir={packs.active} name={overview?.name ?? 'this pack'} onserver={() => showFrom('server', index)} onappsettings={() => showFromWithAnchor('settings', index)} onchange={refresh} onremoved={() => { only('mods'); refresh() }} />
     {:else}
       <SettingsView onchange={refresh} />
     {/if}

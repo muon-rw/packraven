@@ -3,12 +3,17 @@
   import { listen } from '@tauri-apps/api/event'
   import { ask } from '@tauri-apps/plugin-dialog'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type FileState, type PackFile, type ReleaseStatus, type UpdateCheckerSetup, type UpdateType } from '../lib/api'
+  import { api, changelogFitNote, errorText, type FileState, type PackFile, type ReleaseStatus, type UpdateCheckerSetup, type UpdateType } from '../lib/api'
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
   import ServerPackTagDialog from '../components/ServerPackTagDialog.svelte'
   import ServerPackTagStep from '../components/ServerPackTagStep.svelte'
   import Notice from '../components/Notice.svelte'
+  import AnnouncementImages from '../components/AnnouncementImages.svelte'
+  import AnnouncementPreview from '../components/AnnouncementPreview.svelte'
+  import Twisty from '../components/Twisty.svelte'
+  import { SvelteSet } from 'svelte/reactivity'
   import { job, onJobEnd } from '../lib/jobs.svelte'
+  import { appSettingsView, nav, packSettingsView } from '../lib/nav.svelte'
   import { asReleaseType, asUpdateType, curseforgeProblem, repoName, updateTypeLabel } from '../lib/format'
 
   let { onsettings, onappsettings }: { onsettings: () => void; onappsettings: () => void } = $props()
@@ -18,6 +23,12 @@
   let loading = $state(true)
   let hasWebhook = $state(false)
   let announcing = $state<string | null>(null)
+  const previewsOpen = new SvelteSet<string>()
+  const domId = (text: string) => text.replace(/[^\w-]/g, '_')
+
+  function togglePreview(version: string) {
+    if (!previewsOpen.delete(version)) previewsOpen.add(version)
+  }
   let discordError = $state<string | null>(null)
   let rolePing = $state(false)
   let uploading = $state<string | null>(null)
@@ -358,8 +369,14 @@
   async function announceNow(release: ReleaseStatus) {
     const { version } = release
     const ready = approved(release)
+    announcing = version
+    // Without the composed message we can still announce. We only lose the note about a long changelog.
+    const fitNote = await api.composeAnnouncement(version).then(changelogFitNote, () => null)
+    announcing = null
+    const images = release.announcementImages.length
     const lines = [
-      `Post the ${version} announcement to the Discord channel your webhook points at${rolePing ? ', then ping the role from Pack settings' : ''}.`,
+      `Post the ${version} announcement to the Discord channel your webhook points at${images ? `, with ${images === 1 ? 'its image' : `its ${images} images`}` : ''}${rolePing ? ', then ping the role from Pack settings' : ''}.`,
+      fitNote,
       ready ? null : `${holdups(release).join(', and ')}, so players may not be able to download it everywhere yet.`,
       release.announcedAt ? `You already announced it on ${new Date(release.announcedAt).toLocaleDateString()}, so this will post it again.` : null,
     ].filter(Boolean)
@@ -380,6 +397,10 @@
     } finally {
       announcing = null
     }
+  }
+
+  async function setAnnouncementImages(release: ReleaseStatus, images: string[]) {
+    release.announcementImages = await api.setAnnouncementImages(release.version, images)
   }
 
   async function editInDiscohook(version: string) {
@@ -415,7 +436,7 @@
       </p>
     </div>
     <div class="actions">
-      <button class="ghost settings" onclick={onsettings}>{showUpdateChecker ? 'Announcement settings' : 'Discord settings'}</button>
+      <button class="ghost settings" onclick={() => { packSettingsView.tab = 'discord'; nav.anchor = 'discord-title'; onsettings() }}>Discord settings</button>
       <button class:busy={loading} disabled={loading} onclick={loadReleases}>{loading ? 'Checking' : 'Refresh'}</button>
     </div>
   </header>
@@ -509,7 +530,13 @@
                     </button>
                   {/if}
                   <button class="ghost" onclick={() => editInDiscohook(release.version)} aria-describedby="discohook-hint">Edit in Discohook</button>
+                  <button class="ghost disclosure" aria-expanded={previewsOpen.has(release.version)} aria-controls="discord-preview-{domId(release.version)}" onclick={() => togglePreview(release.version)}>
+                    <Twisty open={previewsOpen.has(release.version)} />Preview<span class="visually-hidden"> the {release.version} Discord post</span>
+                  </button>
                 </span>
+                {#if hasWebhook}
+                  <AnnouncementImages quiet images={release.announcementImages} label="Images attached to the {release.version} announcement" onchange={(images) => setAnnouncementImages(release, images)} />
+                {/if}
               </div>
             </td>
             {#if showUpdateChecker}
@@ -533,6 +560,20 @@
                 </div>
               </td>
             {/if}
+          </tr>
+          <tr class="follow-up discord-follow-up" hidden={!previewsOpen.has(release.version)}>
+            <td colspan={columns} id="discord-preview-{domId(release.version)}">
+              {#if previewsOpen.has(release.version)}
+                <div class="discord-preview">
+                  <AnnouncementPreview
+                    compose={() => api.composeAnnouncement(release.version)}
+                    inputs={release.announcementImages}
+                    label="Preview of the Discord post for {release.version}"
+                    showFitNote
+                  />
+                </div>
+              {/if}
+            </td>
           </tr>
           {@const problems = fileProblems(release)}
           {#each problems as { file, page, found } (file)}
@@ -603,7 +644,7 @@
                           Try<span class="visually-hidden"> adding {release.version} to the update checker</span> again
                         {/if}
                       </button>
-                      <button class="link" onclick={onappsettings}>Open App settings</button>
+                      <button class="link" onclick={() => { appSettingsView.tab = 'accounts'; nav.anchor = 'github-access-title'; onappsettings() }}>Open App settings</button>
                       {#if checkerRepo}
                         {@const repo = checkerRepo}
                         <button class="link" onclick={() => openUrl(repo.page)}>Open {repoName(repo)} on GitHub</button>
@@ -641,7 +682,7 @@
     </table>
     </div>
     <p class="muted small" id="discohook-hint">
-      Discohook is a web editor for Discord messages. packraven opens the announcement there, so you can change it and post it yourself.
+      Discohook is a web editor for Discord messages. packraven opens the announcement there without any attached images, so you can change it and post it yourself.
     </p>
   {:else if loading}
     <p class="muted" role="status">Checking each release's status.</p>
@@ -769,6 +810,22 @@
   .follow-up td {
     border-top: 0;
     padding-top: 0;
+  }
+
+  .discord-follow-up td {
+    padding-bottom: 16px;
+  }
+
+  .discord-preview {
+    position: sticky;
+    left: 0;
+    max-width: min(640px, 100cqi);
+  }
+
+  .disclosure {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
   }
 
   /* Sticky to the scroll area's left edge, and no wider than it, so the steps stay in view while the table scrolls sideways. */

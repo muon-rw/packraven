@@ -13,8 +13,30 @@
   import { javas, scanJava } from '../lib/java.svelte'
   import { trackSave } from '../lib/launch.svelte'
   import { cancelSignIn, minecraft, signIn, signOut } from '../lib/minecraft.svelte'
+  import { appSettingsView } from '../lib/nav.svelte'
 
   let { onchange }: { onchange: () => void } = $props()
+
+  const tabs = [
+    ['general', 'General'],
+    ['java', 'Java & Test runs'],
+    ['accounts', 'Accounts & Tokens'],
+  ] as const
+
+  function selectTab(tab: (typeof tabs)[number][0]) {
+    flushPending()
+    appSettingsView.tab = tab
+  }
+
+  function onTabKey(event: KeyboardEvent) {
+    const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
+    if (!step && event.key !== 'Home' && event.key !== 'End') return
+    event.preventDefault()
+    const index = tabs.findIndex(([tab]) => tab === appSettingsView.tab)
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + step + tabs.length) % tabs.length
+    selectTab(tabs[next][0])
+    document.getElementById(`app-settings-tab-${tabs[next][0]}`)?.focus()
+  }
 
   let settings: Settings | null = $state(null)
   let savedSettings: Settings | null = $state(null)
@@ -195,13 +217,15 @@
     commit()
   }
 
-  onDestroy(() => {
+  function flushPending() {
     for (const { timer, commit } of timers.values()) {
       clearTimeout(timer)
       commit()
     }
     timers.clear()
-  })
+  }
+
+  onDestroy(flushPending)
 
   function onFormKey(event: KeyboardEvent) {
     if (event.key === 'Enter' && event.target instanceof HTMLInputElement && event.target.type !== 'checkbox' && event.target.type !== 'button') {
@@ -505,8 +529,29 @@
     <p class="muted">Configure general packraven settings. For individual packs, see Pack settings.</p>
   </header>
 
+  <div class="tab-row">
+    <div class="tabs" role="tablist" aria-label="App settings" onkeydown={onTabKey}>
+      {#each tabs as [tab, label] (tab)}
+        <button
+          type="button"
+          role="tab"
+          id="app-settings-tab-{tab}"
+          aria-selected={appSettingsView.tab === tab}
+          tabindex={appSettingsView.tab === tab ? 0 : -1}
+          aria-controls="app-settings-panel"
+          class:on={appSettingsView.tab === tab}
+          onclick={() => selectTab(tab)}
+        >
+          {label}
+        </button>
+      {/each}
+    </div>
+  </div>
+
+  <div class="panel" id="app-settings-panel" role="tabpanel" aria-labelledby="app-settings-tab-{appSettingsView.tab}">
+  {#if appSettingsView.tab === 'accounts'}
   <section class="account" id="minecraft-account" aria-labelledby="minecraft-account-title">
-    <h3 id="minecraft-account-title">Minecraft account</h3>
+    <h3 id="minecraft-account-title" tabindex="-1">Minecraft account</h3>
     {#if account}
       <p>
         Signed in as <strong>{account.name}</strong>. Test clients on this computer launch as this account.
@@ -537,7 +582,9 @@
     {/if}
     <p class="muted hint">packraven is not an official Minecraft product, and is not approved by or associated with Mojang or Microsoft.</p>
   </section>
+  {/if}
 
+  {#if appSettingsView.tab === 'general'}
   <div class="app-switches">
   <div class="switch-row">
     <div>
@@ -631,7 +678,7 @@
     {#if saveError}<p class="failed" role="alert">{saveError}</p>{/if}
 
     <section aria-labelledby="machine-title">
-      <h3 id="machine-title">This machine</h3>
+      <h3 id="machine-title" tabindex="-1">This machine</h3>
       <div class="field">
         <div class="label-row">
           <label for="install-dir">CurseForge install folder</label>
@@ -650,7 +697,7 @@
     </section>
 
     <section aria-labelledby="commits-title">
-      <h3 id="commits-title">Commits</h3>
+      <h3 id="commits-title" tabindex="-1">Commits</h3>
       <div class="field">
         <div class="label-row">
           <label for="git-name">Name</label>
@@ -689,48 +736,6 @@
           {#if identityMessage}<span class:muted={identityMessage.ok} class:failed={!identityMessage.ok} role="status">{identityMessage.text}</span>{/if}
         </div>
       {/if}
-    </section>
-
-    <section aria-labelledby="java-title">
-      <h3 id="java-title">Java</h3>
-      <p class="muted">
-        On Automatic, we use CurseForge's Java for each version, or another Java of that version on this computer. A newer Java runs most packs from
-        Minecraft 1.18 on, though some mods may break. To use a different Java for one pack, choose it in Pack settings.
-      </p>
-      {#each JAVA_SLOTS as slot (slot.major)}
-        <JavaPicker
-          id="java-{slot.major}"
-          label={slot.versions}
-          major={Number(slot.major)}
-          bind:value={() => settings!.javaByMajor[slot.major] ?? '', (path) => (settings!.javaByMajor[slot.major] = path)}
-          defaultName="Automatic"
-          defaultPath={javas.scan?.automatic[slot.major] ?? null}
-          needed={javas.scan?.needed.includes(Number(slot.major)) ?? false}
-          onchange={() => saveJavaSlot(slot.major)}
-          ondownload={(java) => {
-            // The backend only chooses a download for a slot when Automatic wouldn't pick it, like GraalVM 21 for Java 17.
-            if (java.major !== Number(slot.major)) saveJavaSlotQuiet(slot.major, java.path)
-          }}
-        >
-          {#snippet status()}{@render badge(`java-${slot.major}`)}{/snippet}
-        </JavaPicker>
-      {/each}
-      <p class="muted hint java-scan" role="status">
-        {#if javas.error}
-          <span class="failed">Couldn't look for Java: {javas.error}</span>
-        {:else if javas.scan}
-          {javas.scan.installs.length === 1 ? '1 Java install' : `${javas.scan.installs.length} Java installs`} found on this computer.
-        {/if}
-        <button type="button" class="link" disabled={javas.scanning} onclick={scanJava}>{javas.scanning ? 'Looking' : 'Look again'}</button>
-      </p>
-      <ExtraLaunchArgs
-        bind:draft={runArgs}
-        scope="app"
-        onedit={() => saveState !== 'failed' && (saveState = 'idle')}
-        onchange={saveRunArgs}
-      >
-        {#snippet status(key)}{@render badge(key)}{/snippet}
-      </ExtraLaunchArgs>
     </section>
 
     <section aria-labelledby="editor-title">
@@ -782,6 +787,80 @@
     </section>
   </form>
 
+  {#if defender?.active}
+    <section class="removal" aria-labelledby="windows-security-title">
+      <h3 id="windows-security-title" tabindex="-1">Windows Security</h3>
+      {#if defender.missing.length}
+        <p class="muted">
+          Windows Defender can slow things down. Exclude {defender.missing.length === 1 ? 'this folder' : 'these folders'} to speed things up, but Defender will stop scanning files in {defender.missing.length === 1 ? 'it' : 'them'}.
+          {defender.exclusionsReadable ? '' : "Windows only shows exclusions to administrators, so packraven may still list folders you excluded elsewhere."}
+        </p>
+        <ul class="folders">{#each defender.missing as path (path)}<li class="file">{path}</li>{/each}</ul>
+        <div><button type="button" class:busy={defenderBusy} disabled={defenderBusy} onclick={excludeFolders}>{defenderBusy ? 'Waiting for Windows' : 'Exclude folders'}</button></div>
+        <p class="muted">You'll get a pop-up from Windows.</p>
+      {:else}
+        <p class="muted">Windows Defender will skip the pack, CurseForge and packraven folders. Only install projects you trust.</p>
+      {/if}
+      <p class:muted={!defenderFailed} class:failed={defenderFailed} class:visually-hidden={!defenderMessage} role="status">{defenderMessage ?? ''}</p>
+      <div class="check-line">
+        <label class="check">
+          <input type="checkbox" checked={!settings.defenderDismissed} onchange={(e) => setDefenderPrompt(e.currentTarget.checked, e.currentTarget)} />
+          Remind me when these folders aren't excluded
+        </label>
+        {@render badge('defender-prompt')}
+      </div>
+    </section>
+  {/if}
+  {:else if appSettingsView.tab === 'java'}
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <form class="form" onsubmit={(e) => e.preventDefault()} onkeydown={onFormKey}>
+    {#if saveError}<p class="failed" role="alert">{saveError}</p>{/if}
+
+    <section aria-labelledby="java-title">
+      <h3 id="java-title" tabindex="-1">Java</h3>
+      <p class="muted">
+        On Automatic, we use CurseForge's Java for each version, or another Java of that version on this computer. A newer Java runs most packs from
+        Minecraft 1.18 on, though some mods may break. To use a different Java for one pack, choose it in Pack settings.
+      </p>
+      {#each JAVA_SLOTS as slot (slot.major)}
+        <JavaPicker
+          id="java-{slot.major}"
+          label={slot.versions}
+          major={Number(slot.major)}
+          bind:value={() => settings!.javaByMajor[slot.major] ?? '', (path) => (settings!.javaByMajor[slot.major] = path)}
+          defaultName="Automatic"
+          defaultPath={javas.scan?.automatic[slot.major] ?? null}
+          needed={javas.scan?.needed.includes(Number(slot.major)) ?? false}
+          onchange={() => saveJavaSlot(slot.major)}
+          ondownload={(java) => {
+            // The backend only chooses a download for a slot when Automatic wouldn't pick it, like GraalVM 21 for Java 17.
+            if (java.major !== Number(slot.major)) saveJavaSlotQuiet(slot.major, java.path)
+          }}
+        >
+          {#snippet status()}{@render badge(`java-${slot.major}`)}{/snippet}
+        </JavaPicker>
+      {/each}
+      <p class="muted hint java-scan" role="status">
+        {#if javas.error}
+          <span class="failed">Couldn't look for Java: {javas.error}</span>
+        {:else if javas.scan}
+          {javas.scan.installs.length === 1 ? '1 Java install' : `${javas.scan.installs.length} Java installs`} found on this computer.
+        {/if}
+        <button type="button" class="link" disabled={javas.scanning} onclick={scanJava}>{javas.scanning ? 'Looking' : 'Look again'}</button>
+      </p>
+      <ExtraLaunchArgs
+        bind:draft={runArgs}
+        scope="app"
+        onedit={() => saveState !== 'failed' && (saveState = 'idle')}
+        onchange={saveRunArgs}
+      >
+        {#snippet status(key)}{@render badge(key)}{/snippet}
+      </ExtraLaunchArgs>
+    </section>
+  </form>
+  {/if}
+
+  {#if appSettingsView.tab === 'accounts'}
   {#if credentialsError}
     <section class="removal" aria-labelledby="access-tokens-title">
       <h3 id="access-tokens-title">Access tokens</h3>
@@ -821,7 +900,7 @@
     </section>
 
     <section class="removal" id="github-access" aria-labelledby="github-access-title">
-      <h3 id="github-access-title">GitHub access</h3>
+      <h3 id="github-access-title" tabindex="-1">GitHub access</h3>
       <CredentialField credential="github" label="GitHub token" status={credentials.github} keychain={credentials.keychain} {envNames} onchange={loadCredentials}>
         {#snippet help()}
           <p class="muted hint">
@@ -833,31 +912,8 @@
       </CredentialField>
     </section>
   {/if}
-
-  {#if defender?.active}
-    <section class="removal" aria-labelledby="windows-security-title">
-      <h3 id="windows-security-title">Windows Security</h3>
-      {#if defender.missing.length}
-        <p class="muted">
-          Windows Defender can slow things down. Exclude {defender.missing.length === 1 ? 'this folder' : 'these folders'} to speed things up, but Defender will stop scanning files in {defender.missing.length === 1 ? 'it' : 'them'}.
-          {defender.exclusionsReadable ? '' : "Windows only shows exclusions to administrators, so packraven may still list folders you excluded elsewhere."}
-        </p>
-        <ul class="folders">{#each defender.missing as path (path)}<li class="file">{path}</li>{/each}</ul>
-        <div><button type="button" class:busy={defenderBusy} disabled={defenderBusy} onclick={excludeFolders}>{defenderBusy ? 'Waiting for Windows' : 'Exclude folders'}</button></div>
-        <p class="muted">You'll get a pop-up from Windows.</p>
-      {:else}
-        <p class="muted">Windows Defender will skip the pack, CurseForge and packraven folders. Only install projects you trust.</p>
-      {/if}
-      <p class:muted={!defenderFailed} class:failed={defenderFailed} class:visually-hidden={!defenderMessage} role="status">{defenderMessage ?? ''}</p>
-      <div class="check-line">
-        <label class="check">
-          <input type="checkbox" checked={!settings.defenderDismissed} onchange={(e) => setDefenderPrompt(e.currentTarget.checked, e.currentTarget)} />
-          Remind me when these folders aren't excluded
-        </label>
-        {@render badge('defender-prompt')}
-      </div>
-    </section>
   {/if}
+  </div>
   </div>
 {/if}
 
@@ -871,8 +927,49 @@
 
   .settings {
     display: grid;
-    gap: 36px;
+    gap: 20px;
     max-width: 760px;
+  }
+
+  .tab-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: end;
+    justify-content: space-between;
+    gap: 8px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .tabs {
+    display: flex;
+    gap: 4px;
+  }
+
+  .tabs button {
+    margin-bottom: -1px;
+    padding: 8px 14px;
+    font-weight: 400;
+    color: var(--muted);
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+  }
+
+  .tabs button:hover:not(.on) {
+    color: var(--text);
+    background: transparent;
+  }
+
+  .tabs button.on {
+    color: var(--text);
+    font-weight: 700;
+    border-bottom-color: var(--forest);
+  }
+
+  .panel {
+    display: grid;
+    gap: 36px;
   }
 
   .folders {
@@ -893,8 +990,6 @@
   .account {
     display: grid;
     gap: 12px;
-    padding-bottom: 28px;
-    border-bottom: 1px solid var(--line);
   }
 
   .account h3,

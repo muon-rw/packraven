@@ -5,7 +5,7 @@
   import { open } from '@tauri-apps/plugin-dialog'
   import { api, errorText, type ModDiff, type Overview } from '../lib/api'
   import { shortcut } from '../lib/platform'
-  import { nav } from '../lib/nav.svelte'
+  import { appSettingsView, nav, packSettingsView } from '../lib/nav.svelte'
   import RenderedChangelog from '../components/RenderedChangelog.svelte'
   import LinkedText from '../components/LinkedText.svelte'
   import { job, onJobEnd } from '../lib/jobs.svelte'
@@ -42,6 +42,8 @@
   })
 
   function go(page: 'pack' | 'settings', anchor: string) {
+    if (page === 'pack') packSettingsView.tab = 'publishing'
+    if (page === 'settings') appSettingsView.tab = 'accounts'
     nav.anchor = anchor
     nav.view = page
   }

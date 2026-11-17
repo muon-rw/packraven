@@ -6,7 +6,7 @@
   import { SIGN_IN_FIRST, cancelSignIn, minecraft, signIn } from '../lib/minecraft.svelte'
   import { job, serverPack, testOptions, testState } from '../lib/jobs.svelte'
   import { killServer, launch, launchClient, restartServer, startServer, stopServer } from '../lib/launch.svelte'
-  import { serverView } from '../lib/nav.svelte'
+  import { appSettingsView, nav, serverView } from '../lib/nav.svelte'
   import JobLog from '../components/JobLog.svelte'
   import Tip from '../components/Tip.svelte'
   import LinkedText from '../components/LinkedText.svelte'
@@ -146,7 +146,7 @@
         {#if serverMode}
           <button type="button" class="link" onclick={() => ((serverView.tab = 'properties'), onserver())}>Edit server.properties</button>
         {:else if account && !running}
-          <button type="button" class="link" onclick={onappsettings}>Manage your sign-in in App settings</button>
+          <button type="button" class="link" onclick={() => { appSettingsView.tab = 'accounts'; nav.anchor = 'minecraft-account-title'; onappsettings() }}>Manage your sign-in in App settings</button>
         {/if}
       </p>
     </div>

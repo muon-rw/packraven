@@ -55,7 +55,7 @@ async fn check(app: &AppHandle) -> bool {
                 continue;
             }
             if let Some(webhook) = webhook.as_deref().filter(|_| announces(&release)) {
-                match discord::announce(pack, &releases_path, &release.version, webhook).await {
+                match discord::announce(pack, &pack_data, &releases_path, &release.version, webhook).await {
                     Ok(()) => {
                         let _ = app.emit("release-announced", &release.version);
                     }

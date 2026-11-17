@@ -4,7 +4,7 @@
   import { open } from '@tauri-apps/plugin-dialog'
   import { api, errorText, type InstanceInfo } from '../lib/api'
   import { job, onJobEnd } from '../lib/jobs.svelte'
-  import { nav } from '../lib/nav.svelte'
+  import { appSettingsView, nav } from '../lib/nav.svelte'
   import Notice from '../components/Notice.svelte'
   import LogView from '../components/LogView.svelte'
 
@@ -240,7 +240,7 @@
           <p class="hint" id="join-remote-hint">
             The repository your collaborators push the pack to.
             {#if !hasGithubToken}
-              If it's a private GitHub repository, <button type="button" class="link" onclick={() => (nav.view = 'settings')}>add a GitHub token in App settings</button> first.
+              If it's a private GitHub repository, <button type="button" class="link" onclick={() => { appSettingsView.tab = 'accounts'; nav.anchor = 'github-access-title'; nav.view = 'settings' }}>add a GitHub token in App settings</button> first.
             {/if}
           </p>
         </div>

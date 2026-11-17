@@ -69,6 +69,7 @@
 
 <script lang="ts">
   import { onDestroy, type Snippet } from 'svelte'
+  import { appSettingsView, nav } from '../lib/nav.svelte'
 
   let {
     draft = $bindable(),
@@ -153,7 +154,7 @@
           For debugging this pack on this machine. packraven adds these to test runs after the pack's own flags and arguments{inherited ? ' and the ones for every pack' : ''},
           and never ships them in the server pack or saves them in the pack repo.
           {#if inherited}
-            Test runs also get {inherited === 1 ? '1 line' : `${inherited} lines`} from <button type="button" class="link" onclick={onappsettings}>App settings</button>.
+            Test runs also get {inherited === 1 ? '1 line' : `${inherited} lines`} from <button type="button" class="link" onclick={() => { appSettingsView.tab = 'java'; nav.anchor = 'java-title'; onappsettings?.() }}>App settings</button>.
           {/if}
         </p>
       {/if}

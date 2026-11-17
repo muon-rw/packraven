@@ -38,6 +38,9 @@ pub struct Release {
     pub published_at: String,
     pub announce: bool,
     pub announced_at: Option<String>,
+    /// The images on your disk that go out with the Discord announcement.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub announcement_images: Vec<String>,
     /// The steps after the uploads that haven't happened yet, in order. Releases from before we kept these have none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pending: Vec<PendingStep>,
@@ -170,6 +173,8 @@ struct StoredRelease {
     #[serde(default)]
     announced_at: Option<String>,
     #[serde(default)]
+    announcement_images: Vec<String>,
+    #[serde(default)]
     pending: Vec<PendingStep>,
     #[serde(default)]
     mods_digest: Option<String>,
@@ -193,6 +198,7 @@ impl From<StoredRelease> for Release {
             published_at: stored.published_at,
             announce: stored.announce,
             announced_at: stored.announced_at,
+            announcement_images: stored.announcement_images,
             pending: stored.pending,
             mods_digest: stored.mods_digest,
             update_checker: stored.update_checker,
@@ -213,6 +219,8 @@ pub struct PublishOptions {
     /// How the update checker describes the release, or None to leave it out of the update checker.
     #[serde(default)]
     pub update_checker: Option<UpdateType>,
+    #[serde(default)]
+    pub announcement_images: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, PartialEq, Clone)]
@@ -415,6 +423,7 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
     if load_releases(&pack_data.join("releases.json")).iter().any(|r| r.version == version) {
         bail!("You already published {version}. Finish it from Publish if it's unfinished, or change the version.");
     }
+    crate::discord::check_images(&options.announcement_images)?;
     let pack = Pack::open(&pack.dir)?;
     let client_names = upload_names("client pack", &options.client, default_client_names(&pack), &version)?;
     let server_names = upload_names("server pack", &options.server, default_server_names(&pack), &version)?;
@@ -434,6 +443,8 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
     let message = Some(options.message.trim()).filter(|m| !m.is_empty()).map_or_else(|| format!("Release {version}"), String::from);
     let releases_path = pack_data.join("releases.json");
     let release_type = pack.config.curseforge.release_type.clone();
+    let cached_images = crate::discord::cache_images(&crate::discord::release_images_dir(&pack_data, &version), &options.announcement_images)?;
+    crate::discord::clear_pending_images(&pack_data);
     let mut release = Release {
         version: version.clone(),
         display_name: Some(client_names.display_name.clone()),
@@ -445,6 +456,7 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
         published_at: chrono::Utc::now().to_rfc3339(),
         announce,
         announced_at: None,
+        announcement_images: cached_images,
         pending: [Some(PendingStep::Tag { message }), options.push.then_some(PendingStep::Push)].into_iter().flatten().collect(),
         mods_digest: Some(mods_digest(&pack)),
         update_checker: options.update_checker.filter(|_| update_checker::repo(&pack).is_some()).map(update_checker::Entry::new),

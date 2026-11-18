@@ -3,7 +3,7 @@
   import Notice from './Notice.svelte'
   import { open } from '@tauri-apps/plugin-dialog'
   import { errorText, type JavaInstall } from '../lib/api'
-  import { cancelJavaDownload, downloadJava, findJava, javaName, javas, samePath, scanJava } from '../lib/java.svelte'
+  import { cancelJavaDownload, downloadJava, findJava, isOurGraalvm, javaName, javas, samePath, scanJava, type DownloadProgress } from '../lib/java.svelte'
 
   let {
     id,
@@ -67,6 +67,10 @@
   const progress = $derived(graalvm ? javas.downloads[graalvm] : undefined)
   const missing = $derived(!chosen && javas.scan !== null)
 
+  const chosenJava = $derived(findJava(chosen))
+  const outdated = $derived(chosenJava && isOurGraalvm(chosenJava) && javas.outdated.includes(chosenJava.major) ? chosenJava : undefined)
+  const updateProgress = $derived(outdated ? javas.downloads[outdated.major] : undefined)
+
   let downloadError = $state<string | null>(null)
   let downloadStatus = $state<string | null>(null)
 
@@ -87,6 +91,22 @@
     }
   }
 
+  async function update(java: JavaInstall) {
+    downloadError = null
+    downloadStatus = null
+    try {
+      const updated = await downloadJava(java.major)
+      if (!updated) {
+        downloadStatus = 'Update cancelled.'
+        return
+      }
+      downloadStatus = `Updated to ${updated.distribution} ${updated.version}.`
+      ondownload(updated)
+    } catch (error) {
+      downloadError = `Couldn't update GraalVM ${java.major}: ${errorText(error)}`
+    }
+  }
+
   function selectJava(next: string) {
     if (next === value) return
     downloadStatus = null
@@ -102,15 +122,19 @@
   const megabytes = (bytes: number) => Math.round(bytes / 1_000_000)
 </script>
 
+{#snippet downloading(graalvm: number, progress: DownloadProgress)}
+  <div class="download">
+    <progress max={progress.total ?? undefined} value={progress.total ? progress.received : undefined} aria-label="Downloading GraalVM {graalvm}"></progress>
+    <button type="button" onclick={() => cancelJavaDownload(graalvm)}>Cancel</button>
+  </div>
+  <p class="muted note" role="status">
+    Downloading GraalVM {graalvm}{progress.total ? `: ${megabytes(progress.received)} of ${megabytes(progress.total)} MB` : ''}
+  </p>
+{/snippet}
+
 {#snippet offer()}
   {#if graalvm && progress}
-    <div class="download">
-      <progress max={progress.total ?? undefined} value={progress.total ? progress.received : undefined} aria-label="Downloading GraalVM {graalvm}"></progress>
-      <button type="button" onclick={() => cancelJavaDownload(graalvm)}>Cancel</button>
-    </div>
-    <p class="muted note" role="status">
-      Downloading GraalVM {graalvm}{progress.total ? `: ${megabytes(progress.received)} of ${megabytes(progress.total)} MB` : ''}
-    </p>
+    {@render downloading(graalvm, progress)}
   {:else}
     {#if installedNewer}
       <p class="note">
@@ -172,6 +196,23 @@
   </div>
   {#if chosen}<p class="path file" id="{id}-path">{chosen}</p>{/if}
   {#if downloadStatus}<p class="muted note" role="status">{downloadStatus}</p>{/if}
+
+  {#if outdated}
+    <div class="quiet">
+      {#if updateProgress}
+        {@render downloading(outdated.major, updateProgress)}
+      {:else}
+        <p class="note">
+          Oracle has published a newer build of GraalVM {outdated.major}, which can include security fixes. We'll move your Java settings to it and delete this
+          one.
+        </p>
+        <div class="actions">
+          <button type="button" class="primary" onclick={() => update(outdated)}>Update GraalVM {outdated.major}</button>
+        </div>
+      {/if}
+      {#if downloadError}<p class="failed" role="alert">{downloadError}</p>{/if}
+    </div>
+  {/if}
 
   {#if missing}
     {#if needed}

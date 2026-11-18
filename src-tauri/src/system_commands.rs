@@ -116,16 +116,31 @@ pub async fn download_java(app: AppHandle, state: State<'_, AppState>, major: u3
         let _ = app.emit("java-download", JavaDownloadProgress { graalvm, received, total });
     };
     let java = crate::java::download_graalvm(major, progress).await.map_err(|e| format!("{e:#}"))?;
-    // Automatic picks up a download of the same version. Java 17 gets GraalVM 21, which Automatic
-    // won't choose for Java 17 packs, so we choose it for that version under App settings.
-    if java.major != major {
-        state
-            .update_settings(|s| {
+    let superseded = crate::java::superseded_by(&java);
+    state
+        .update_settings(|s| {
+            // Automatic picks up a download of the same version. Java 17 gets GraalVM 21, which Automatic
+            // won't choose for Java 17 packs, so we choose it for that version under App settings.
+            if java.major != major {
                 s.java_by_major.insert(major, java.path.clone());
-            })
-            .map_err(|e| format!("{e:#}"))?;
+            }
+            for chosen in s.java_by_major.values_mut().chain(s.pack_java.values_mut()) {
+                if superseded.iter().any(|old| crate::java::same_java(old, chosen)) {
+                    *chosen = java.path.clone();
+                }
+            }
+        })
+        .map_err(|e| format!("{e:#}"))?;
+    // A test run may still use an old build. We leave that one for the next update to delete.
+    for old in &superseded {
+        let _ = crate::java::remove_download(old);
     }
     Ok(java)
+}
+
+#[tauri::command]
+pub async fn outdated_graalvms() -> BTreeSet<u32> {
+    crate::java::outdated_graalvms().await
 }
 
 #[tauri::command]

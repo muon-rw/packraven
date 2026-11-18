@@ -285,6 +285,9 @@ pub fn client(settings: &Settings, pack: &Pack, player: &Player, server: Option<
     let run_args = settings.combined_run_args(&settings.instance_dir);
     let mut args: Vec<String> = Vec::new();
     collect("jvm", &mut args);
+    if crate::java::needs_java4shell_flag(required_java(settings).1) {
+        args.push(crate::java::JAVA4SHELL_FLAG.into());
+    }
     match profile.java_args {
         Some(java_args) => args.extend(split_args(&java_args)),
         None => args.push(format!("-Xmx{}", pack.config.test.client_memory)),

@@ -704,6 +704,7 @@ export const api = {
   scanJava: () => invoke<JavaScan>('scan_java'),
   downloadJava: (major: number) => invoke<JavaInstall>('download_java', { major }),
   cancelJavaDownload: (graalvm: number) => invoke<void>('cancel_java_download', { graalvm }),
+  outdatedGraalvms: () => invoke<number[]>('outdated_graalvms'),
   getServerIcon: () => invoke<string | null>('get_server_icon'),
   setServerIcon: (image: string) => invoke<string | null>('set_server_icon', { image }),
   useProjectLogoAsServerIcon: () => invoke<string | null>('use_project_logo_as_server_icon'),

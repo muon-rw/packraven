@@ -1147,7 +1147,12 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     minecraftAccount = null
   },
   get_settings: () => ({ instanceDir: pack.dir, packs: [pack.dir], installDir: 'C:/curseforge/minecraft/Install', javaByMajor: { ...javaByMajor }, defenderExcluded: [], defenderDismissed: false, minecraftEulaAccepted: eulaAccepted, editorAskMb: 50, editorMaxMb: 100, gitName: '', gitEmail: '', autoUpdate, discordShowsPack, runArgs: appRunArgs }),
-  save_settings: (a) => (appRunArgs = (a.settings as { runArgs: typeof appRunArgs }).runArgs),
+  save_settings: (a) => {
+    const saved = a.settings as { runArgs: typeof appRunArgs; javaByMajor: Record<string, string> }
+    appRunArgs = saved.runArgs
+    for (const major of Object.keys(javaByMajor)) delete javaByMajor[major]
+    Object.assign(javaByMajor, saved.javaByMajor)
+  },
   update_status: () => updateView(),
   check_for_update: () => updateView(),
   install_update: () => {
@@ -1657,11 +1662,18 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       if (javaDownloadCancelled) throw 'Download cancelled.'
       emit('java-download', { graalvm, received: (total * step) / 20, total })
     }
-    const java = { path: `C:/Users/you/AppData/Roaming/dev.muon.packraven/java/graalvm-jdk-${graalvm}.0.4+7.1/bin/java.exe`, major: graalvm, version: `${graalvm}.0.4`, distribution: 'GraalVM', source: 'packraven', foreignArch: null }
-    mockJavas.unshift(java)
+    // A second download stands in for Oracle's newer build, replacing the first like the backend does.
+    const ours = (j: (typeof mockJavas)[number]) => j.source === 'packraven' && j.major === graalvm
+    const patch = mockJavas.some(ours) ? 5 : 4
+    const java = { path: `C:/Users/you/AppData/Roaming/dev.muon.packraven/java/graalvm-jdk-${graalvm}.0.${patch}+7.1/bin/java.exe`, major: graalvm, version: `${graalvm}.0.${patch}`, distribution: 'GraalVM', source: 'packraven', foreignArch: null }
+    const superseded = mockJavas.filter(ours).map((j) => j.path)
+    mockJavas.splice(0, mockJavas.length, java, ...mockJavas.filter((j) => !ours(j)))
     if (graalvm !== major) javaByMajor[String(major)] = java.path
+    for (const [slot, path] of Object.entries(javaByMajor)) if (superseded.includes(path)) javaByMajor[slot] = java.path
     return java
   },
+  // Treats the first GraalVM you download in the mock as out of date, so you can try the update.
+  outdated_graalvms: () => [...new Set(mockJavas.filter((j) => j.source === 'packraven' && j.version.endsWith('.0.4')).map((j) => j.major))],
   cancel_java_download: () => {
     javaDownloadCancelled = true
   },

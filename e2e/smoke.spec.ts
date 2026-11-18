@@ -516,6 +516,27 @@ test('downloading GraalVM fills a Java version nobody has installed', async ({ p
   await expect(page.locator('#java-25 option:checked')).toHaveText('Automatic: GraalVM 25.0.4 · downloaded by packraven')
 })
 
+test('updating a downloaded GraalVM moves your choice to the new build', async ({ page }) => {
+  await openApp(page, 'settings', 'dirty')
+  await page.getByRole('tab', { name: 'Java & Test runs' }).click()
+  const slot = page.locator('.java', { has: page.locator('#java-25') })
+  await slot.getByRole('button', { name: 'Download GraalVM 25' }).click()
+  await page.locator('#java-25').selectOption({ label: 'GraalVM 25.0.4 · downloaded by packraven' })
+  await expect(slot).toContainText('Oracle has published a newer build of GraalVM 25')
+  await slot.getByRole('button', { name: 'Update GraalVM 25' }).click()
+  await expect(slot.getByRole('status').filter({ hasText: 'Updated to' })).toHaveText('Updated to GraalVM 25.0.5.')
+  await expect(page.locator('#java-25 option:checked')).toHaveText('GraalVM 25.0.5 · downloaded by packraven')
+  await expect(slot.getByRole('button', { name: 'Update GraalVM 25' })).toHaveCount(0)
+})
+
+test('server packs on Java 16 and newer turn off the Base64 intrinsic', async ({ page }) => {
+  await openApp(page, 'server', 'dirty')
+  await page.getByRole('tab', { name: 'Startup' }).click()
+  const jvmArgs = page.getByRole('figure', { name: 'user_jvm_args.txt' })
+  await expect(jvmArgs).toContainText('# Java4Shell workaround')
+  await expect(jvmArgs).toContainText('-XX:-UseBASE64Intrinsics')
+})
+
 test('extra launch arguments check what Java will receive', async ({ page }) => {
   await openApp(page, 'pack', 'dirty')
   await page.getByRole('tab', { name: 'Test runs' }).click()

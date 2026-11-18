@@ -326,6 +326,7 @@ pub fn run() {
             system_commands::scan_java,
             system_commands::download_java,
             system_commands::cancel_java_download,
+            system_commands::outdated_graalvms,
             system_commands::pack_java_default,
             system_commands::credentials_status,
             system_commands::credential_store,

@@ -125,6 +125,13 @@
     javaDefault = await api.packJavaDefault().catch(() => null)
   }
 
+  // A GraalVM update moves this pack's Java off the build it replaces.
+  async function reloadPackJava() {
+    packJava = (await api.getPackJava().catch(() => null)) ?? packJava
+    savedPackJava = packJava.trim()
+    await loadJavaDefault()
+  }
+
   onMount(() => {
     scanJava()
     load()
@@ -514,7 +521,7 @@
             needed
             hint="pack-java-hint"
             onchange={savePackJava}
-            ondownload={loadJavaDefault}
+            ondownload={reloadPackJava}
           >
             {#snippet status()}{@render badge('pack-java')}{/snippet}
           </JavaPicker>

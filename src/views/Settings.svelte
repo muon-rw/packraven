@@ -269,22 +269,18 @@
     )
   }
 
-  function saveJavaSlotQuiet(major: string, path: string) {
-    if (!settings || !savedSettings) return
-    const next = path.trim()
-    settings.javaByMajor[major] = next
-    savedSettings.javaByMajor[major] = next
+  // The backend saves Java choices itself when you download GraalVM: it chooses GraalVM 21 for
+  // Java 17, and an update moves every setting off the build it replaces.
+  function reloadJavaPaths() {
     saving = trackSave(
       saving.then(async () => {
         try {
           const fresh = await api.getSettings()
-          if (next) fresh.javaByMajor[major] = next
-          else delete fresh.javaByMajor[major]
-          fresh.javaByMajor = cleanJavaByMajor(fresh.javaByMajor)
-          await api.saveSettings(fresh)
+          if (settings) settings.javaByMajor = { ...fresh.javaByMajor }
+          if (savedSettings) savedSettings.javaByMajor = { ...fresh.javaByMajor }
           onchange()
         } catch (error) {
-          saveError = `Couldn't save: ${errorText(error)}`
+          saveError = `Couldn't reload your Java settings: ${errorText(error)}`
         }
       }),
     )
@@ -832,10 +828,7 @@
           defaultPath={javas.scan?.automatic[slot.major] ?? null}
           needed={javas.scan?.needed.includes(Number(slot.major)) ?? false}
           onchange={() => saveJavaSlot(slot.major)}
-          ondownload={(java) => {
-            // The backend only chooses a download for a slot when Automatic wouldn't pick it, like GraalVM 21 for Java 17.
-            if (java.major !== Number(slot.major)) saveJavaSlotQuiet(slot.major, java.path)
-          }}
+          ondownload={reloadJavaPaths}
         >
           {#snippet status()}{@render badge(`java-${slot.major}`)}{/snippet}
         </JavaPicker>

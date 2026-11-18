@@ -2,6 +2,13 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1]
+### Changed
+- Java4shell mitigations:
+- - Auto-update server pack's Java version when they start.
+- - On packs using Java 16+ (Minecraft 1.17+), add `-XX:-UseBASE64Intrinsics` to the server pack's default flags and to test run clients
+- - Prompt to update GraalVM downloaded by packraven when Oracle publishes a newer build
+
 ## [0.5.0] - 2026-11-16
 ### Added
 - In-app discord webhook viewer

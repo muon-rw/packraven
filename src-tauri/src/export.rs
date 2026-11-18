@@ -749,8 +749,14 @@ fn escape_property(value: &str) -> String {
     value.encode_utf16().map(|unit| if unit < 0x80 { char::from(unit as u8).to_string() } else { format!("\\u{unit:04X}") }).collect()
 }
 
+// Pack flags come after the workaround, so a pack can turn the intrinsic back on with -XX:+UseBASE64Intrinsics.
 fn user_jvm_args(pack: &Pack) -> String {
     let mut text = format!("-Xmx{}\n", pack.config.server.memory);
+    if pack.lock.minecraft().is_ok_and(|minecraft| crate::java::needs_java4shell_flag(crate::launch::java_for_minecraft(minecraft).1)) {
+        text.push_str("# We turn off Java's Base64 intrinsic to block Java4Shell (CVE-2026-114938). You can remove the next line once your Java has the fix.\n");
+        text.push_str(crate::java::JAVA4SHELL_FLAG);
+        text.push('\n');
+    }
     for flag in pack.config.server.jvm_args.iter().map(|flag| flag.trim()).filter(|flag| !flag.is_empty()) {
         text.push_str(flag);
         text.push('\n');
@@ -1130,6 +1136,16 @@ mod tests {
         let [(_, ps1), (_, sh)] = downloader_scripts();
         assert!(!sh.contains('\r') && sh.starts_with("#!/usr/bin/env sh\n"));
         assert_eq!(ps1.matches('\n').count(), ps1.matches("\r\n").count());
+    }
+
+    #[test]
+    fn turns_off_base64_intrinsics_only_where_java_has_them() {
+        let args = |minecraft| user_jvm_args(&loader_pack(minecraft, "forge-36.2.39"));
+        assert!(!args("1.16.5").contains("Base64Intrinsics"), "Java 8 won't start with an unknown -XX flag");
+        assert!(args("1.17.1").contains("\n-XX:-UseBASE64Intrinsics\n"));
+        let modern = args("1.21.1");
+        let flags: Vec<&str> = modern.lines().filter(|line| !line.starts_with('#')).collect();
+        assert_eq!(flags, ["-Xmx6G", "-XX:-UseBASE64Intrinsics"]);
     }
 
     #[test]

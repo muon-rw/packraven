@@ -56,6 +56,11 @@
     if (major === 1 && minor >= 18) return '21'
     return null
   })
+  // Mirrors the backend: Minecraft versions on Java 8 don't get the Java4Shell workaround flag.
+  let blocksJava4Shell = $derived.by(() => {
+    const [major, minor] = (minecraft ?? '').split('.').map(Number)
+    return major >= 26 || (major === 1 && minor >= 17)
+  })
   let hostGraalvm = $derived(graalvmChoice === 'auto' ? automaticGraalvm : graalvmChoice === 'exact' ? exactGraalvm.trim() || null : graalvmChoice)
 
   function chooseGraalvm(choice: GraalvmChoice) {
@@ -222,7 +227,7 @@
     <figure>
       <figcaption class="file">user_jvm_args.txt</figcaption>
       <pre><span class="muted"># The loader installer's lines</span>
--Xmx{memoryInvalid ? memory : memoryDraft.trim()}{#each lines(flagsDraft) as flag, i (i)}{'\n'}{flag}{/each}</pre>
+-Xmx{memoryInvalid ? memory : memoryDraft.trim()}{#if blocksJava4Shell}{'\n'}<span class="muted"># Java4Shell workaround</span>{'\n'}-XX:-UseBASE64Intrinsics{/if}{#each lines(flagsDraft) as flag, i (i)}{'\n'}{flag}{/each}</pre>
     </figure>
     {#each scripts as script (script.file)}
       <figure>

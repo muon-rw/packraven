@@ -281,6 +281,12 @@ async fn downloads_graalvm() {
     assert!(java.path.starts_with(&dir));
     let output = std::process::Command::new(&java.path).arg("-version").output().unwrap();
     assert!(output.status.success());
+
+    assert!(!crate::java::outdated_graalvms().await.contains(&25), "we just downloaded Oracle's latest build");
+    let home = java.path.parent().unwrap().parent().unwrap();
+    std::fs::write(home.join("download.sha256"), "an older build").unwrap();
+    assert!(crate::java::outdated_graalvms().await.contains(&25));
+    assert!(crate::java::update_reminder(&java.path).await.is_some());
 }
 
 // Installs an older Apotheosis into a fresh repo, then updates it, which also pulls in its

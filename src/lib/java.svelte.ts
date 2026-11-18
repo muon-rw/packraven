@@ -12,6 +12,8 @@ export const javas = $state({
   error: null as string | null,
   // Keyed by GraalVM version, since Java 17 and Java 21 both download GraalVM 21.
   downloads: {} as Record<number, DownloadProgress>,
+  // GraalVM versions we downloaded that Oracle has since published a newer build of.
+  outdated: [] as number[],
 })
 
 let listening: Promise<unknown> | null = null
@@ -27,11 +29,19 @@ export async function scanJava() {
   try {
     javas.scan = await api.scanJava()
     javas.error = null
+    if (javas.scan.installs.some(isOurGraalvm)) checkForUpdates()
   } catch (error) {
     javas.error = errorText(error)
   } finally {
     javas.scanning = false
   }
+}
+
+export const isOurGraalvm = (java: JavaInstall) => java.source === 'packraven' && java.distribution === 'GraalVM'
+
+// We only learn about updates when online, so a failed check leaves the last answer in place.
+async function checkForUpdates() {
+  javas.outdated = await api.outdatedGraalvms().catch(() => javas.outdated)
 }
 
 const cancelled = new Set<number>()

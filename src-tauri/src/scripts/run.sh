@@ -22,21 +22,51 @@ elif [ -z "$JAVA" ]; then
         aarch64 | arm64) ARCH=aarch64 ;;
         *) echo "Oracle has no GraalVM build for $(uname -m). Install Java $GRAALVM yourself, then write the path to its java executable in java.txt."; exit 1 ;;
     esac
-    if [ ! -x "$JAVA" ]; then
-        echo "Downloading GraalVM $GRAALVM into $GRAALVM_DIR. To use your own Java instead, write its path in java.txt."
-        URL="{{URL_PREFIX}}$OS-${ARCH}_bin.tar.gz"
-        rm -rf "$GRAALVM_DIR" && mkdir -p "$GRAALVM_DIR"
-        if command -v curl > /dev/null 2>&1; then
-            curl -fL "$URL" | tar -xz -C "$GRAALVM_DIR" --strip-components=1
-        elif command -v wget > /dev/null 2>&1; then
-            wget -qO- "$URL" | tar -xz -C "$GRAALVM_DIR" --strip-components=1
+    URL="{{URL_PREFIX}}$OS-${ARCH}_bin.tar.gz"
+    if command -v curl > /dev/null 2>&1; then
+        CHECK="curl -fsL --max-time 20"; FETCH="curl -fL"
+    elif command -v wget > /dev/null 2>&1; then
+        CHECK="wget -qO- -T 20"; FETCH="wget -qO-"
+    else
+        CHECK=""; FETCH=""
+    fi
+
+    # Oracle replaces its latest GraalVM build in place, so we compare the checksum Oracle publishes
+    # with the one we saved when we installed. Offline, we keep using what's installed.
+    LATEST=""
+    if [ -n "$CHECK" ]; then
+        LATEST=$($CHECK "$URL.sha256" 2> /dev/null | cut -d ' ' -f 1)
+    fi
+    INSTALLED=""
+    if [ -f "$GRAALVM_DIR/download.sha256" ]; then
+        INSTALLED=$(cat "$GRAALVM_DIR/download.sha256")
+    fi
+
+    if [ ! -x "$JAVA" ] || { [ -n "$LATEST" ] && [ "$LATEST" != "$INSTALLED" ]; }; then
+        if [ -x "$JAVA" ]; then
+            echo "Updating GraalVM $GRAALVM in $GRAALVM_DIR."
+        else
+            echo "Downloading GraalVM $GRAALVM into $GRAALVM_DIR. To use your own Java instead, write its path in java.txt."
+        fi
+        STAGING="$GRAALVM_DIR.new"
+        rm -rf "$STAGING" && mkdir -p "$STAGING"
+        if [ -n "$FETCH" ]; then
+            $FETCH "$URL" | tar -xz -C "$STAGING" --strip-components=1
         else
             echo "Downloading GraalVM needs curl or wget, and this system has neither."
         fi
-        if [ ! -x "$JAVA" ]; then
-            rm -rf "$GRAALVM_DIR"
-            echo "Couldn't download GraalVM $GRAALVM. Install Java $GRAALVM yourself, then write the path to its java executable in java.txt."
-            exit 1
+        if [ -x "$STAGING${JAVA#"$GRAALVM_DIR"}" ]; then
+            if [ -n "$LATEST" ]; then
+                echo "$LATEST" > "$STAGING/download.sha256"
+            fi
+            rm -rf "$GRAALVM_DIR" && mv "$STAGING" "$GRAALVM_DIR"
+        else
+            rm -rf "$STAGING"
+            if [ ! -x "$JAVA" ]; then
+                echo "Couldn't download GraalVM $GRAALVM. Install Java $GRAALVM yourself, then write the path to its java executable in java.txt."
+                exit 1
+            fi
+            echo "Couldn't update GraalVM $GRAALVM, so the server will start on the version it already has."
         fi
     fi
 fi

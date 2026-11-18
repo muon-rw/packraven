@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
@@ -224,6 +224,15 @@ pub fn automatic(installs: &[JavaInstall], major: u32) -> Option<&JavaInstall> {
     installs.iter().filter(|java| java.major == major).min_by_key(|java| (java.foreign_arch.is_some(), java.source))
 }
 
+// We turn off HotSpot's Base64 intrinsic to block Java4Shell (CVE-2026-114938), on the client and
+// the server, until patched Javas are common. Java 8 has no such intrinsic and refuses to start
+// on an unknown -XX flag, so we only add it for Java 16 and newer.
+pub const JAVA4SHELL_FLAG: &str = "-XX:-UseBASE64Intrinsics";
+
+pub fn needs_java4shell_flag(major: u32) -> bool {
+    major >= 16
+}
+
 // GraalVM 21 runs everything that needs Java 17, and faster than Java 17 does. Oracle's free
 // GraalVM 17 builds also stopped getting updates.
 pub fn graalvm_for(major: u32) -> Option<u32> {
@@ -285,9 +294,8 @@ pub async fn download_graalvm(major: u32, progress: impl Fn(u64, Option<u64>)) -
     }
     let _slot = DownloadSlot(graalvm);
 
-    let url = format!("https://download.oracle.com/graalvm/{graalvm}/latest/graalvm-jdk-{graalvm}_{platform}");
-    let checksum = CLIENT.get(format!("{url}.sha256")).send().await?.error_for_status()?.text().await.context("reading GraalVM's checksum")?;
-    let expected = checksum.split_whitespace().next().context("Oracle didn't list a checksum for GraalVM")?.to_lowercase();
+    let url = latest_url(graalvm, platform);
+    let expected = latest_checksum(graalvm, platform).await?;
 
     tokio::fs::create_dir_all(root).await?;
     let archive = root.join(format!(".graalvm-{graalvm}-download"));
@@ -328,7 +336,85 @@ pub async fn download_graalvm(major: u32, progress: impl Fn(u64, Option<u64>)) -
     .await?;
     let _ = std::fs::remove_file(&archive);
     let _ = std::fs::remove_dir_all(&staging);
-    inspect(JavaSource::Packraven, &home?).context("the GraalVM download has no Java in it")
+    let home = home?;
+    std::fs::write(home.join(CHECKSUM_FILE), &expected)?;
+    inspect(JavaSource::Packraven, &home).context("the GraalVM download has no Java in it")
+}
+
+// Oracle replaces the archive behind its latest URL in place, so we save the checksum of the one
+// we unpacked and compare it with Oracle's to tell when there's a newer build.
+const CHECKSUM_FILE: &str = "download.sha256";
+
+fn latest_url(graalvm: u32, platform: &str) -> String {
+    format!("https://download.oracle.com/graalvm/{graalvm}/latest/graalvm-jdk-{graalvm}_{platform}")
+}
+
+async fn latest_checksum(graalvm: u32, platform: &str) -> Result<String> {
+    let request = CLIENT.get(format!("{}.sha256", latest_url(graalvm, platform))).timeout(std::time::Duration::from_secs(20));
+    let checksum = request.send().await?.error_for_status()?.text().await.context("reading GraalVM's checksum")?;
+    Ok(checksum.split_whitespace().next().context("Oracle didn't list a checksum for GraalVM")?.to_lowercase())
+}
+
+fn downloaded_graalvms() -> Vec<JavaInstall> {
+    let Some(root) = DOWNLOAD_DIR.get() else { return Vec::new() };
+    scan(JavaSource::Packraven, root, 1).into_iter().filter_map(|(source, home)| inspect(source, &home)).filter(|java| java.distribution == "GraalVM").collect()
+}
+
+fn home_of(java: &Path) -> Option<&Path> {
+    java.parent()?.parent()
+}
+
+fn saved_checksum(java: &JavaInstall) -> Option<String> {
+    Some(std::fs::read_to_string(home_of(&java.path)?.join(CHECKSUM_FILE)).ok()?.trim().to_lowercase())
+}
+
+/// Returns the GraalVM versions we downloaded that Oracle has since published a newer build of.
+/// We skip any version whose checksum we can't fetch, so this returns nothing when offline.
+pub async fn outdated_graalvms() -> BTreeSet<u32> {
+    let installs = downloaded_graalvms();
+    let mut outdated = BTreeSet::new();
+    for graalvm in installs.iter().map(|java| java.major).collect::<BTreeSet<_>>() {
+        if has_newer_build(graalvm, &installs).await {
+            outdated.insert(graalvm);
+        }
+    }
+    outdated
+}
+
+async fn has_newer_build(graalvm: u32, installs: &[JavaInstall]) -> bool {
+    let Some(platform) = graalvm_platform() else { return false };
+    let Ok(latest) = latest_checksum(graalvm, platform).await else { return false };
+    !installs.iter().any(|java| java.major == graalvm && saved_checksum(java).as_deref() == Some(latest.as_str()))
+}
+
+/// Returns a reminder to update when `java` is a GraalVM we downloaded and Oracle has a newer build.
+pub async fn update_reminder(java: &Path) -> Option<String> {
+    let installs = downloaded_graalvms();
+    let key = dedupe_key(java);
+    let graalvm = installs.iter().find(|install| dedupe_key(&install.path) == key)?.major;
+    has_newer_build(graalvm, &installs).await.then(|| format!("Oracle has published a newer build of GraalVM {graalvm}, which can include security fixes. Update it under App settings."))
+}
+
+/// Lists the other GraalVMs we downloaded of the same version as `newest`.
+pub fn superseded_by(newest: &JavaInstall) -> Vec<PathBuf> {
+    let key = dedupe_key(&newest.path);
+    downloaded_graalvms().into_iter().filter(|java| java.major == newest.major && dedupe_key(&java.path) != key).map(|java| java.path).collect()
+}
+
+pub fn same_java(a: &Path, b: &Path) -> bool {
+    dedupe_key(a) == dedupe_key(b)
+}
+
+// We rename the folder before deleting it, since Windows refuses the rename while a test run still
+// uses this Java, and deleting it in place would leave half a JDK behind.
+pub fn remove_download(java: &Path) -> Result<()> {
+    let root = DOWNLOAD_DIR.get().context("packraven has no folder to download Java into")?;
+    let home = home_of(java).context("not a Java executable")?;
+    let folder = home.strip_prefix(root).ok().and_then(|inside| inside.components().next()).context("packraven didn't download this Java")?;
+    let folder = root.join(folder);
+    let doomed = root.join(format!(".removing-{}", folder.file_name().context("not a Java folder")?.to_string_lossy()));
+    std::fs::rename(&folder, &doomed).with_context(|| format!("moving {} aside", folder.display()))?;
+    std::fs::remove_dir_all(&doomed).with_context(|| format!("deleting {}", doomed.display()))
 }
 
 // Oracle's archives hold one folder named after the exact version, like graalvm-jdk-21.0.9+7.1, so
@@ -388,6 +474,32 @@ mod tests {
         assert_eq!(distribution(&release(&[("IMPLEMENTOR", "Oracle Corporation"), ("JAVA_RUNTIME_VERSION", "25.0.2+10-LTS-jvmci-b01")])), "GraalVM");
         assert_eq!(distribution(&release(&[("IMPLEMENTOR", "Azul Systems, Inc."), ("IMPLEMENTOR_VERSION", "Zulu21.30+15-CA")])), "Zulu");
         assert_eq!(distribution(&release(&[])), "OpenJDK");
+    }
+
+    // GraalVM 99 keeps this test clear of real downloads when the live tests share DOWNLOAD_DIR.
+    #[test]
+    fn removes_the_builds_an_update_replaces() {
+        let root = DOWNLOAD_DIR.get_or_init(|| std::env::temp_dir().join(format!("packraven-java-{}", std::process::id())));
+        let fake = |version: &str| {
+            let home = root.join(format!("graalvm-jdk-{version}"));
+            std::fs::create_dir_all(home.join("bin")).unwrap();
+            std::fs::write(home.join("release"), format!("JAVA_VERSION=\"{version}\"\nGRAALVM_VERSION=\"{version}\"\n")).unwrap();
+            std::fs::write(executable(&home), "").unwrap();
+            inspect(JavaSource::Packraven, &home).unwrap()
+        };
+        let (old, new) = (fake("99.0.1"), fake("99.0.2"));
+        std::fs::write(home_of(&new.path).unwrap().join(CHECKSUM_FILE), "ABC\n").unwrap();
+        assert_eq!(saved_checksum(&new).as_deref(), Some("abc"));
+        assert_eq!(saved_checksum(&old), None);
+
+        let superseded = superseded_by(&new);
+        assert_eq!(superseded.len(), 1);
+        assert!(same_java(&superseded[0], &old.path));
+        remove_download(&superseded[0]).unwrap();
+        assert!(!root.join("graalvm-jdk-99.0.1").exists());
+        assert!(superseded_by(&new).is_empty());
+        remove_download(&new.path).unwrap();
+        assert!(remove_download(Path::new("/elsewhere/jdk/bin/java")).is_err(), "only removes what packraven downloaded");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.5.3]
+## [0.5.3] - 2026-11-19
 ### Added
 - Many features for the Browse tab:
 - - Added support for gallery view, website, wiki, and discord/source links if mods have them
@@ -308,7 +308,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 - Mod updates skip jars Minecraft is currently holding open instead of stopping partway
 - Failed downloads will retry up to three times
 
-[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/muon-rw/packraven/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/muon-rw/packraven/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/muon-rw/packraven/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/muon-rw/packraven/compare/v0.4.9...v0.5.0

@@ -457,7 +457,7 @@
   }
 
   .mod-list-notice > p {
-    max-width: 65ch;
+    max-width: 56ch;
   }
 
   /* Notice caps the height of its lists for plain file names, but we show at most a few of these
@@ -511,7 +511,7 @@
   }
 
   .skew {
-    max-width: 65ch;
+    max-width: 56ch;
     margin: 2px 0;
   }
 

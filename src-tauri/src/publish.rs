@@ -302,6 +302,30 @@ pub fn tag_exists(pack: &Pack, version: &str) -> bool {
     git::run(&pack.dir, &["rev-parse", "-q", "--verify", &format!("refs/tags/{}", release_tag(version))]).is_ok()
 }
 
+const NO_CHAT_REPORTS_CF_ID: u64 = 634_062;
+const NO_CHAT_REPORTS_MR_ID: &str = "qQyHxfxd";
+
+fn ships_no_chat_reports_to_curseforge(pack: &Pack) -> bool {
+    let excluded = |path: &str| path.ends_with(".disabled") || pack.config.curseforge.exclude.iter().any(|p| p == path);
+    let is_ncr_path = |path: &str| {
+        path.strip_prefix("mods/")
+            .is_some_and(|name| name.to_ascii_lowercase().starts_with("nochatreports"))
+    };
+    let in_lock = pack.lock.files.iter().any(|e| {
+        !excluded(&e.path)
+            && (e.curseforge_project() == Some(NO_CHAT_REPORTS_CF_ID)
+                || e.modrinth.as_ref().is_some_and(|m| m.project_id == NO_CHAT_REPORTS_MR_ID)
+                || is_ncr_path(&e.path))
+    });
+    if in_lock {
+        return true;
+    }
+    git::run(&pack.dir, &["ls-files", "-z", "--", "mods/*.jar"]).is_ok_and(|out| {
+        out.split('\0')
+            .any(|path| !path.is_empty() && !excluded(path) && is_ncr_path(path) && pack.dir.join(path).is_file())
+    })
+}
+
 pub fn preflight(pack: &Pack, cache: &MetadataCache, version: &str, unknown: &[String], modrinth_error: Option<&str>, identity: &Identity) -> Vec<String> {
     let mut problems = Vec::new();
     let config = &pack.config;
@@ -335,6 +359,9 @@ pub fn preflight(pack: &Pack, cache: &MetadataCache, version: &str, unknown: &[S
         paths => problems.push(format!("{} files aren't on {hosts}. In Changes, add them to Git or move them to the trash.", paths.len())),
     }
     problems.extend(export::duplicate_mods_problem(pack));
+    if config.targets_curseforge() && ships_no_chat_reports_to_curseforge(pack) {
+        problems.push("No Chat Reports is in the pack, and CurseForge rejects modpacks that include it. Remove it in Mods before publishing to CurseForge.".into());
+    }
     // The commit comes after the upload, which you can't take back, so we check git can make it first.
     if !identity.is_usable(&pack.dir) {
         problems.push("Set your commit name and email in App settings.".into());
@@ -951,6 +978,104 @@ pub async fn upload_release_to_modrinth(pack: &Pack, pack_data: &Path, version: 
     Ok(message)
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbortReleaseResult {
+    pub version: String,
+    pub tag: String,
+    pub local_tag_deleted: bool,
+    pub remote_tag_deleted: bool,
+    pub remote_tag_warning: Option<String>,
+    pub notes_restored: bool,
+}
+
+fn extract_notes(rendered: &str) -> &str {
+    if rendered.starts_with("## Mod changes") {
+        ""
+    } else if let Some((notes, _)) = rendered.split_once("\n\n## Mod changes") {
+        notes
+    } else if let Some((notes, _)) = rendered.split_once("\n## Mod changes") {
+        notes
+    } else {
+        rendered
+    }
+}
+
+fn delete_remote_tag(dir: &Path, tag: &str) -> (bool, Option<String>) {
+    let branch = git::branch(dir).unwrap_or_default();
+    let remote = git::run(dir, &["config", "--get", &format!("branch.{branch}.remote")])
+        .ok()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
+        .unwrap_or_else(|| "origin".into());
+    if git::run(dir, &["remote", "get-url", &remote]).is_err() {
+        return (false, None);
+    }
+    let ref_name = format!("refs/tags/{tag}");
+    match crate::remote::run(dir, &["ls-remote", "--tags", &remote, &ref_name]) {
+        Ok(out) if out.trim().is_empty() => (false, None),
+        Ok(_) => match crate::remote::run(dir, &["push", "--delete", &remote, tag]) {
+            Ok(_) => (true, None),
+            Err(error) => (false, Some(format!("Couldn't remove tag {tag} from {remote}: {error:#}"))),
+        },
+        Err(error) => (false, Some(format!("Couldn't check whether {remote} has tag {tag}: {error:#}"))),
+    }
+}
+
+/// Clears a release's git tag, record in releases.json, and cached build so you can publish the same version fresh.
+pub async fn abort_release(pack: &Pack, pack_data: &Path, version: &str) -> Result<AbortReleaseResult> {
+    let version = version.trim();
+    if version.is_empty() {
+        bail!("No version given.");
+    }
+    let tag = release_tag(version);
+    let releases_path = pack_data.join("releases.json");
+    let mut releases = load_releases(&releases_path);
+    if let Some(index) = releases.iter().position(|r| r.version == version) {
+        let removed = releases.remove(index);
+        save_releases(&releases_path, &releases)?;
+        if !removed.announcement_images.is_empty() && crate::discord::load_pending_images(pack_data).is_empty() {
+            let _ = crate::discord::save_pending_images(pack_data, &removed.announcement_images);
+        }
+    }
+    crate::discord::clear_release_images(pack_data, version);
+    let _ = std::fs::remove_dir_all(pack_data.join("builds").join(version));
+
+    let archive_path = pack.dir.join(CHANGELOG_ARCHIVE).join(format!("{version}.md"));
+    let mut notes_restored = false;
+    if archive_path.exists() {
+        if changelog::read_notes(pack).trim().is_empty()
+            && let Ok(archived) = std::fs::read_to_string(&archive_path)
+        {
+            let notes = extract_notes(&archived).trim();
+            if !notes.is_empty() {
+                changelog::write_notes(pack, &format!("{notes}\n"))?;
+                notes_restored = true;
+            }
+        }
+        let _ = std::fs::remove_file(&archive_path);
+    }
+
+    let mut local_tag_deleted = false;
+    if tag_exists(pack, version) {
+        git::run(&pack.dir, &["tag", "-d", &tag])?;
+        local_tag_deleted = true;
+    }
+
+    let dir = pack.dir.clone();
+    let tag_for_remote = tag.clone();
+    let (remote_tag_deleted, remote_tag_warning) = tokio::task::spawn_blocking(move || delete_remote_tag(&dir, &tag_for_remote)).await?;
+
+    Ok(AbortReleaseResult {
+        version: version.to_string(),
+        tag,
+        local_tag_deleted,
+        remote_tag_deleted,
+        remote_tag_warning,
+        notes_restored,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{load_releases, release_tag, upload_names, version_of_tag, UploadNames};
@@ -1069,6 +1194,86 @@ mod tests {
         assert!(cf.unsent_server_pack.is_none());
         assert!(!cf.server_pack_uploaded_by_you);
         assert!(cf.last_upload.is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extract_notes_strips_mod_changes_section() {
+        assert_eq!(super::extract_notes("Big fix\n\n## Mod changes\n\n### Added\n- Foo\n"), "Big fix");
+        assert_eq!(super::extract_notes("## Mod changes\n\n### Added\n- Foo\n"), "");
+        assert_eq!(super::extract_notes("Just notes\n"), "Just notes\n");
+    }
+
+    #[tokio::test]
+    async fn abort_release_clears_tag_record_builds_and_restores_notes() {
+        let root = std::env::temp_dir().join(format!("packraven-abort-release-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pack_dir = root.join("pack");
+        let pack_data = root.join("data");
+        std::fs::create_dir_all(pack_dir.join("changelogs")).unwrap();
+        std::fs::create_dir_all(pack_data.join("builds").join("0.3.1")).unwrap();
+        std::fs::write(pack_dir.join("packraven.toml"), "name = \"Test\"\n").unwrap();
+        std::fs::write(pack_dir.join("mods.lock.json"), r#"{"files":[]}"#).unwrap();
+        std::fs::write(pack_dir.join("changelog.md"), "").unwrap();
+        std::fs::write(pack_dir.join("changelogs").join("0.3.1.md"), "Fixed crash\n\n## Mod changes\n\n### Added\n- Foo\n").unwrap();
+        std::fs::write(pack_data.join("builds").join("0.3.1").join("client.zip"), b"zip").unwrap();
+        std::fs::write(
+            pack_data.join("releases.json"),
+            r#"[{"version":"0.3.0","publishedAt":"2026-11-01T00:00:00Z"},{"version":"0.3.1","publishedAt":"2026-11-02T00:00:00Z"}]"#,
+        )
+        .unwrap();
+
+        crate::git::run(&pack_dir, &["init"]).unwrap();
+        crate::git::run(&pack_dir, &["config", "user.name", "Test"]).unwrap();
+        crate::git::run(&pack_dir, &["config", "user.email", "test@example.com"]).unwrap();
+        crate::git::run(&pack_dir, &["add", "-A"]).unwrap();
+        crate::git::run(&pack_dir, &["commit", "-m", "Release 0.3.1"]).unwrap();
+        crate::git::run(&pack_dir, &["tag", "-a", "v0.3.1", "-m", "Release 0.3.1"]).unwrap();
+
+        let pack = crate::pack::Pack::open(&pack_dir).unwrap();
+        assert!(super::tag_exists(&pack, "0.3.1"));
+
+        let result = super::abort_release(&pack, &pack_data, "0.3.1").await.unwrap();
+        assert_eq!(result.tag, "v0.3.1");
+        assert!(result.local_tag_deleted);
+        assert!(!result.remote_tag_deleted);
+        assert!(result.remote_tag_warning.is_none());
+        assert!(result.notes_restored);
+        assert!(!super::tag_exists(&pack, "0.3.1"));
+        assert_eq!(load_releases(&pack_data.join("releases.json")).iter().map(|r| r.version.as_str()).collect::<Vec<_>>(), ["0.3.0"]);
+        assert!(!pack_data.join("builds").join("0.3.1").exists());
+        assert!(!pack_dir.join("changelogs").join("0.3.1.md").exists());
+        assert_eq!(std::fs::read_to_string(pack_dir.join("changelog.md")).unwrap(), "Fixed crash\n");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn detects_no_chat_reports_unless_disabled_or_excluded_from_curseforge() {
+        let dir = std::env::temp_dir().join(format!("packraven-ncr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("packraven.toml"), "name = \"Test\"\n").unwrap();
+        std::fs::write(dir.join("mods.lock.json"), r#"{"files":[]}"#).unwrap();
+        let mut pack = crate::pack::Pack::open(&dir).unwrap();
+
+        assert!(!super::ships_no_chat_reports_to_curseforge(&pack));
+
+        pack.lock.files.push(crate::pack::LockEntry::curseforge(
+            "mods/NoChatReports-NEOFORGE-1.21.1-v2.9.1.jar".into(),
+            "abc".into(),
+            10,
+            crate::pack::CurseforgeFile { project_id: 634_062, file_id: 1, url: String::new() },
+        ));
+        assert!(super::ships_no_chat_reports_to_curseforge(&pack));
+
+        pack.config.curseforge.exclude.push("mods/NoChatReports-NEOFORGE-1.21.1-v2.9.1.jar".into());
+        assert!(!super::ships_no_chat_reports_to_curseforge(&pack));
+
+        pack.config.curseforge.exclude.clear();
+        pack.lock.files[0].path.push_str(".disabled");
+        assert!(!super::ships_no_chat_reports_to_curseforge(&pack));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

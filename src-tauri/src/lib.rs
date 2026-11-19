@@ -229,6 +229,7 @@ pub fn run() {
             commands::mark_server_pack_uploaded,
             commands::replace_curseforge_file,
             commands::release_attention,
+            commands::abort_release,
             commands::set_override_choice,
             commands::modrinth_project_title,
             commands::look_up_override_candidates,

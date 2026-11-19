@@ -1015,6 +1015,13 @@ pub async fn release_attention(state: State<'_, AppState>, version: String) -> C
     Ok(None)
 }
 
+#[tauri::command]
+pub async fn abort_release(state: State<'_, AppState>, version: String) -> CmdResult<publish::AbortReleaseResult> {
+    let pack = state.pack().map_err(err)?;
+    let pack_data = state.pack_data();
+    publish::abort_release(&pack, &pack_data, &version).await.map_err(err)
+}
+
 // CurseForge's API answers for files under review too, so a missing file was deleted, unless it went
 // up minutes ago and CurseForge is still processing it. A failed lookup tells us nothing either way.
 fn describe_file(lookup: &Result<Option<curseforge::CfFile>>, recent: bool) -> (String, Option<curseforge::FileState>) {

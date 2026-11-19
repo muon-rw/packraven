@@ -2,6 +2,12 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2]
+### Changed
+- Show progress of client/server pack zipping during publish
+- Block/warn publishing when a curseforge upload would contain NoChatReports
+- Improve responsiveness when a published pack is rejected
+
 ## [0.5.1] - 2026-11-18
 ### Changed
 - Prompt to input the download link after you manually uploaded the server pack, so it can be tracked instantly

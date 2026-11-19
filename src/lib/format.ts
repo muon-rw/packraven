@@ -559,3 +559,20 @@ export function curseforgeProblem(state: FileState | null, version: string, file
       return null
   }
 }
+
+export function isGoneOnCurseforge(state: FileState | null | undefined): boolean {
+  return state === 'rejected' || state === 'malwareDetected' || state === 'failedPublishing' || state === 'deleted'
+}
+
+export function abortReleaseConfirmation(version: string, liveSites: string[]): { title: string; message: string; okLabel: string } {
+  const tag = releaseTag(version)
+  const lines = [
+    `This deletes git tag ${tag} locally (and from your remote if it was pushed), removes ${version} from packraven's release list, and restores its changelog notes if your current release notes are empty. Your git commits stay intact.`,
+    liveSites.length ? `packraven can't delete files already uploaded to ${liveSites.join(' or ')}, so delete them there if you don't want two copies.` : null,
+  ].filter(Boolean)
+  return {
+    title: `Abort ${version} and start over`,
+    message: lines.join('\n\n'),
+    okLabel: `Abort ${version}`,
+  }
+}

@@ -833,7 +833,7 @@
     {:else if pane === 'publish'}
       <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFromWithAnchor('pack', index)} onreleases={() => showFrom('releases', index)} onrun={() => openBesideIfRoom('test', index)} onappsettings={() => showFromWithAnchor('settings', index)} onserver={() => showFrom('server', index)} />
     {:else if pane === 'releases'}
-      <Releases onsettings={() => showFromWithAnchor('pack', index)} onappsettings={() => showFromWithAnchor('settings', index)} />
+      <Releases onsettings={() => showFromWithAnchor('pack', index)} onappsettings={() => showFromWithAnchor('settings', index)} onchange={refresh} onpublish={() => showFrom('publish', index)} />
     {:else if pane === 'pack' && packs?.active}
       <PackSettings dir={packs.active} name={overview?.name ?? 'this pack'} onserver={() => showFrom('server', index)} onappsettings={() => showFromWithAnchor('settings', index)} onchange={refresh} onremoved={() => { only('mods'); refresh() }} />
     {:else}

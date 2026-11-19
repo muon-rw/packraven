@@ -458,6 +458,15 @@ export interface PublishedTo {
   modrinthError: string | null
 }
 
+export interface AbortReleaseResult {
+  version: string
+  tag: string
+  localTagDeleted: boolean
+  remoteTagDeleted: boolean
+  remoteTagWarning: string | null
+  notesRestored: boolean
+}
+
 export type OverrideChoice = 'ship' | 'leaveOut'
 
 export type HooksState = 'missing' | 'outdated' | 'current'
@@ -846,6 +855,7 @@ export const api = {
   markServerPackUploaded: (version: string, link?: string | null) => invoke<number | null>('mark_server_pack_uploaded', { version, link: link ?? null }),
   replaceCurseforgeFile: (version: string, file: PackFile) => invoke<void>('replace_curseforge_file', { version, file }),
   releaseAttention: (version: string) => invoke<{ file: PackFile; state: FileState } | null>('release_attention', { version }),
+  abortRelease: (version: string) => invoke<AbortReleaseResult>('abort_release', { version }),
   setOverrideChoice: (platform: Platform, paths: string[], choice: OverrideChoice | null) => invoke<void>('set_override_choice', { platform, paths, choice }),
   overrideChoices: (platform: Platform) => invoke<OverrideChoices>('override_choices', { platform }),
   lookUpOverrideCandidates: () => invoke<void>('look_up_override_candidates'),

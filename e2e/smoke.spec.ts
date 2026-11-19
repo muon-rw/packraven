@@ -1303,3 +1303,15 @@ test('Publish jumps to Discord settings and footer, and condenses mod updates wh
   const embed = page.getByRole('region', { name: /^Preview of the Discord post for / }).getByRole('article')
   await expect(embed).toContainText(/Updated \d+ mods?/)
 })
+
+test('Releases can abort a release and clear its tag', async ({ page }) => {
+  await openApp(page, 'releases', 'dirty')
+  page.once('dialog', (dialog) => {
+    expect(dialog.message()).toContain('deletes git tag v0.1.1')
+    dialog.accept()
+  })
+  await page.getByRole('button', { name: 'Abort release 0.1.1' }).click()
+  await expect(page.getByText(/Aborted 0\.1\.1 \(deleted tag v0\.1\.1\)/)).toBeVisible()
+  await expect(page.locator('.aborted')).toBeFocused()
+  await expect(page.getByRole('button', { name: 'Abort release 0.1.1' })).toHaveCount(0)
+})

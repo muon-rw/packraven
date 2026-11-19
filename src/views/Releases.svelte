@@ -3,7 +3,7 @@
   import { listen } from '@tauri-apps/api/event'
   import { ask } from '@tauri-apps/plugin-dialog'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, changelogFitNote, errorText, type FileState, type PackFile, type ReleaseStatus, type UpdateCheckerSetup, type UpdateType } from '../lib/api'
+  import { api, changelogFitNote, errorText, type AbortReleaseResult, type FileState, type PackFile, type ReleaseStatus, type UpdateCheckerSetup, type UpdateType } from '../lib/api'
   import ServerPackSteps from '../components/ServerPackSteps.svelte'
   import ServerPackTagDialog from '../components/ServerPackTagDialog.svelte'
   import ServerPackTagStep from '../components/ServerPackTagStep.svelte'
@@ -14,9 +14,9 @@
   import { SvelteSet } from 'svelte/reactivity'
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import { appSettingsView, nav, packSettingsView } from '../lib/nav.svelte'
-  import { asReleaseType, asUpdateType, curseforgeProblem, repoName, updateTypeLabel } from '../lib/format'
+  import { abortReleaseConfirmation, asReleaseType, asUpdateType, curseforgeProblem, isGoneOnCurseforge, releaseTag, repoName, updateTypeLabel } from '../lib/format'
 
-  let { onsettings, onappsettings }: { onsettings: () => void; onappsettings: () => void } = $props()
+  let { onsettings, onappsettings, onchange, onpublish }: { onsettings: () => void; onappsettings: () => void; onchange?: () => void; onpublish?: () => void } = $props()
 
   let releases: ReleaseStatus[] = $state([])
   let releasesError: string | null = $state(null)
@@ -48,6 +48,41 @@
   let replaced = $state<{ text: string; serverPage: string | null } | null>(null)
   let replacedNotice = $state<HTMLElement>()
   let tagModalPage = $state<string | null>(null)
+  let aborting = $state<string | null>(null)
+  let aborted = $state<AbortReleaseResult | null>(null)
+  let abortedNotice = $state<HTMLElement>()
+  let abortError = $state<string | null>(null)
+  let abortErrorNotice = $state<HTMLElement>()
+
+  async function abortRelease(release: ReleaseStatus) {
+    const { version } = release
+    const cfLive = !!release.curseforge && !isGoneOnCurseforge(release.curseforge.state)
+    const liveSites = [cfLive && 'CurseForge', release.modrinth && 'Modrinth'].filter((s): s is string => !!s)
+    const dialog = abortReleaseConfirmation(version, liveSites)
+    const confirmed = await ask(dialog.message, {
+      title: dialog.title,
+      kind: 'warning',
+      okLabel: dialog.okLabel,
+      cancelLabel: 'Cancel',
+    })
+    if (!confirmed) return
+    aborting = version
+    aborted = null
+    abortError = null
+    try {
+      aborted = await api.abortRelease(version)
+      releases = releases.filter((r) => r.version !== version)
+      onchange?.()
+      await tick()
+      abortedNotice?.focus()
+    } catch (e) {
+      abortError = errorText(e)
+      await tick()
+      abortErrorNotice?.focus()
+    } finally {
+      aborting = null
+    }
+  }
 
   type Problem = { title: string; detail: string; before: string[]; deleteFirst: boolean; waitable: boolean }
 
@@ -279,11 +314,13 @@
   // Modrinth lists a version as soon as we upload it, so only CurseForge's review holds a release back.
   function holdups(release: ReleaseStatus): string[] {
     const { curseforge, modrinth } = release
+    const problems = fileProblems(release)
+    const clientProblem = problems.some((p) => p.file === 'client')
     return [
       curseforge && fileTone(curseforge.state) !== 'ok' ? `CurseForge still lists the file as "${curseforge.status}"` : null,
-      release.serverPackMissing ? "its server pack isn't on CurseForge yet" : null,
-      curseforge && !release.serverPackMissing && curseforge.serverPackLinked === false ? "its server pack isn't tagged on CurseForge yet" : null,
-      curseforge && fileProblems(release).some((p) => p.file === 'server') ? 'CurseForge has a problem with its server pack' : null,
+      release.serverPackMissing && !clientProblem ? "its server pack isn't on CurseForge yet" : null,
+      curseforge && !release.serverPackMissing && !clientProblem && curseforge.serverPackLinked === false ? "its server pack isn't tagged on CurseForge yet" : null,
+      curseforge && problems.some((p) => p.file === 'server') ? 'CurseForge has a problem with its server pack' : null,
       release.modrinthMissing ? "it isn't on Modrinth yet" : null,
       modrinth && statusTone(modrinth.status) !== 'ok' ? `Modrinth lists it as "${modrinth.status}"` : null,
     ].filter((reason) => reason !== null)
@@ -446,7 +483,23 @@
 
   {#if releasesError}<p class="failed" role="alert">{releasesError}</p>{/if}
   {#if discordError}<p class="failed" role="alert">{discordError}</p>{/if}
+  {#if abortError}
+    <div class="aborted" tabindex="-1" bind:this={abortErrorNotice}>
+      <Notice tone="error"><p>{abortError}</p></Notice>
+    </div>
+  {/if}
   <p class="visually-hidden" role="status">{checkerAnnouncement}</p>
+  {#if aborted}
+    <div class="aborted" tabindex="-1" bind:this={abortedNotice}>
+      <Notice tone={aborted.remoteTagWarning ? 'warn' : 'ok'} live={false}>
+        <p role="status">
+          Aborted {aborted.version}{#if aborted.localTagDeleted}{' '}(deleted tag <span class="file">{aborted.tag}</span>{aborted.remoteTagDeleted ? ' locally and on the remote' : ''}){/if}{#if aborted.notesRestored}{' '}and restored its changelog notes{/if}.
+          {#if onpublish}<button class="link" onclick={onpublish}>Open Publish</button>{/if}
+        </p>
+        {#if aborted.remoteTagWarning}<p class="muted">{aborted.remoteTagWarning}</p>{/if}
+      </Notice>
+    </div>
+  {/if}
   <!-- The problem notice you acted on goes away, so this takes its place and takes focus. -->
   {#if replaced}
     <div class="replaced" tabindex="-1" bind:this={replacedNotice}>
@@ -472,10 +525,15 @@
       </thead>
       <tbody>
         {#each [...releases].reverse() as release (release.version)}
+          {@const problems = fileProblems(release)}
+          {@const clientProblem = problems.some((p) => p.file === 'client')}
           <tr>
             <td>
               <span class="file">{release.version}</span>
               <span class="published muted"><span class="visually-hidden">Published </span>{new Date(release.publishedAt).toLocaleDateString()}</span>
+              <button class="ghost abort-row" class:busy={aborting === release.version} aria-busy={aborting === release.version} disabled={aborting !== null} onclick={() => abortRelease(release)}>
+                {aborting === release.version ? 'Aborting' : 'Abort'}<span class="visually-hidden"> release {release.version}</span>
+              </button>
             </td>
             {#if showCurseforge}
               <td>
@@ -487,7 +545,7 @@
                     <dt>Server pack</dt>
                     <dd class="server-cell">
                       <!-- A missing server pack waits on you, not on CurseForge's review. -->
-                      <span class="chip {release.serverPackMissing ? 'fail' : fileTone(curseforge.serverState)}">{curseforge.serverStatus}</span>
+                      <span class="chip {release.serverPackMissing && !clientProblem ? 'fail' : fileTone(curseforge.serverState)}">{curseforge.serverStatus}</span>
                       {#if curseforge.serverPackLinked === false}
                         <span class="untagged small">
                           <span class="untagged-label">Not tagged as a server pack</span>{#if curseforge.serverPage} · <a href={curseforge.serverPage} onclick={(e) => { e.preventDefault(); openUrl(curseforge.serverPage!) }}>Tag on CurseForge<span class="visually-hidden"> ({release.version} server pack)</span></a>{/if}
@@ -578,7 +636,6 @@
               {/if}
             </td>
           </tr>
-          {@const problems = fileProblems(release)}
           {#each problems as { file, page, found } (file)}
             {@const key = `${release.version}:${file}`}
             {@const label = `${release.version} ${file} pack`}
@@ -624,6 +681,14 @@
                       </svelte:element>
                       {#if release.packChanged}<p class="muted small">Your mods changed since {release.version} shipped, so a new server pack won't match the client pack.</p>{/if}
                       {#if replaceErrors[key]}<p class="failed small" role="alert">{replaceErrors[key]}</p>{/if}
+                      {#if file === 'client'}
+                        <p class="muted small">
+                          Need to change the pack or release notes instead of keeping tag <span class="file">{releaseTag(release.version)}</span>?{' '}
+                          <button class="link danger-link" aria-busy={aborting === release.version} disabled={aborting !== null} onclick={() => abortRelease(release)}>
+                            {aborting === release.version ? 'Aborting' : `Abort ${release.version} and start over`}
+                          </button>.
+                        </p>
+                      {/if}
                       {#if found.waitable}<p><button class="link" onclick={() => setWaiting(release, file, true)}>Keep waiting<span class="visually-hidden"> for the {label}</span></button></p>{/if}
                     </Notice>
                   </section>
@@ -768,6 +833,28 @@
   .published {
     display: block;
     font-size: var(--step--1);
+  }
+
+  .abort-row {
+    display: block;
+    margin: 4px 0 0 -8px;
+    color: var(--muted);
+  }
+
+  .abort-row:hover:not(:disabled) {
+    color: var(--fail);
+  }
+
+  .danger-link {
+    color: var(--fail);
+  }
+
+  .danger-link:hover:not(:disabled) {
+    color: var(--fail);
+  }
+
+  .aborted:focus {
+    outline: none;
   }
 
   .statuses {

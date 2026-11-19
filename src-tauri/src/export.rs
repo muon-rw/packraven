@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -237,12 +237,67 @@ fn options() -> SimpleFileOptions {
     SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true)
 }
 
-fn add_file(zip: &mut ZipWriter<File>, name: &str, source: &Path, executable: bool) -> Result<()> {
+struct ZipProgress<'a> {
+    verb: &'static str,
+    total_bytes: u64,
+    written_bytes: u64,
+    total_files: usize,
+    written_files: usize,
+    last_tenth: u64,
+    log: &'a Log,
+}
+
+impl<'a> ZipProgress<'a> {
+    fn new(verb: &'static str, total_files: usize, total_bytes: u64, log: &'a Log) -> Self {
+        Self { verb, total_bytes, written_bytes: 0, total_files, written_files: 0, last_tenth: 0, log }
+    }
+
+    fn record_bytes(&mut self, bytes: u64) {
+        self.written_bytes = self.written_bytes.saturating_add(bytes);
+        if self.total_bytes == 0 {
+            return;
+        }
+        let capped = self.written_bytes.min(self.total_bytes);
+        let tenth = (capped * 10 / self.total_bytes).min(9);
+        if tenth > self.last_tenth {
+            self.last_tenth = tenth;
+            self.log.info(format!("{} {}% ({} of {})", self.verb, tenth * 10, http::size_text(capped), http::size_text(self.total_bytes)));
+        }
+    }
+
+    fn finish_file(&mut self) {
+        self.written_files += 1;
+        if self.total_bytes > 0 || self.total_files == 0 {
+            return;
+        }
+        let tenth = ((self.written_files.min(self.total_files) as u64) * 10 / (self.total_files as u64)).min(9);
+        if tenth > self.last_tenth {
+            self.last_tenth = tenth;
+            self.log.info(format!("{} {}% ({} of {} files)", self.verb, tenth * 10, self.written_files, self.total_files));
+        }
+    }
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map_or(0, |m| m.len())
+}
+
+fn add_file(zip: &mut ZipWriter<File>, name: &str, source: &Path, executable: bool, progress: &mut ZipProgress<'_>) -> Result<()> {
     let already_compressed = name.ends_with(".jar") || name.ends_with(".zip");
     let options = if already_compressed { options().compression_method(CompressionMethod::Stored) } else { options() };
     let options = if executable { options.unix_permissions(0o755) } else { options };
     zip.start_file(name, options)?;
-    std::io::copy(&mut File::open(source).with_context(|| format!("reading {}", source.display()))?, zip)?;
+    let mut reader = File::open(source).with_context(|| format!("reading {}", source.display()))?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        zip.write_all(&buf[..read])?;
+        progress.record_bytes(read as u64);
+    }
+    progress.finish_file();
     Ok(())
 }
 
@@ -281,6 +336,12 @@ pub fn client_export(pack: &Pack, cache: &MetadataCache, version: &str, out_dir:
     let kept_off = literal_paths(&pack.config.curseforge.exclude);
     let left_out = globs(&kept_off)?;
     let overrides = override_files(pack, &[server_pack_sources(), kept_off].concat())?;
+    let extra_jars: Vec<&LockEntry> = only_on_modrinth(pack).filter(|e| !left_out.is_match(&e.path)).collect();
+    let total_files = overrides.len() + extra_jars.len();
+    let total_bytes: u64 = overrides.iter().map(|f| file_size(&pack.dir.join(f))).sum::<u64>()
+        + extra_jars.iter().map(|e| file_size(&pack.dir.join(&e.path))).sum::<u64>();
+    log.info(format!("Building the client pack ({} CurseForge files, {total_files} override files, {})", files.len(), http::size_text(total_bytes)));
+    let mut progress = ZipProgress::new("Packed", total_files, total_bytes, log);
     let mut zip = ZipWriter::new(File::create(&path)?);
     zip.start_file("manifest.json", options())?;
     zip.write_all(serde_json::to_string_pretty(&manifest)?.as_bytes())?;
@@ -288,14 +349,17 @@ pub fn client_export(pack: &Pack, cache: &MetadataCache, version: &str, out_dir:
         let name = format!("overrides/{file}");
         match pack.config.export.properties.get(file) {
             Some(forced) => {
+                let bytes = force_properties(&std::fs::read_to_string(pack.dir.join(file))?, forced);
                 zip.start_file(name, options())?;
-                zip.write_all(force_properties(&std::fs::read_to_string(pack.dir.join(file))?, forced).as_bytes())?;
+                zip.write_all(bytes.as_bytes())?;
+                progress.record_bytes(file_size(&pack.dir.join(file)));
+                progress.finish_file();
             }
-            None => add_file(&mut zip, &name, &pack.dir.join(file), false)?,
+            None => add_file(&mut zip, &name, &pack.dir.join(file), false, &mut progress)?,
         }
     }
-    for entry in only_on_modrinth(pack).filter(|e| !left_out.is_match(&e.path)) {
-        add_file(&mut zip, &format!("overrides/{}", entry.path), &pack.dir.join(&entry.path), false)?;
+    for entry in extra_jars {
+        add_file(&mut zip, &format!("overrides/{}", entry.path), &pack.dir.join(&entry.path), false, &mut progress)?;
     }
     zip.finish()?;
     log.info(format!("Client export: {} CurseForge files, {} override files", files.len(), overrides.len()));
@@ -352,10 +416,17 @@ pub fn modrinth_export(pack: &Pack, sides: &[ModSide], cache: &MetadataCache, ve
 
     std::fs::create_dir_all(out_dir)?;
     let path = out_dir.join(pack.modrinth_pack_name(version));
+    let overrides = override_files(pack, &[server_pack_sources(), literal_paths(&pack.config.modrinth.exclude)].concat())?;
+    let has_server_icon = git::tracked_files(&pack.dir)?.iter().any(|f| f == SERVER_ICON);
+    let total_files = overrides.len() + from_disk.len() + usize::from(has_server_icon);
+    let total_bytes: u64 = overrides.iter().map(|f| file_size(&pack.dir.join(f))).sum::<u64>()
+        + from_disk.iter().map(|f| file_size(&pack.dir.join(f))).sum::<u64>()
+        + if has_server_icon { file_size(&pack.dir.join(SERVER_ICON)) } else { 0 };
+    log.info(format!("Building the Modrinth pack ({} Modrinth files, {} override files, {})", files.len(), overrides.len() + from_disk.len(), http::size_text(total_bytes)));
+    let mut progress = ZipProgress::new("Packed", total_files, total_bytes, log);
     let mut zip = ZipWriter::new(File::create(&path)?);
     zip.start_file("modrinth.index.json", options())?;
     zip.write_all(serde_json::to_string_pretty(&index)?.as_bytes())?;
-    let overrides = override_files(pack, &[server_pack_sources(), literal_paths(&pack.config.modrinth.exclude)].concat())?;
     // Modrinth's launchers apply client-overrides only to clients, so these stay off servers the way
     // they stay out of our server pack.
     let folder = |path: &str| if client_only(path) { "client-overrides" } else { "overrides" };
@@ -363,17 +434,20 @@ pub fn modrinth_export(pack: &Pack, sides: &[ModSide], cache: &MetadataCache, ve
         let name = format!("{}/{file}", folder(file));
         match pack.config.export.properties.get(file) {
             Some(forced) => {
+                let bytes = force_properties(&std::fs::read_to_string(pack.dir.join(file))?, forced);
                 zip.start_file(name, options())?;
-                zip.write_all(force_properties(&std::fs::read_to_string(pack.dir.join(file))?, forced).as_bytes())?;
+                zip.write_all(bytes.as_bytes())?;
+                progress.record_bytes(file_size(&pack.dir.join(file)));
+                progress.finish_file();
             }
-            None => add_file(&mut zip, &name, &pack.dir.join(file), false)?,
+            None => add_file(&mut zip, &name, &pack.dir.join(file), false, &mut progress)?,
         }
     }
     for file in &from_disk {
-        add_file(&mut zip, &format!("{}/{file}", folder(file)), &pack.dir.join(file), false)?;
+        add_file(&mut zip, &format!("{}/{file}", folder(file)), &pack.dir.join(file), false, &mut progress)?;
     }
-    if git::tracked_files(&pack.dir)?.iter().any(|f| f == SERVER_ICON) {
-        add_file(&mut zip, &format!("server-overrides/{SERVER_ICON}"), &pack.dir.join(SERVER_ICON), false)?;
+    if has_server_icon {
+        add_file(&mut zip, &format!("server-overrides/{SERVER_ICON}"), &pack.dir.join(SERVER_ICON), false, &mut progress)?;
     }
     zip.finish()?;
     log.info(format!("Modrinth pack: {} Modrinth files, {} override files", files.len(), overrides.len() + from_disk.len()));
@@ -852,21 +926,29 @@ pub async fn server_pack(pack: &Pack, sides: &[ModSide], version: &str, out_dir:
 pub async fn zip_server_pack(pack: &Pack, version: &str, out_dir: &Path, log: &Log) -> Result<PathBuf> {
     let dir = out_dir.join("server");
     let zip_path = out_dir.join(pack.server_zip_name(version));
-    let files = WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).count();
-    log.info(format!("Zipping the server pack ({files} files). This can take a few minutes."));
-    let (source, dest) = (dir, zip_path.clone());
-    tokio::task::spawn_blocking(move || zip_dir(&source, &dest)).await??;
+    let mut files = 0usize;
+    let mut total_bytes = 0u64;
+    for entry in WalkDir::new(&dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            files += 1;
+            total_bytes += entry.metadata().map_or(0, |m| m.len());
+        }
+    }
+    log.info(format!("Zipping the server pack ({files} files, {}). This can take a few minutes.", http::size_text(total_bytes)));
+    let (source, dest, log_bg) = (dir, zip_path.clone(), log.clone());
+    tokio::task::spawn_blocking(move || zip_dir(&source, &dest, files, total_bytes, &log_bg)).await??;
     log.info(format!("Server pack: {}", zip_path.display()));
     Ok(zip_path)
 }
 
-fn zip_dir(source: &Path, dest: &Path) -> Result<()> {
+fn zip_dir(source: &Path, dest: &Path, total_files: usize, total_bytes: u64, log: &Log) -> Result<()> {
+    let mut progress = ZipProgress::new("Zipped", total_files, total_bytes, log);
     let mut zip = ZipWriter::new(File::create(dest)?);
     for entry in WalkDir::new(source).sort_by_file_name() {
         let entry = entry?;
         if entry.file_type().is_file() {
             let name = entry.path().strip_prefix(source)?.to_string_lossy().replace('\\', "/");
-            add_file(&mut zip, &name, entry.path(), name.ends_with(".sh"))?;
+            add_file(&mut zip, &name, entry.path(), name.ends_with(".sh"), &mut progress)?;
         }
     }
     zip.finish()?;

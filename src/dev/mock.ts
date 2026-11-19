@@ -1093,8 +1093,8 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       behind: 0,
       incoming: null,
       changed: fx.changed,
-      lastVersion: scenario === 'empty' ? null : '0.1.0',
-      lastTag: scenario === 'empty' ? null : 'v0.1.0',
+      lastVersion: releases.at(-1)?.version ?? null,
+      lastTag: releases.at(-1) ? `v${releases.at(-1)!.version}` : null,
       devJars: scenario === 'dirty' ? ['raven_core-dev.jar'] : [],
       projectId: config.curseforge.project_id,
       modrinthProjectId: config.modrinth.project_id,
@@ -1331,7 +1331,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   changelog_preview: () => ({ diff: modDiff, markdown: renderChangelog() }),
   publish_preflight: () => {
     const stem = `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-{version}`
-    const tagTaken = scenario !== 'empty' && bcc.version === '0.1.0'
+    const tagTaken = scenario !== 'empty' && !!bcc.version && releases.some((r) => r.version === bcc.version)
     const invalid = bcc.version === null ? null : versionProblem(bcc.version)
     const blocker =
       bcc.version === null
@@ -1339,7 +1339,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
         : invalid
           ? `${invalid} Change the version to publish.`
           : tagTaken
-            ? 'You already released 0.1.0 (tag v0.1.0 exists). Change the version to publish a new release.'
+            ? `You already released ${bcc.version} (tag v${bcc.version} exists). Change the version to publish a new release.`
             : null
     const blockedOn = (platform: Platform, name: string) => {
       const blocked = notOn(platform)
@@ -1415,6 +1415,20 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     if (!curseforge) return null
     if (needsYou(curseforge.state)) return { file: 'client', state: curseforge.state }
     return needsYou(curseforge.serverState) ? { file: 'server', state: curseforge.serverState } : null
+  },
+  abort_release: (a) => {
+    const version = String(a.version)
+    const index = releases.findIndex((r) => r.version === version)
+    if (index >= 0) releases.splice(index, 1)
+    unfinishedSteps.delete(version)
+    return {
+      version,
+      tag: version.startsWith('v') ? version : `v${version}`,
+      localTagDeleted: true,
+      remoteTagDeleted: false,
+      remoteTagWarning: null,
+      notesRestored: false,
+    }
   },
   replace_curseforge_file: (a) =>
     mockJob('publish', ['CurseForge no longer has the old file', 'Building the server pack again', 'Uploaded the server pack as file 7300002'], `Uploaded the ${a.version} server pack to CurseForge as file 7300002`, () => {

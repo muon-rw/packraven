@@ -1,4 +1,5 @@
 import { getContext, setContext } from 'svelte'
+import { appSettingsView, packSettingsView, serverView } from './nav.svelte'
 import { StoredSplit } from './storedSplit.svelte'
 
 export const views = ['changes', 'test', 'mods', 'server', 'files', 'git', 'publish', 'releases', 'pack', 'settings', 'add'] as const
@@ -149,4 +150,93 @@ export function providePane(focused: () => boolean) {
 // Views with window-wide shortcuts check this, so Ctrl+S or Ctrl+F only reaches the focused pane.
 export function paneFocus(): () => boolean {
   return getContext<(() => boolean) | undefined>(PANE) ?? (() => true)
+}
+
+type HistoryTabs = {
+  server?: typeof serverView.tab
+  pack?: typeof packSettingsView.tab
+  settings?: typeof appSettingsView.tab
+}
+
+type HistoryEntry = {
+  panes: View[]
+  focused: number
+  tabs: HistoryTabs
+}
+
+const HISTORY_LIMIT = 50
+const navHistory = $state({ entries: [] as HistoryEntry[], at: -1 })
+
+function snapshot(): HistoryEntry {
+  const panes = [...layout.panes]
+  const tabs: HistoryTabs = {}
+  if (panes.includes('server')) tabs.server = serverView.tab
+  if (panes.includes('pack')) tabs.pack = packSettingsView.tab
+  if (panes.includes('settings')) tabs.settings = appSettingsView.tab
+  return { panes, focused: layout.focused, tabs }
+}
+
+function sameEntry(a: HistoryEntry, b: HistoryEntry): boolean {
+  if (a.panes.length !== b.panes.length) return false
+  for (let i = 0; i < a.panes.length; i++) if (a.panes[i] !== b.panes[i]) return false
+  return a.tabs.server === b.tabs.server && a.tabs.pack === b.tabs.pack && a.tabs.settings === b.tabs.settings
+}
+
+function restore(entry: HistoryEntry) {
+  previous = layout.panes[layout.focused] ?? previous
+  parked = null
+  layout.panes = [...entry.panes]
+  layout.focused = Math.min(entry.focused, entry.panes.length - 1)
+  if (entry.tabs.server !== undefined) serverView.tab = entry.tabs.server
+  if (entry.tabs.pack !== undefined) packSettingsView.tab = entry.tabs.pack
+  if (entry.tabs.settings !== undefined) appSettingsView.tab = entry.tabs.settings
+}
+
+export function resetHistory() {
+  navHistory.entries = [snapshot()]
+  navHistory.at = 0
+}
+
+export function recordHistory() {
+  const next = snapshot()
+  if (navHistory.at >= 0 && sameEntry(navHistory.entries[navHistory.at], next)) {
+    navHistory.entries[navHistory.at].focused = next.focused
+    return
+  }
+  const trimmed = navHistory.entries.slice(0, navHistory.at + 1)
+  trimmed.push(next)
+  if (trimmed.length > HISTORY_LIMIT) trimmed.shift()
+  navHistory.entries = trimmed
+  navHistory.at = trimmed.length - 1
+}
+
+function findHistory(step: -1 | 1, canOpen?: (view: View) => boolean): number {
+  for (let i = navHistory.at + step; i >= 0 && i < navHistory.entries.length; i += step) {
+    if (!canOpen || navHistory.entries[i].panes.every(canOpen)) return i
+  }
+  return -1
+}
+
+export function canGoBack(canOpen?: (view: View) => boolean): boolean {
+  return findHistory(-1, canOpen) >= 0
+}
+
+export function canGoForward(canOpen?: (view: View) => boolean): boolean {
+  return findHistory(1, canOpen) >= 0
+}
+
+export function goBack(canOpen?: (view: View) => boolean): boolean {
+  const target = findHistory(-1, canOpen)
+  if (target < 0) return false
+  navHistory.at = target
+  restore(navHistory.entries[target])
+  return true
+}
+
+export function goForward(canOpen?: (view: View) => boolean): boolean {
+  const target = findHistory(1, canOpen)
+  if (target < 0) return false
+  navHistory.at = target
+  restore(navHistory.entries[target])
+  return true
 }

@@ -14,6 +14,8 @@
   import { SvelteSet } from 'svelte/reactivity'
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import { appSettingsView, nav, packSettingsView } from '../lib/nav.svelte'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { paneFocus } from '../lib/panes.svelte'
   import { abortReleaseConfirmation, asReleaseType, asUpdateType, curseforgeProblem, isGoneOnCurseforge, releaseTag, repoName, updateTypeLabel } from '../lib/format'
 
   let { onsettings, onappsettings, onchange, onpublish }: { onsettings: () => void; onappsettings: () => void; onchange?: () => void; onpublish?: () => void } = $props()
@@ -41,6 +43,17 @@
   function togglePreview(version: string) {
     if (!previewsOpen.delete(version)) previewsOpen.add(version)
   }
+
+  const inFocusedPane = paneFocus()
+
+  useBack(BACK_PRIORITY.detail, () => {
+    if (!inFocusedPane() || !previewsOpen.size) return false
+    const activeRow = document.activeElement instanceof Element ? document.activeElement.closest<HTMLElement>('tr.discord-follow-up') : null
+    const trigger = activeRow?.previousElementSibling?.querySelector<HTMLElement>('button.disclosure')
+    previewsOpen.clear()
+    if (trigger) trigger.focus({ preventScroll: true })
+    return true
+  })
   let discordError = $state<string | null>(null)
   let rolePing = $state(false)
   let uploading = $state<string | null>(null)

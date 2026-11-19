@@ -28,6 +28,7 @@
 
 <script lang="ts">
   import { onMount, tick } from 'svelte'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
 
   let {
     x,
@@ -134,9 +135,15 @@
   function outside(target: Node) {
     return !menu.contains(target) && !submenu?.contains(target)
   }
+
+  useBack(BACK_PRIORITY.overlay, () => {
+    if (open) closeSubmenu()
+    else close()
+    return true
+  })
 </script>
 
-<svelte:window onpointerdown={(e) => outside(e.target as Node) && close(false)} onblur={() => close(false)} onresize={() => close(false)} />
+<svelte:window onpointerdown={(e) => e.button !== 3 && e.button !== 4 && outside(e.target as Node) && close(false)} onblur={() => close(false)} onresize={() => close(false)} />
 
 {#snippet entries(list: MenuItem[], nested: boolean)}
   {@const narrowed = !!(nested ? open?.maxWidth : position?.maxWidth)}

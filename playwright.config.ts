@@ -25,7 +25,7 @@ export default defineConfig({
     viewport: { width: 1280, height: 820 },
   },
   projects: [
-    { name: 'smoke', testMatch: ['smoke.spec.ts', 'discordMarkdown.spec.ts', 'maven.spec.ts', 'modsEnhancements.spec.ts'] },
+    { name: 'smoke', testMatch: ['smoke.spec.ts', 'discordMarkdown.spec.ts', 'maven.spec.ts', 'modsEnhancements.spec.ts', 'backNavigation.spec.ts'] },
     { name: 'shots', testMatch: 'shots.spec.ts' },
   ],
   // Tests get their own port, so the dev server you keep on 5173 (or `npm run tauri dev`) stays yours.

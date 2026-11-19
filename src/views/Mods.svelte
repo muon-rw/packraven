@@ -22,6 +22,7 @@
   import { fileIdCopyLabel, mavenCopyLabel, mavenSnippet, rawFileId, rawProjectId } from '../lib/maven'
   import type { MenuItem } from '../lib/menu'
   import { commandKey, isMac, shortcut, trashName } from '../lib/platform'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
 
   let {
@@ -735,19 +736,50 @@
     field?.select()
   }
 
-  function onEscape(event: KeyboardEvent) {
-    if (event.key !== 'Escape' || !browse.platform || !inFocusedPane() || event.defaultPrevented) return
-    // Escape first clears a search you typed, like it does in the field.
-    if (document.activeElement === browseField && browse.text) return
-    event.preventDefault()
+  useBack(BACK_PRIORITY.detail, () => {
+    if (!inFocusedPane() || browse.platform || !expanded) return false
+    const closing = mods.find((m) => m.path === expanded)
+    const detailId = closing ? `details-${domId(`${closing.key ?? closing.path}-${closing.file}`)}` : null
+    const detailEl = detailId ? document.getElementById(detailId) : null
+    const restoreFocus = !!(detailEl && document.activeElement && detailEl.contains(document.activeElement))
+    expanded = null
+    openChangelog = null
+    if (restoreFocus && detailId) {
+      tick().then(() => document.querySelector<HTMLElement>(`button[aria-controls="${CSS.escape(detailId)}"]`)?.focus({ preventScroll: true }))
+    }
+    return true
+  })
+
+  useBack(BACK_PRIORITY.selection, () => {
+    if (!inFocusedPane() || browse.platform || !selected.size) return false
+    selected = new Set()
+    return true
+  })
+
+  useBack(BACK_PRIORITY.filter, () => {
+    if (!inFocusedPane()) return false
+    if (browse.platform) {
+      if (!browse.text) return false
+      browse.text = ''
+      return true
+    }
+    if (!search) return false
+    search = ''
+    return true
+  })
+
+  useBack(BACK_PRIORITY.mode, () => {
+    if (!inFocusedPane() || !browse.platform) return false
     stopAdding()
-  }
+    return true
+  })
+
   function onModifier(event: KeyboardEvent, down: boolean) {
     if (isMac ? event.key === 'Meta' : event.key === 'Control') ctrlHeld = down
   }
 </script>
 
-<svelte:window onkeydown={(e) => { onModifier(e, true); onKey(e); onEscape(e) }} onkeyup={(e) => onModifier(e, false)} onblur={() => (ctrlHeld = false)} />
+<svelte:window onkeydown={(e) => { onModifier(e, true); onKey(e) }} onkeyup={(e) => onModifier(e, false)} onblur={() => (ctrlHeld = false)} />
 
 <!-- Browsers won't break a line between a hyphen and a digit, so long jar names would hold the
      table wider than the view without these break points. -->

@@ -6,6 +6,8 @@
   import { api, errorText, type DirEntry, type GitStatus, type PackKind, type Pasted } from '../lib/api'
   import { fs, moved, onDiskChange } from '../lib/workspace.svelte'
   import { drag } from '../lib/drag.svelte'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { paneFocus } from '../lib/panes.svelte'
   import { gitMenu } from '../lib/gitActions'
   import { RangeSelection, isPlainClick } from '../lib/rangeSelection'
   import { commandKey, fileManager, isMac, shortcut } from '../lib/platform'
@@ -616,6 +618,28 @@
       edit.error = null
     }
   }
+
+  const inFocusedPane = paneFocus()
+
+  useBack(BACK_PRIORITY.prompt, () => {
+    if (!inFocusedPane()) return false
+    if (drag.paths.length) {
+      cancelDrag()
+      return true
+    }
+    if (edit) {
+      edit = null
+      if (focused) focusRow(focused)
+      return true
+    }
+    return false
+  })
+
+  useBack(BACK_PRIORITY.selection, () => {
+    if (!inFocusedPane() || selection.size <= 1) return false
+    selectOnly(focused ?? [...selection][0])
+    return true
+  })
 
   // A moved folder takes its expanded subfolders with it, so we carry them over to the new
   // paths and reload everything that's open.

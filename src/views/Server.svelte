@@ -10,6 +10,7 @@
   import { trackSave } from '../lib/launch.svelte'
   import { serverView } from '../lib/nav.svelte'
   import { commandKey, shortcut } from '../lib/platform'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
 
   let { overview, onfiles }: { overview: Overview | null; onfiles: (path: string) => void } = $props()
@@ -171,6 +172,12 @@
   let searchField = $state<HTMLInputElement>()
 
   const inFocusedPane = paneFocus()
+
+  useBack(BACK_PRIORITY.filter, () => {
+    if (!inFocusedPane() || serverView.tab !== 'mods' || !search) return false
+    search = ''
+    return true
+  })
 
   function onKey(event: KeyboardEvent) {
     if (!inFocusedPane()) return

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { tick } from 'svelte'
   import { api, errorText } from '../lib/api'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { job } from '../lib/jobs.svelte'
   import { nav } from '../lib/nav.svelte'
 
@@ -61,6 +62,12 @@
     await tick()
     if (opener?.isConnected) opener.focus()
   }
+
+  useBack(BACK_PRIORITY.prompt, () => {
+    if (!editing) return false
+    stop(true)
+    return true
+  })
 
   async function commit(refocus: boolean) {
     const next = draft.trim()

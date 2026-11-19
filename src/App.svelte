@@ -15,7 +15,8 @@
   import SettingsView from './views/Settings.svelte'
   import AddPack from './views/AddPack.svelte'
   import Git from './views/Git.svelte'
-  import { nav, revealAnchor } from './lib/nav.svelte'
+  import { appSettingsView, nav, packSettingsView, revealAnchor, serverView } from './lib/nav.svelte'
+  import { BACK_PRIORITY, hasOpenModal, runBack, useBack } from './lib/back.svelte'
   import Releases from './views/Releases.svelte'
   import PackSettings from './views/PackSettings.svelte'
   const loadFiles = () => import('./views/Files.svelte')
@@ -37,7 +38,7 @@
   import ContextMenu from './components/ContextMenu.svelte'
   import type { MenuItem } from './lib/menu'
   import { clamp } from './lib/storedSplit.svelte'
-  import { closePane, focusedView, isSplit, layout, only, openBeside, paneSplit, placeInPane, show, showFrom, splitCompanion, swapPanes, titles, toggleSplit, views, type View } from './lib/panes.svelte'
+  import { canGoBack, canGoForward, closePane, focusedView, goBack, goForward, isSplit, layout, only, openBeside, paneSplit, placeInPane, recordHistory, resetHistory, show, showFrom, splitCompanion, swapPanes, titles, toggleSplit, views, type View } from './lib/panes.svelte'
 
   type Tone = 'ok' | 'warn' | 'bad' | 'busy' | 'idle'
   type NavItem = { id: View; title: string; key?: string; alias?: string; status?: string; tone?: Tone; count?: number; countText?: string }
@@ -53,6 +54,7 @@
   }
 
   initialLayout()
+  resetHistory()
   let view = $derived(focusedView())
   let split = $derived(isSplit())
   let overview = $state<Overview | null>(null)
@@ -135,6 +137,7 @@
       overview = null
       loadError = null
       only(view === 'settings' ? 'settings' : 'add')
+      resetHistory()
       return
     }
     try {
@@ -212,6 +215,7 @@
       await api.switchPack(dir, killTests)
       // A split you set up is a layout for your work, not for one pack, so we keep it.
       if (!split) show('mods')
+      resetHistory()
       hookMessage = null
       hooksDismissed = false
       await refresh()
@@ -371,6 +375,93 @@
     if (nav.anchor) revealAnchor(nav.anchor)
     nav.anchor = null
   })
+
+  $effect(() => {
+    for (const pane of layout.panes) void pane
+    if (layout.panes.includes('server')) void serverView.tab
+    if (layout.panes.includes('pack')) void packSettingsView.tab
+    if (layout.panes.includes('settings')) void appSettingsView.tab
+    recordHistory()
+  })
+
+  useBack(BACK_PRIORITY.overlay, () => {
+    if (!railGhost) return false
+    cancelRailDrag()
+    return true
+  })
+
+  const canOpenView = (id: View) => !!packs?.active || id === 'add' || id === 'settings'
+  let canBack = $derived(canGoBack(canOpenView))
+  let canForward = $derived(canGoForward(canOpenView))
+  let navAnnouncement = $state('')
+
+  function announceHistoryMove(direction: 'Back' | 'Forward') {
+    const dest = focusedView()
+    const sub = dest === 'server' ? `, ${serverView.tab}` : dest === 'pack' ? `, ${packSettingsView.tab}` : dest === 'settings' ? `, ${appSettingsView.tab}` : ''
+    navAnnouncement = ''
+    tick().then(() => {
+      navAnnouncement = `${direction} to ${titles[dest]}${sub}`
+      const active = document.activeElement
+      if (!active || active === document.body || !active.isConnected) {
+        const targetId = tabbed ? `pane-${layout.focused}-tab` : `pane-${layout.focused}`
+        document.getElementById(targetId)?.focus({ preventScroll: true })
+      }
+    })
+  }
+
+  function handleBack() {
+    if (runBack('back') !== 'none') return
+    if (goBack(canOpenView)) announceHistoryMove('Back')
+  }
+
+  function handleForward() {
+    if (hasOpenModal()) return
+    if (goForward(canOpenView)) announceHistoryMove('Forward')
+  }
+
+  function onNavKey(event: KeyboardEvent): boolean {
+    if (event.defaultPrevented) return false
+    if (event.key === 'Escape' && !event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+      if (runBack('escape', event.target) === 'handled') {
+        event.preventDefault()
+        return true
+      }
+      return false
+    }
+    const isBack =
+      event.key === 'BrowserBack' ||
+      (!isMac && event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && event.key === 'ArrowLeft') ||
+      (isMac && event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && event.key === '[')
+    if (isBack) {
+      event.preventDefault()
+      handleBack()
+      return true
+    }
+    const isForward =
+      event.key === 'BrowserForward' ||
+      (!isMac && event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && event.key === 'ArrowRight') ||
+      (isMac && event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && event.key === ']')
+    if (isForward) {
+      event.preventDefault()
+      handleForward()
+      return true
+    }
+    return false
+  }
+
+  function onNavMouseDown(event: MouseEvent) {
+    if (event.button === 3 || event.button === 4) event.preventDefault()
+  }
+
+  function onNavMouseUp(event: MouseEvent) {
+    if (event.button === 3) {
+      event.preventDefault()
+      handleBack()
+    } else if (event.button === 4) {
+      event.preventDefault()
+      handleForward()
+    }
+  }
 
   let navItems = $derived(groups.flatMap((group) => group.items))
 
@@ -580,13 +671,11 @@
 
 <svelte:window
   onkeydown={(e) => {
-    if (e.key === 'Escape' && railGhost) {
-      e.preventDefault()
-      cancelRailDrag()
-    } else {
-      onKey(e)
-    }
+    if (!onNavKey(e)) onKey(e)
   }}
+  onmousedown={onNavMouseDown}
+  onmouseup={onNavMouseUp}
+  onauxclick={onNavMouseDown}
   onpointermove={onRailPointerMove}
   onpointerup={onRailPointerUp}
   onpointercancel={cancelRailDrag}
@@ -595,7 +684,33 @@
 
 <div class="shell" class:dragging-rail={!!railGhost}>
   <aside class="rail">
-    <div class="brand"><RavenMark /><span>packraven</span><ThemeToggle /></div>
+    <div class="brand">
+      <RavenMark />
+      <span>packraven</span>
+      <div class="brand-actions">
+        <button
+          class="rail-icon"
+          disabled={!canBack}
+          aria-label="Back"
+          aria-keyshortcuts={isMac ? 'Meta+[' : 'Alt+ArrowLeft'}
+          title="Back ({isMac ? '⌘[' : 'Alt+Left'})"
+          onclick={() => goBack(canOpenView) && announceHistoryMove('Back')}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6l-6 6 6 6" /></svg>
+        </button>
+        <button
+          class="rail-icon"
+          disabled={!canForward}
+          aria-label="Forward"
+          aria-keyshortcuts={isMac ? 'Meta+]' : 'Alt+ArrowRight'}
+          title="Forward ({isMac ? '⌘]' : 'Alt+Right'})"
+          onclick={() => goForward(canOpenView) && announceHistoryMove('Forward')}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6" /></svg>
+        </button>
+        <ThemeToggle />
+      </div>
+    </div>
 
     <section class="pack" aria-label="Current pack">
       <div class="identity">
@@ -806,7 +921,7 @@
   <!-- Setup activates the new pack before it reports done, so we keep Add pack outside the key
        block. Otherwise the switch would remount it and drop the setup result. -->
   {#if pane === 'add'}
-    <AddPack first={!packs?.packs.length} onadded={() => { only('mods'); refresh() }} />
+    <AddPack first={!packs?.packs.length} onadded={() => { only('mods'); resetHistory(); refresh() }} />
   {:else}
   {#if pane === 'settings'}
     <SettingsView onchange={refresh} />
@@ -835,7 +950,7 @@
     {:else if pane === 'releases'}
       <Releases onsettings={() => showFromWithAnchor('pack', index)} onappsettings={() => showFromWithAnchor('settings', index)} onchange={refresh} onpublish={() => showFrom('publish', index)} />
     {:else if pane === 'pack' && packs?.active}
-      <PackSettings dir={packs.active} name={overview?.name ?? 'this pack'} onserver={() => showFrom('server', index)} onappsettings={() => showFromWithAnchor('settings', index)} onchange={refresh} onremoved={() => { only('mods'); refresh() }} />
+      <PackSettings dir={packs.active} name={overview?.name ?? 'this pack'} onserver={() => showFrom('server', index)} onappsettings={() => showFromWithAnchor('settings', index)} onchange={refresh} onremoved={() => { only('mods'); resetHistory(); refresh() }} />
     {:else}
       <SettingsView onchange={refresh} />
     {/if}
@@ -853,6 +968,8 @@
 {#if railMenu}
   <ContextMenu x={railMenu.x} y={railMenu.y} label="Pane actions" items={railMenu.items} scroller={railMenu.scroller} onclose={() => (railMenu = null)} />
 {/if}
+
+<p class="visually-hidden" role="status" aria-live="polite">{navAnnouncement}</p>
 
 <IgnoreDialog />
 <UpdateChangelogDialog />
@@ -907,6 +1024,41 @@
     font-size: var(--step--1);
     letter-spacing: 0.02em;
     color: var(--rail-muted);
+  }
+
+  .brand-actions {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    margin-left: auto;
+  }
+
+  .rail-icon {
+    display: grid;
+    place-items: center;
+    padding: 5px;
+    color: var(--rail-muted);
+    background: transparent;
+    border-color: transparent;
+  }
+
+  .rail-icon:hover:not(:disabled) {
+    color: var(--rail-text);
+    background: var(--rail-hi);
+  }
+
+  .rail-icon:disabled {
+    opacity: 0.35;
+  }
+
+  .rail-icon svg {
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .pack {

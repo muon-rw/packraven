@@ -28,6 +28,15 @@
     appSettingsView.tab = tab
   }
 
+  let lastTab = appSettingsView.tab
+  $effect.pre(() => {
+    const next = appSettingsView.tab
+    if (next !== lastTab) {
+      flushPending()
+      lastTab = next
+    }
+  })
+
   function onTabKey(event: KeyboardEvent) {
     const step = event.key === 'ArrowRight' ? 1 : event.key === 'ArrowLeft' ? -1 : 0
     if (!step && event.key !== 'Home' && event.key !== 'End') return

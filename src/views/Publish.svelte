@@ -16,6 +16,8 @@
   import ServerPackTagDialog from '../components/ServerPackTagDialog.svelte'
   import ServerPackTagStep from '../components/ServerPackTagStep.svelte'
   import { appSettingsView, nav, packSettingsView, serverView, showInFiles } from '../lib/nav.svelte'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { paneFocus } from '../lib/panes.svelte'
   import { abortReleaseConfirmation, asReleaseType, asUpdateType, curseforgeProblem, isGoneOnCurseforge, releaseTag, repoName, UPDATE_TYPES, updateTypeEffect } from '../lib/format'
 
   let {
@@ -41,6 +43,25 @@
   let push = $state(true)
   // Which collapsed groups of files you opened in What we'll ship.
   let groupsOpen = $state<Record<string, boolean>>({})
+
+  const inFocusedPane = paneFocus()
+
+  useBack(BACK_PRIORITY.detail, () => {
+    if (!inFocusedPane()) return false
+    if (discordPreviewOpen) {
+      const panel = document.getElementById('discord-preview')
+      const restore = !!(panel && document.activeElement && panel.contains(document.activeElement))
+      discordPreviewOpen = false
+      if (restore) document.querySelector<HTMLElement>('button[aria-controls="discord-preview"]')?.focus({ preventScroll: true })
+      return true
+    }
+    const openGroups = Object.keys(groupsOpen).filter((k) => groupsOpen[k])
+    if (openGroups.length) {
+      for (const k of openGroups) groupsOpen[k] = false
+      return true
+    }
+    return false
+  })
 
   // We keep the authors, licenses and other versions of only the files that need a decision, so we
   // look them up as they appear.
@@ -261,13 +282,34 @@
   let lastTag = $derived(overview?.lastTag ?? null)
   let lastVersion = $derived(overview?.lastVersion ?? null)
 
+  let lastConfigJson: string | null = null
+  let configRevision = $state(0)
+
   function loadPackSettings() {
     api.getPackConfig().then(
       (c) => {
+        const json = JSON.stringify(c)
+        if (json === lastConfigJson) return
+        const prev = config
+        lastConfigJson = json
         config = c
-        resetUpdateType()
+        if (!prev) {
+          resetUpdateType()
+        } else {
+          configRevision++
+          if (
+            prev.update_checker.add_releases !== c.update_checker.add_releases ||
+            prev.update_checker.update_type !== c.update_checker.update_type
+          ) {
+            resetUpdateType()
+          }
+        }
       },
-      () => (config = null),
+      () => {
+        if (config !== null) configRevision++
+        lastConfigJson = null
+        config = null
+      },
     )
     api.getWebhook().then((w) => (hasWebhook = !!w), () => (hasWebhook = false))
   }
@@ -376,15 +418,29 @@
   let defaultMessage = $derived(`Release ${trimmed}`)
   let uncommitted = $derived(overview?.changed ?? [])
 
+  // Derive a primitive key so background overview refreshes with unchanged inputs don't re-run preflight.
+  let preflightKey = $derived(
+    [
+      trimmed,
+      overview?.unhosted.length ?? 0,
+      overview?.notOnCurseforge.length ?? 0,
+      overview?.notOnModrinth.length ?? 0,
+      overview?.modrinthError ?? '',
+      overview?.projectId ?? 0,
+      overview?.modrinthProjectId ?? '',
+      overview?.lockCount ?? 0,
+      overview?.lastTag ?? '',
+      configRevision,
+      job('publish').finishedRuns,
+      preflightNonce,
+      // A join records the mods the test ran with, so it can clear the untested warning.
+      testState.players.length,
+    ].join('\0'),
+  )
+
   $effect(() => {
+    void preflightKey
     const wanted = trimmed
-    void overview?.unhosted.length
-    void overview?.notOnCurseforge.length
-    void overview?.notOnModrinth.length
-    void job('publish').finishedRuns
-    void preflightNonce
-    // A join records the mods the test ran with, so it can clear the untested warning.
-    void testState.players.length
     let current = true
     checking = true
     const delay = skipPreflightDelay ? 0 : 300
@@ -973,7 +1029,7 @@
           <span>{untestedText} <button class="link" onclick={onrun}>Run a Quick test</button> before you publish.</span>
         </li>
       {/if}
-      {#if !blockers.length && !warnings.length && !checkerProblem && !checking}
+      {#if checkedOnce && !blockers.length && !warnings.length && !checkerProblem}
         <li class="ok">
           <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8.5l3 3 7-7" /></svg>
           Ready to publish

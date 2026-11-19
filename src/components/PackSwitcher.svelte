@@ -2,6 +2,7 @@
   import { loaderName } from '../lib/loader'
   import { tick } from 'svelte'
   import type { PackList } from '../lib/api'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
 
   let {
     list,
@@ -47,9 +48,15 @@
     close()
     action()
   }
+
+  useBack(BACK_PRIORITY.overlay, () => {
+    if (!open) return false
+    close()
+    return true
+  })
 </script>
 
-<svelte:window onpointerdown={(e) => open && !menu?.contains(e.target as Node) && !trigger.contains(e.target as Node) && close(false)} />
+<svelte:window onpointerdown={(e) => open && e.button !== 3 && e.button !== 4 && !menu?.contains(e.target as Node) && !trigger.contains(e.target as Node) && close(false)} />
 
 <div class="switcher">
   <h1>

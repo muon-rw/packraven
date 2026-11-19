@@ -2,6 +2,7 @@
   import { tick } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import type { GalleryItem } from '../lib/api'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
 
   let {
     name,
@@ -48,19 +49,21 @@
     viewing = (viewing + delta + items.length) % items.length
   }
 
-  // Capture-phase listener stops Escape before Mods.svelte's window handler can close ModBrowser.
+  useBack(BACK_PRIORITY.overlay, () => {
+    if (viewing === null) return false
+    closeLightbox()
+    return true
+  })
+
+  // Capture-phase listener handles lightbox navigation and focus trapping while it's open.
   $effect(() => {
     if (viewing === null) return
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault()
-        event.stopPropagation()
-        closeLightbox()
-      } else if (event.key === 'ArrowLeft') {
+      if (event.key === 'ArrowLeft' && !event.altKey && !event.metaKey && !event.ctrlKey) {
         event.preventDefault()
         event.stopPropagation()
         step(-1)
-      } else if (event.key === 'ArrowRight') {
+      } else if (event.key === 'ArrowRight' && !event.altKey && !event.metaKey && !event.ctrlKey) {
         event.preventDefault()
         event.stopPropagation()
         step(1)

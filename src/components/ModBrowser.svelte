@@ -11,6 +11,8 @@
   import { fileIdCopyLabel, mavenCopyLabel, mavenSnippet, rawFileId, rawProjectId } from '../lib/maven'
   import type { MenuItem } from '../lib/menu'
   import { browse, cancelChange, changeFor, flashCopyNote, modUpdates, point, projectKey, queuedButton } from '../lib/modUpdates.svelte'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { paneFocus } from '../lib/panes.svelte'
   import { commandKey, isMac, shortcut } from '../lib/platform'
 
   let {
@@ -289,6 +291,24 @@
     confirming = null
     document.getElementById(`install-${domId(key)}`)?.focus()
   }
+
+  const inFocusedPane = paneFocus()
+
+  useBack(BACK_PRIORITY.prompt, () => {
+    if (!inFocusedPane() || !confirming) return false
+    cancelConfirm(confirming.result.key)
+    return true
+  })
+
+  useBack(BACK_PRIORITY.detail, () => {
+    if (!inFocusedPane() || !reading) return false
+    const readingEl = resultsRegion?.querySelector<HTMLElement>('.reading')
+    const restoreFocus = !!(readingEl && document.activeElement && readingEl.contains(document.activeElement))
+    const trigger = restoreFocus ? readingEl.closest('li')?.querySelector<HTMLElement>('button.name') : null
+    reading = null
+    if (trigger) trigger.focus({ preventScroll: true })
+    return true
+  })
 
   // Cancelling or confirming the dependency prompt removes the button you used, so focus falls to
   // the page. You may have moved on to another result by then, so we leave focus alone in that case.

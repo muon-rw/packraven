@@ -2,6 +2,13 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Added
+- Universal back/forward navigation, throughout the app. Power users rejoice! 
+
+### Fixed
+- Occasional flickering on the publish screen while checking for changes
+
 ## [0.5.3] - 2026-11-19
 ### Added
 - Many features for the Browse tab:

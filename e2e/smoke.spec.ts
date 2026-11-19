@@ -1347,3 +1347,37 @@ test('Releases shows newest first and loads older releases only when opened', as
   await page.getByRole('button', { name: 'Older releases (3)' }).click()
   await expect(versions).toHaveText(['0.1.1', '0.1.0', '0.0.6', '0.0.5', '0.0.4', '0.0.3', '0.0.2', '0.0.1'])
 })
+
+test('Publish stays steady on background file-watcher refreshes', async ({ page }) => {
+  await openApp(page, 'publish', 'ready')
+  const publishBtn = page.getByRole('button', { name: /^Publish / })
+  const checks = page.locator('#publish-checks')
+  await expect(publishBtn).toBeEnabled()
+  await expect(checks).toContainText('Ready to publish')
+
+  // Observe any flicker of the disabled button, stale checks class, or disappearance of "Ready to publish".
+  await page.evaluate(() => {
+    const btn = document.querySelector<HTMLButtonElement>('.go button.primary')!
+    const list = document.getElementById('publish-checks')!
+    const flickers: string[] = []
+    ;(window as unknown as Record<string, unknown>).__publishFlickers = flickers
+    const observer = new MutationObserver(() => {
+      if (btn.disabled) flickers.push('button-disabled')
+      if (list.classList.contains('stale')) flickers.push('checks-stale')
+      if (!list.textContent?.includes('Ready to publish')) flickers.push('ready-missing')
+    })
+    observer.observe(btn, { attributes: true, attributeFilter: ['disabled'] })
+    observer.observe(list, { attributes: true, childList: true, subtree: true })
+  })
+
+  // Trigger an immediate overview refresh (the same refresh() path fs-change schedules after its 5s gap).
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __mockEmit: (event: string, payload: unknown) => void }).__mockEmit
+    emit('fs-change', { paths: ['config/jei-client.ini'] })
+    emit('test-event', { kind: 'client-started', detail: '' })
+  })
+  await page.waitForTimeout(500)
+
+  const flickers = await page.evaluate(() => (window as unknown as Record<string, string[]>).__publishFlickers)
+  expect(flickers).toEqual([])
+})

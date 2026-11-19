@@ -2,6 +2,8 @@
   import { tick, untrack } from 'svelte'
   import { errorText } from '../lib/api'
   import type { Head, Level, LogModel } from '../lib/logs'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { paneFocus } from '../lib/panes.svelte'
   import { isMac, shortcut } from '../lib/platform'
   import ContextMenu from './ContextMenu.svelte'
   import type { MenuItem } from '../lib/menu'
@@ -441,12 +443,37 @@
       event.preventDefault()
       copy(model.lines[selected])
     } else if (event.key === 'Escape' && query) {
+      event.preventDefault()
       leaveFilter()
     } else if (event.altKey && event.key === 'ArrowLeft' && !query && leftQuery) {
       event.preventDefault()
       backToFilter()
     }
   }
+
+  const inFocusedPane = paneFocus()
+  let panelEl = $state<HTMLDivElement>()
+
+  // When two logs share a pane (TestRun), clear the focused log's filter before its sibling's.
+  useBack(BACK_PRIORITY.filter + 1, () => {
+    if (!inFocusedPane() || !query || !viewport?.offsetParent) return false
+    if (!panelEl?.contains(document.activeElement)) return false
+    leaveFilter()
+    return true
+  })
+
+  useBack(BACK_PRIORITY.filter, () => {
+    if (!inFocusedPane() || !query || !viewport?.offsetParent) return false
+    leaveFilter()
+    return true
+  })
+
+  useBack(BACK_PRIORITY.mode, (source) => {
+    if (source !== 'back' || !inFocusedPane() || query || !leftQuery || !viewport?.offsetParent) return false
+    if (!panelEl?.contains(document.activeElement)) return false
+    backToFilter()
+    return true
+  })
 
   function entryText(entry: number) {
     return model.lines.slice(model.entries[entry].start, model.entryEnd(entry)).join('\n')
@@ -505,7 +532,7 @@
   {#each parts(text) as part, i (i)}{#if part.hit}<mark>{part.text}</mark>{:else}{part.text}{/if}{/each}
 {/snippet}
 
-<div class="panel" class:framed>
+<div class="panel" class:framed bind:this={panelEl}>
   <div class="bar">
     <span class="levels" role="group" aria-label="Show levels">
       {#each FILTERS as { level, label: filterLabel } (level)}

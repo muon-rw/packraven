@@ -3,6 +3,8 @@
   import { SvelteSet } from 'svelte/reactivity'
   import type { LineAction } from '../lib/api'
   import { diffRows, isChange, type DiffRow } from '../lib/diffRows'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { paneFocus } from '../lib/panes.svelte'
   import { commandKey, isMac, shortcut } from '../lib/platform'
   import Notice from './Notice.svelte'
 
@@ -251,6 +253,14 @@
   let keyHelp = $derived(
     `Arrow keys move between changed lines and blocks, and Alt with an arrow jumps to the next block. Space selects. Enter ${staged ? 'unstages' : 'stages'} the selection, or the line or block under the cursor${discardable ? '; Delete discards it' : ''}. Escape clears the selection.`,
   )
+
+  const inFocusedPane = paneFocus()
+
+  useBack(BACK_PRIORITY.selection, () => {
+    if (!inFocusedPane() || !picked.size) return false
+    clear()
+    return true
+  })
 </script>
 
 {#if selectable && hasChanges}

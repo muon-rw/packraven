@@ -24,6 +24,8 @@
   import ImageDiff from '../components/ImageDiff.svelte'
   import UntrackIgnoredDialog, { type UntrackResult } from '../components/UntrackIgnoredDialog.svelte'
   import { StoredSplit, clamp } from '../lib/storedSplit.svelte'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { paneFocus } from '../lib/panes.svelte'
 
   let { onchange }: { onchange: () => void } = $props()
 
@@ -38,6 +40,13 @@
   // Selection keys are the group and path, with a trailing slash for folder rows in the tree.
   const keys = new SvelteSet<string>()
   const picker = new RangeSelection(keys)
+  const inFocusedPane = paneFocus()
+
+  useBack(BACK_PRIORITY.selection, () => {
+    if (!inFocusedPane() || keys.size <= 1) return false
+    picker.only(focused ?? [...keys][0])
+    return true
+  })
   const collapsed = new SvelteSet<string>()
   let focused = $state<string | null>(null)
   let layout = $state<Layout>(storedLayout())

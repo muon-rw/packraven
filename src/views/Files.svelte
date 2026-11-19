@@ -31,6 +31,7 @@
   import PackOverrideDialog, { type OverrideItem } from '../components/PackOverrideDialog.svelte'
   import Splitter from '../components/Splitter.svelte'
   import { StoredSplit, clamp } from '../lib/storedSplit.svelte'
+  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
 
   let { pack }: { pack: string | null } = $props()
@@ -356,6 +357,24 @@
 
   const inFocusedPane = paneFocus()
 
+  useBack(BACK_PRIORITY.detail, () => {
+    if (!inFocusedPane() || !formatNote) return false
+    formatNote = null
+    return true
+  })
+
+  useBack(BACK_PRIORITY.filter, () => {
+    if (!inFocusedPane() || !query) return false
+    endSearch()
+    return true
+  })
+
+  useBack(BACK_PRIORITY.mode, () => {
+    if (!inFocusedPane() || !textSearch.open) return false
+    closeTextSearch()
+    return true
+  })
+
   function onKey(event: KeyboardEvent) {
     if (!inFocusedPane()) return
     // On macOS, Option changes event.key, so we match the physical key.
@@ -364,7 +383,6 @@
       format()
       return
     }
-    if (event.key === 'Escape') formatNote = null
     if (event.key === 'F4' && textSearch.open && !event.ctrlKey && !event.metaKey && !event.altKey) {
       event.preventDefault()
       textPanel?.step(event.shiftKey ? -1 : 1)

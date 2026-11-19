@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.5.4]
 ### Added
 - Universal back/forward navigation, throughout the app. Power users rejoice! 
 - Multiple Microsoft logins, with multi-client test workflows

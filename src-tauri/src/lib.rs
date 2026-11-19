@@ -31,6 +31,7 @@ mod links;
 mod minecraft_auth;
 mod minecraft_commands;
 mod logs;
+mod memory;
 mod mirror;
 mod mod_commands;
 mod mod_list;
@@ -319,7 +320,7 @@ pub fn run() {
             system_commands::defender_exclude,
             system_commands::defender_dismiss,
             system_commands::accept_minecraft_eula,
-            minecraft_commands::minecraft_account,
+            minecraft_commands::minecraft_accounts,
             minecraft_commands::minecraft_sign_in,
             minecraft_commands::minecraft_sign_in_cancel,
             minecraft_commands::minecraft_sign_out,

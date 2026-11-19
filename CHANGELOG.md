@@ -5,6 +5,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 ## [Unreleased]
 ### Added
 - Universal back/forward navigation, throughout the app. Power users rejoice! 
+- Multiple Microsoft logins, with multi-client test workflows
+- Option to set a server pack changelog.
 
 ### Fixed
 - Occasional flickering on the publish screen while checking for changes

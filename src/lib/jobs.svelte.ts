@@ -1,7 +1,8 @@
 import { untrack } from 'svelte'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import type { ClientSlot } from './api'
 
-export type JobName = 'client-export' | 'modrinth-export' | 'server-pack' | 'test' | 'server' | 'client' | 'publish' | 'setup' | 'git' | 'restore' | 'mods'
+export type JobName = 'client-export' | 'modrinth-export' | 'server-pack' | 'test' | 'server' | 'client' | 'second-client' | 'publish' | 'setup' | 'git' | 'restore' | 'mods'
 export type JobPhase = 'idle' | 'running' | 'done' | 'failed'
 
 export interface LogLine {
@@ -46,10 +47,29 @@ const FLUSH_MS = 50
 let nextId = 0
 
 export const jobs: Record<string, JobRecord> = $state({})
-// player is the name the backend confirmed, and serverOnline the mode the test server started in.
-export const testState = $state({ serverReady: false, players: [] as string[], player: null as string | null, serverOnline: null as boolean | null, clientJoins: false })
+export function clientJob(slot: ClientSlot) {
+  return slot === 'first' ? 'client' : 'second-client'
+}
+
+// The players are the names the backend confirmed, and serverOnline the mode the test server started in.
+export const testState = $state({
+  serverReady: false,
+  players: [] as string[],
+  player: null as string | null,
+  secondPlayer: null as string | null,
+  serverOnline: null as boolean | null,
+  clientJoins: false,
+  secondClientJoins: false,
+})
 export const serverPack = $state({ changedSinceBuild: false, changedSinceTest: false })
-export const testOptions = $state({ recopyAll: false, joinServer: false })
+const SECOND_CLIENT_KEY = 'packraven.quickTestSecondClient'
+// Whether Quick test also launches the second client is a standing choice, so it survives restarts.
+export const testOptions = $state({ recopyAll: false, joinServer: false, secondClient: localStorage.getItem(SECOND_CLIENT_KEY) === 'true', clientTab: 'first' as ClientSlot })
+
+export function setQuickTestSecondClient(on: boolean) {
+  testOptions.secondClient = on
+  localStorage.setItem(SECOND_CLIENT_KEY, String(on))
+}
 
 const serverStopListeners: (() => void)[] = []
 
@@ -153,6 +173,8 @@ function register(): Promise<UnlistenFn[]> {
       for (const listener of serverStopListeners) listener()
     } else if (payload.kind === 'player-resolved') {
       testState.player = payload.detail
+    } else if (payload.kind === 'second-player-resolved') {
+      testState.secondPlayer = payload.detail
     } else if (payload.kind === 'server-online') {
       testState.serverOnline = payload.detail === 'true'
     } else if (payload.kind === 'player-joined' && !testState.players.includes(payload.detail)) {

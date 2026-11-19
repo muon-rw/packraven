@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 import { openApp, packViews, scenarios, type Scenario, type View } from './app.ts'
 
 const cases: [View, Scenario][] = [...scenarios.filter((s) => s !== 'nopack').flatMap((s) => packViews.map((v): [View, Scenario] => [v, s])), ['add', 'nopack']]
@@ -407,6 +407,60 @@ test('Server and Run report a test server that stops on its own', async ({ page 
   await expect(page.getByText(/The test server stopped on its own/)).toBeVisible()
 })
 
+async function openRun(page: Page, query: string) {
+  await page.goto(`/?view=test&scenario=ready&${query}`)
+  await page.getByRole('heading', { level: 2, name: 'Run', exact: true }).waitFor()
+  await page.waitForLoadState('networkidle')
+}
+
+test('Quick test can launch a second client as your second account', async ({ page }) => {
+  await openRun(page, 'accounts=2')
+  const tabs = page.getByRole('tablist', { name: 'Clients' })
+  await expect(tabs.getByRole('tab', { name: 'Client', exact: true })).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByText('Logged in as muonr for client runs, and RavenAlt for the second client.')).toBeVisible()
+  const second = page.getByLabel('Launch a second client')
+  await expect(second).not.toBeChecked()
+  await second.check()
+  await page.getByRole('button', { name: 'Quick test' }).click()
+  await expect(tabs.getByRole('tab', { name: /^Second client, running/ })).toBeVisible()
+
+  await tabs.getByRole('tab', { name: /^Second client/ }).click()
+  await expect(page.getByRole('tabpanel')).toContainText("Syncing changed files to the second client's copy of the instance")
+  await expect(page.getByRole('button', { name: 'Launch second client' })).toHaveAttribute('aria-disabled', 'true')
+  await page.locator('#client-panel').locator('..').getByRole('button', { name: 'Kill', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Launch second client' })).toHaveAttribute('aria-disabled', 'false')
+  await expect(tabs.getByRole('tab', { name: 'Client, running' })).toBeVisible()
+
+  // You tick it once for the way you test, so it stays ticked.
+  await openRun(page, 'accounts=2')
+  await expect(page.getByLabel('Launch a second client')).toBeChecked()
+})
+
+test('Run offers to add a second account when you have none', async ({ page }) => {
+  await openApp(page, 'test', 'ready')
+  await expect(page.getByRole('tablist', { name: 'Clients' })).toHaveCount(0)
+  await expect(page.getByLabel('Launch a second client')).toBeDisabled()
+  await page.getByRole('button', { name: 'Add a second account' }).first().click()
+  await expect(page.getByRole('heading', { name: 'Second account' })).toBeFocused()
+  const section = page.locator('#second-minecraft-account')
+  await section.getByRole('button', { name: 'Sign in with Microsoft' }).click()
+  await expect(section).toContainText('If Microsoft offers muonr, choose Use another account.')
+  await expect(section.getByRole('status')).toHaveText('Signed in as RavenAlt.')
+  await section.getByRole('button', { name: 'Sign out' }).click()
+  await expect(section.getByRole('status')).toHaveText('Signed out of the second account.')
+})
+
+test('Run warns when a test can use more memory than is free', async ({ page }) => {
+  await openRun(page, 'accounts=2&memory=low')
+  await page.getByLabel('Launch a second client').check()
+  await page.getByRole('button', { name: 'Quick test' }).click()
+  const warning = page.getByRole('status').filter({ hasText: 'of memory' })
+  await expect(warning).toContainText('6 GB for the server and 8 GB for each client')
+  await expect(warning).toContainText('this computer has 11.4 GB free')
+  await warning.getByRole('button', { name: 'Change client memory' }).click()
+  await expect(page.getByLabel('Client memory')).toBeFocused()
+})
+
 test("starting a test clears the last run's logs", async ({ page }) => {
   await openApp(page, 'test', 'ready')
   await page.evaluate(() => {
@@ -560,11 +614,17 @@ test('extra launch arguments check what Java will receive', async ({ page }) => 
   await page.getByRole('tab', { name: 'Publishing' }).click()
   await page.getByLabel('Author', { exact: true }).fill('Raven')
   await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible()
+  await expect(page.getByLabel('Server pack changelog', { exact: true })).toHaveValue('Made with [packraven](https://packraven.app)')
+  await page.getByLabel('Server pack changelog format', { exact: true }).selectOption('html')
+  await page.getByLabel('Server pack changelog', { exact: true }).fill('<p>Server pack notes</p>')
+  await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible()
 
   // Saved arguments keep the fields open the next time you look.
   await page.getByRole('button', { name: 'Run', exact: true }).click()
   await page.getByRole('button', { name: 'Pack settings', exact: true }).click()
   await expect(page.getByLabel('Author', { exact: true })).toHaveValue('Raven')
+  await expect(page.getByLabel('Server pack changelog format', { exact: true })).toHaveValue('html')
+  await expect(page.getByLabel('Server pack changelog', { exact: true })).toHaveValue('<p>Server pack notes</p>')
   await page.getByRole('tab', { name: 'Test runs' }).click()
   await expect(page.getByRole('textbox', { name: 'Server arguments' })).toHaveValue('--world\nDebug World')
 

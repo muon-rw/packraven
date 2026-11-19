@@ -77,12 +77,34 @@ export interface MinecraftAccount {
   uuid: string
 }
 
+// The second account plays a second client, so you can test with two players at once.
+export type ClientSlot = 'first' | 'second'
+
+export type MinecraftAccounts = Record<ClientSlot, MinecraftAccount | null>
+
+// We only advise when a run asks for more memory than is free; the run still starts.
+export interface MemoryWarning {
+  available: number
+  needed: number
+  launches: { process: 'server' | 'client' | 'secondClient'; heap: number }[]
+}
+
 // packraven.toml lists CurseForge projects by number and Modrinth ones as mr:<id>.
 export type StoredModKey = number | string
 
+export type ChangelogType = 'markdown' | 'html'
+
 export interface PackConfig {
   author: string
-  curseforge: { project_id: number; release_type: string; manual_release: boolean; allowed_override_jars: string[]; exclude: string[] }
+  curseforge: {
+    project_id: number
+    release_type: string
+    manual_release: boolean
+    server_changelog: string
+    server_changelog_type: ChangelogType
+    allowed_override_jars: string[]
+    exclude: string[]
+  }
   modrinth: { project_id: string; allowed_override_jars: string[]; exclude: string[]; allowed_authors: string[] }
   export: { exclude: string[] }
   server: {
@@ -236,6 +258,7 @@ export interface Overview {
   runningJobs: string[]
   serverRunning: boolean
   clientRunning: boolean
+  secondClientRunning: boolean
   hooks: HooksState
 }
 
@@ -441,6 +464,8 @@ export interface ServerPackUpload {
   uploadPage: string
   displayName: string | null
   fileName: string | null
+  changelog: string | null
+  changelogType: ChangelogType
   error: string | null
   // Whether packraven can try the upload again.
   retryable: boolean
@@ -766,11 +791,11 @@ export const api = {
   defenderExclude: (paths: string[]) => invoke<void>('defender_exclude', { paths }),
   defenderDismiss: (dismissed: boolean) => invoke<void>('defender_dismiss', { dismissed }),
   acceptMinecraftEula: () => invoke<void>('accept_minecraft_eula'),
-  minecraftAccount: () => invoke<MinecraftAccount | null>('minecraft_account'),
+  minecraftAccounts: () => invoke<MinecraftAccounts>('minecraft_accounts'),
   // Resolves to null when you cancel.
-  minecraftSignIn: () => invoke<MinecraftAccount | null>('minecraft_sign_in'),
+  minecraftSignIn: (slot: ClientSlot) => invoke<MinecraftAccount | null>('minecraft_sign_in', { slot }),
   minecraftSignInCancel: () => invoke<void>('minecraft_sign_in_cancel'),
-  minecraftSignOut: () => invoke<void>('minecraft_sign_out'),
+  minecraftSignOut: (slot: ClientSlot) => invoke<void>('minecraft_sign_out', { slot }),
   listDir: (path: string) => invoke<DirEntry[]>('list_dir', { path }),
   readFile: (path: string, allowLarge = false) => invoke<FileContent>('read_file', { path, allowLarge }),
   writeFile: (path: string, text: string, crlf: boolean, bom: boolean) => invoke<void>('write_file', { path, text, crlf, bom }),
@@ -892,10 +917,10 @@ export const api = {
   publishedTo: (version: string) => invoke<PublishedTo | null>('published_to', { version }),
   unfinishedReleases: () => invoke<UnfinishedRelease[]>('unfinished_releases'),
   buildServerPack: () => invoke<void>('build_server_pack'),
-  startTest: (recopyAll: boolean, connect: boolean) => invoke<void>('start_test', { recopyAll, connect }),
-  startClient: (join: boolean) => invoke<void>('start_client', { join }),
+  startTest: (recopyAll: boolean, connect: boolean, secondClient: boolean) => invoke<MemoryWarning | null>('start_test', { recopyAll, connect, secondClient }),
+  startClient: (join: boolean, slot: ClientSlot) => invoke<MemoryWarning | null>('start_client', { join, slot }),
   serverCommand: (line: string) => invoke<void>('server_command', { line }),
-  killProcess: (which: 'server' | 'client') => invoke<void>('kill_process', { which }),
+  killProcess: (which: 'server' | 'client' | 'second-client') => invoke<void>('kill_process', { which }),
   publish: (options: { version: string; message: string; push: boolean; client: UploadNames; server: UploadNames; updateChecker: UpdateType | null; announcementImages: string[] }) => invoke<void>('publish', { options }),
   releases: (offset?: number, limit?: number) => invoke<ReleasesPage>('releases', { offset: offset ?? null, limit: limit ?? null }),
   outputDir: () => invoke<string>('output_dir'),

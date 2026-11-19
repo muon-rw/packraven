@@ -26,10 +26,47 @@ const XSTS_URL: &str = "https://xsts.auth.xboxlive.com/xsts/authorize";
 const MINECRAFT_LOGIN_URL: &str = "https://api.minecraftservices.com/authentication/login_with_xbox";
 const ENTITLEMENTS_URL: &str = "https://api.minecraftservices.com/entitlements/mcstore";
 const PROFILE_URL: &str = "https://api.minecraftservices.com/minecraft/profile";
-const KEYCHAIN_USER: &str = "microsoft-refresh-token";
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 // We renew a little early, so a token can't expire between a test run's start and the client's launch.
 const RENEW_BEFORE_EXPIRY: Duration = Duration::from_secs(600);
+
+// The second slot lets you test with two players at once, so it must hold a different account.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Slot {
+    First,
+    Second,
+}
+
+impl Slot {
+    fn keychain_user(self) -> &'static str {
+        match self {
+            Slot::First => "microsoft-refresh-token",
+            Slot::Second => "microsoft-refresh-token-second",
+        }
+    }
+
+    fn account_file(self) -> &'static str {
+        match self {
+            Slot::First => "minecraft-account.json",
+            Slot::Second => "minecraft-account-second.json",
+        }
+    }
+
+    fn other(self) -> Slot {
+        match self {
+            Slot::First => Slot::Second,
+            Slot::Second => Slot::First,
+        }
+    }
+
+    pub fn sign_in_first(self) -> &'static str {
+        match self {
+            Slot::First => "Sign in to Minecraft to launch the client.",
+            Slot::Second => "Sign in a second Minecraft account under App settings to launch a second client.",
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -51,7 +88,20 @@ impl Session {
     }
 }
 
-pub type SessionCache = Mutex<Option<Session>>;
+#[derive(Default)]
+pub struct Sessions {
+    first: Mutex<Option<Session>>,
+    second: Mutex<Option<Session>>,
+}
+
+impl Sessions {
+    fn cache(&self, slot: Slot) -> &Mutex<Option<Session>> {
+        match slot {
+            Slot::First => &self.first,
+            Slot::Second => &self.second,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct MicrosoftTokens {
@@ -70,20 +120,20 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
-fn account_path() -> PathBuf {
-    config_dir().join("minecraft-account.json")
+fn account_path(slot: Slot) -> PathBuf {
+    config_dir().join(slot.account_file())
 }
 
-fn stored_refresh_token() -> Option<String> {
-    keychain::get(KEYCHAIN_USER).filter(|t| !t.is_empty())
+fn stored_refresh_token(slot: Slot) -> Option<String> {
+    keychain::get(slot.keychain_user()).filter(|t| !t.is_empty())
 }
 
-pub fn account() -> Option<Account> {
-    stored_refresh_token()?;
-    serde_json::from_str(&std::fs::read_to_string(account_path()).ok()?).ok()
+pub fn account(slot: Slot) -> Option<Account> {
+    stored_refresh_token(slot)?;
+    serde_json::from_str(&std::fs::read_to_string(account_path(slot)).ok()?).ok()
 }
 
-pub async fn sign_in(open: impl FnOnce(&str) -> Result<()>, cancel: oneshot::Receiver<()>) -> Result<Option<Session>> {
+pub async fn sign_in(slot: Slot, open: impl FnOnce(&str) -> Result<()>, cancel: oneshot::Receiver<()>) -> Result<Option<Session>> {
     let listener = TcpListener::bind("127.0.0.1:0").await.context("opening a local port for the Microsoft sign-in")?;
     let redirect = format!("http://localhost:{}", listener.local_addr()?.port());
     let verifier = random_token()?;
@@ -110,7 +160,12 @@ pub async fn sign_in(open: impl FnOnce(&str) -> Result<()>, cancel: oneshot::Rec
     };
     let result = async {
         let tokens = microsoft_tokens(&[("grant_type", "authorization_code"), ("code", &code), ("redirect_uri", &redirect), ("code_verifier", &verifier)]).await?;
-        finish(tokens).await
+        let session = minecraft_session(&tokens.access_token).await?;
+        if account(slot.other()).is_some_and(|other| other.uuid == session.account.uuid) {
+            bail!(already_signed_in(slot, &session.account.name));
+        }
+        save(slot, &tokens.refresh_token, &session.account)?;
+        Ok(session)
     }
     .await;
     // Xbox or Minecraft can still refuse after Microsoft accepts, so the browser waits for the whole chain.
@@ -121,38 +176,52 @@ pub async fn sign_in(open: impl FnOnce(&str) -> Result<()>, cancel: oneshot::Rec
     result.map(Some)
 }
 
-pub async fn session(cache: &SessionCache) -> Result<Session> {
-    let mut cached = cache.lock().await;
+// Microsoft's account picker offers the account your browser is already signed in to, which is easy
+// to pick by mistake for the second slot.
+fn already_signed_in(slot: Slot, name: &str) -> String {
+    match slot {
+        Slot::First => format!("{name} is already your second account. Sign it out there first, or choose a different Microsoft account."),
+        Slot::Second => format!("{name} is already your main account. Sign in again and choose a different Microsoft account, using \"Use another account\" if Microsoft offers {name}."),
+    }
+}
+
+pub async fn session(sessions: &Sessions, slot: Slot) -> Result<Session> {
+    let mut cached = sessions.cache(slot).lock().await;
     if let Some(session) = cached.as_ref().filter(|s| s.expires_at > Instant::now() + RENEW_BEFORE_EXPIRY) {
         return Ok(session.clone());
     }
-    let refresh_token = stored_refresh_token().context("You're not signed in to Minecraft. Sign in under App settings.")?;
+    let refresh_token = stored_refresh_token(slot).context(slot.sign_in_first())?;
     let tokens = match microsoft_tokens(&[("grant_type", "refresh_token"), ("refresh_token", &refresh_token)]).await {
         Ok(tokens) => tokens,
         // Microsoft refuses a refresh token that expired or was revoked, and no retry fixes that, so we
         // sign out rather than keep showing an account that can't launch.
         Err(e) if e.is::<Refused>() => {
-            let name = account().map(|a| format!(" for {}", a.name)).unwrap_or_default();
+            let name = account(slot).map(|a| format!(" for {}", a.name)).unwrap_or_default();
             cached.take();
-            forget_sign_in()?;
+            forget_sign_in(slot)?;
             bail!("Microsoft no longer accepts your sign-in{name}, so we signed you out. Sign in again to launch the client.");
         }
         Err(e) => return Err(e.context("Couldn't reach Microsoft to renew your Minecraft sign-in. Check your internet connection and try again")),
     };
-    let session = finish(tokens).await?;
+    let session = minecraft_session(&tokens.access_token).await?;
+    save(slot, &tokens.refresh_token, &session.account)?;
     *cached = Some(session.clone());
     Ok(session)
 }
 
-pub async fn sign_out(cache: &SessionCache) -> Result<()> {
-    cache.lock().await.take();
-    forget_sign_in()
+pub async fn remember(sessions: &Sessions, slot: Slot, session: Session) {
+    *sessions.cache(slot).lock().await = Some(session);
 }
 
-fn forget_sign_in() -> Result<()> {
-    keychain::remove(KEYCHAIN_USER).context("removing your Microsoft sign-in from the system keychain")?;
-    match std::fs::remove_file(account_path()) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).context("removing minecraft-account.json"),
+pub async fn sign_out(sessions: &Sessions, slot: Slot) -> Result<()> {
+    sessions.cache(slot).lock().await.take();
+    forget_sign_in(slot)
+}
+
+fn forget_sign_in(slot: Slot) -> Result<()> {
+    keychain::remove(slot.keychain_user()).context("removing your Microsoft sign-in from the system keychain")?;
+    match std::fs::remove_file(account_path(slot)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| format!("removing {}", slot.account_file())),
         _ => Ok(()),
     }
 }
@@ -215,13 +284,11 @@ async fn microsoft_tokens(grant: &[(&str, &str)]) -> Result<MicrosoftTokens> {
 }
 
 // Microsoft rotates the refresh token on every use, so we save the new one each time.
-async fn finish(tokens: MicrosoftTokens) -> Result<Session> {
-    let session = minecraft_session(&tokens.access_token).await?;
-    keychain::set(KEYCHAIN_USER, &tokens.refresh_token).context("saving your Microsoft sign-in to the system keychain")?;
-    let path = account_path();
+fn save(slot: Slot, refresh_token: &str, account: &Account) -> Result<()> {
+    keychain::set(slot.keychain_user(), refresh_token).context("saving your Microsoft sign-in to the system keychain")?;
+    let path = account_path(slot);
     std::fs::create_dir_all(path.parent().context("the config folder has no parent")?)?;
-    std::fs::write(path, serde_json::to_string_pretty(&session.account)?).context("writing minecraft-account.json")?;
-    Ok(session)
+    std::fs::write(path, serde_json::to_string_pretty(account)?).with_context(|| format!("writing {}", slot.account_file()))
 }
 
 async fn minecraft_session(microsoft_token: &str) -> Result<Session> {

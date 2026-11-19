@@ -202,7 +202,22 @@ mod tests {
     }
 }
 
-pub fn client(settings: &Settings, pack: &Pack, player: &Player, server: Option<&str>, natives_dir: &Path) -> Result<ClientLaunch> {
+// A CurseForge profile's own Java arguments replace our memory setting, as they do when CurseForge launches it.
+fn memory_args(java_args: Option<String>, pack: &Pack) -> Vec<String> {
+    match java_args {
+        Some(java_args) => split_args(&java_args),
+        None => vec![format!("-Xmx{}", pack.config.test.client_memory)],
+    }
+}
+
+pub fn client_heap_args(settings: &Settings, pack: &Pack) -> Vec<String> {
+    let mut args = memory_args(launcher_profile(&settings.install_dir, &settings.instance_dir).java_args, pack);
+    args.extend(settings.combined_run_args(&settings.instance_dir).client_jvm());
+    args
+}
+
+/// Launches the selected pack's instance with its game files read from `game_dir`, which can be a copy of the instance.
+pub fn client(settings: &Settings, pack: &Pack, player: &Player, server: Option<&str>, game_dir: &Path, natives_dir: &Path) -> Result<ClientLaunch> {
     let install = &settings.install_dir;
     let id = Instance::read(&settings.instance_dir)?.version_id.context("this profile has no mod loader; choose one in the CurseForge app")?;
     let child = read_version(install, &id)?;
@@ -238,7 +253,7 @@ pub fn client(settings: &Settings, pack: &Pack, player: &Player, server: Option<
     let values: HashMap<&str, String> = [
         ("auth_player_name", player.name.clone()),
         ("version_name", id.clone()),
-        ("game_directory", settings.instance_dir.to_string_lossy().into_owned()),
+        ("game_directory", game_dir.to_string_lossy().into_owned()),
         ("assets_root", install.join("assets").to_string_lossy().into_owned()),
         ("assets_index_name", assets_index),
         ("auth_uuid", player.uuid.clone()),
@@ -288,10 +303,7 @@ pub fn client(settings: &Settings, pack: &Pack, player: &Player, server: Option<
     if crate::java::needs_java4shell_flag(required_java(settings).1) {
         args.push(crate::java::JAVA4SHELL_FLAG.into());
     }
-    match profile.java_args {
-        Some(java_args) => args.extend(split_args(&java_args)),
-        None => args.push(format!("-Xmx{}", pack.config.test.client_memory)),
-    }
+    args.extend(memory_args(profile.java_args, pack));
     args.extend(run_args.client_jvm());
     if let Some(logging) = parent.pointer("/logging/client") {
         let file = logging.pointer("/file/id").and_then(Value::as_str).unwrap_or_default();

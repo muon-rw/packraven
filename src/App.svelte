@@ -4,7 +4,7 @@
   import { onMount, tick } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
   import { api, errorText, type Overview, type PackList, type Platform } from './lib/api'
-  import { minecraft, refreshAccount } from './lib/minecraft.svelte'
+  import { minecraft, refreshAccounts } from './lib/minecraft.svelte'
   import { job, jobs, onJobEnd, serverPack, setJobPack, startListening, testState } from './lib/jobs.svelte'
   import Changes from './views/Changes.svelte'
   import Server from './views/Server.svelte'
@@ -68,7 +68,7 @@
   let hooksDismissed = $state(false)
   let account = $derived(minecraft.account)
   // When a renewal fails at launch, the backend signs you out, so we read the account again.
-  for (const name of ['client', 'test'] as const) onJobEnd(name, (phase) => phase === 'failed' && refreshAccount())
+  for (const name of ['client', 'second-client', 'test'] as const) onJobEnd(name, (phase) => phase === 'failed' && refreshAccounts())
 
   // We refresh when files, git refs or the mod list change, so the timer only catches changes with no
   // event. A test client can rewrite configs every second, and each refresh runs git several times,
@@ -152,7 +152,7 @@
   onMount(() => {
     startListening()
     startWatching()
-    refreshAccount()
+    refreshAccounts()
     const stopSelfUpdates = startSelfUpdates()
     // When CurseForge approves a jar you uploaded, nothing changes on disk, so while one is waiting we
     // check again on the timer. In the background we ask CurseForge about it at most once a minute.
@@ -183,17 +183,19 @@
     refresh()
   })
 
-  function killWarning(server: boolean, client: boolean) {
-    if (server && client) return "The test server and client are still running. If you switch packs, packraven kills them, and the server doesn't save its world."
+  function killWarning(server: boolean, clients: number) {
+    const clientsText = clients > 1 ? 'both clients' : 'client'
+    if (server && clients) return `The test server and ${clientsText} are still running. If you switch packs, packraven kills them, and the server doesn't save its world.`
     if (server) return "The test server is still running. If you switch packs, packraven kills it without saving its world."
-    return 'The test client is still running. If you switch packs, packraven kills it.'
+    return clients > 1 ? 'Both test clients are still running. If you switch packs, packraven kills them.' : 'The test client is still running. If you switch packs, packraven kills it.'
   }
 
   async function switchPack(dir: string) {
     const leaving = dir !== packs?.active
-    const killTests = leaving && !!(overview?.serverRunning || overview?.clientRunning)
+    const clients = Number(!!overview?.clientRunning) + Number(!!overview?.secondClientRunning)
+    const killTests = leaving && !!(overview?.serverRunning || clients)
     if (killTests) {
-      const confirmed = await ask(killWarning(!!overview?.serverRunning, !!overview?.clientRunning), {
+      const confirmed = await ask(killWarning(!!overview?.serverRunning, clients), {
         title: 'Test still running',
         kind: 'warning',
         okLabel: 'Kill and switch',
@@ -286,7 +288,7 @@
       ? `${testState.players.join(', ')} joined`
       : [
           testState.serverReady ? 'Server up' : overview?.serverRunning ? 'Server starting' : null,
-          overview?.clientRunning ? 'Client running' : null,
+          overview?.clientRunning && overview.secondClientRunning ? 'Clients running' : overview?.clientRunning || overview?.secondClientRunning ? 'Client running' : null,
         ]
           .filter(Boolean)
           .join(', ') || undefined,
@@ -936,7 +938,7 @@
     {:else if pane === 'server'}
       <Server {overview} onfiles={(path) => openFileBesideIfRoom(path, index)} />
     {:else if pane === 'test'}
-      <TestRun {overview} onserver={() => showFrom('server', index)} onappsettings={() => showFromWithAnchor('settings', index)} />
+      <TestRun {overview} onserver={() => showFrom('server', index)} onappsettings={() => showFromWithAnchor('settings', index)} onpacksettings={() => showFromWithAnchor('pack', index)} />
     {:else if pane === 'files'}
       {#if loadError}<div class="banner">{@render loadNotice(index)}</div>{/if}
       {#await loadFiles() then { default: Files }}

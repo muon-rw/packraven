@@ -13,6 +13,8 @@ use crate::export;
 use crate::git;
 use crate::jobs::{JobQueue, Jobs};
 use crate::launch;
+use crate::memory::{Memory, MemoryWarning, Process};
+use crate::minecraft_auth::{Sessions, Slot};
 use crate::allowlist::Allowlist;
 use crate::links::Skew;
 use crate::pack::{ModKey, Pack, PackConfig, Platform};
@@ -33,7 +35,7 @@ pub struct AppState {
     pub watch_error: Mutex<Option<String>>,
     pub history: Mutex<crate::history::History>,
     pub mod_list: Mutex<crate::mod_list::ModListState>,
-    pub minecraft: Arc<crate::minecraft_auth::SessionCache>,
+    pub minecraft: Arc<crate::minecraft_auth::Sessions>,
     pub minecraft_sign_in: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
@@ -154,6 +156,7 @@ pub struct Overview {
     running_jobs: Vec<String>,
     server_running: bool,
     client_running: bool,
+    second_client_running: bool,
     hooks: crate::setup::HooksState,
 }
 
@@ -303,7 +306,8 @@ pub fn overview(state: State<'_, AppState>) -> CmdResult<Overview> {
         modrinth_project_id: pack.config.modrinth.project_id.trim().to_string(),
         running_jobs: state.jobs.running(),
         server_running: state.test.server.lock().unwrap().is_some(),
-        client_running: state.test.client.lock().unwrap().is_some(),
+        client_running: state.test.client_running(Slot::First),
+        second_client_running: state.test.client_running(Slot::Second),
         hooks: crate::setup::hooks_state(&pack.dir),
     })
 }
@@ -806,7 +810,7 @@ fn mods_changing(state: &AppState) -> bool {
 }
 
 #[tauri::command]
-pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, connect: bool) -> CmdResult<()> {
+pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, connect: bool, second_client: bool) -> CmdResult<Option<MemoryWarning>> {
     if state.test.server.lock().unwrap().is_some() {
         return Err("the test server is already running".into());
     }
@@ -818,25 +822,43 @@ pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, 
     if !settings.minecraft_eula_accepted {
         return Err("Accept the Minecraft EULA before you start a test server.".into());
     }
-    if connect && crate::minecraft_auth::account().is_none() {
-        return Err(crate::minecraft_commands::SIGN_IN_FIRST.into());
+    let clients: &[Slot] = match (connect, second_client) {
+        (false, _) => &[],
+        (true, false) => &[Slot::First],
+        (true, true) => &[Slot::First, Slot::Second],
+    };
+    if let Some(slot) = clients.iter().find(|slot| crate::minecraft_auth::account(**slot).is_none()) {
+        return Err(slot.sign_in_first().into());
+    }
+    if let Some(slot) = clients.iter().find(|slot| state.test.client_running(**slot)) {
+        return Err(already_running(*slot).into());
     }
     let pack = state.pack().map_err(err)?;
     let java = launch::java(&settings).map_err(err)?;
+    let warning = memory_warning(&settings, &pack, true, clients);
     let (data_dir, cache_path) = (state.data_dir.clone(), state.cache_path());
     let test_dir = state.pack_data().join("test-server");
-    let natives = state.pack_data().join("natives");
     let tested = testrun::JoinRecord::new(&state.pack_data(), &pack).map_err(err)?;
     let run_args = settings.combined_run_args(&settings.instance_dir);
     let jobs = state.jobs.clone();
     let run = state.test.clone();
     let minecraft = state.minecraft.clone();
+    let launcher = ClientLauncher::new(&app, &state);
     let job_app = app.clone();
+    let logged_warning = warning.clone();
     state.jobs.start(&app, "test", move |log| async move {
-        // We check the sign-in before building anything, so a lapsed one fails fast.
-        let player = if connect { Some(crate::minecraft_commands::signed_in_player(&minecraft).await?) } else { None };
-        if let Some(player) = &player {
-            testrun::announce_player(&job_app, player);
+        if let Some(warning) = &logged_warning {
+            warning.log(&log);
+        }
+        // We check the sign-ins before building anything, so a lapsed one fails fast.
+        for &slot in clients {
+            let player = crate::minecraft_commands::signed_in_player(&minecraft, slot).await?;
+            testrun::announce_player(&job_app, slot, &player);
+        }
+        let (ready_tx, ready_rx) = watch::channel(false);
+        // Copying the instance for the second client can take minutes the first time, so it copies while the server starts.
+        if clients.contains(&Slot::Second) {
+            launcher.start(Slot::Second, true, Some(ready_rx.clone()), None).map_err(anyhow::Error::msg)?;
         }
         let version = pack.version().unwrap_or_else(|| "dev".into());
         let sides = classify_cached(&cache_path, &pack).await?;
@@ -849,49 +871,106 @@ pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, 
             log.info("This pack's server.properties turns online mode off, so the test server won't check accounts");
         }
         log.info(report.to_string());
-        let (ready_tx, mut ready_rx) = watch::channel(false);
         let server_pack = Pack::open(&pack.dir)?;
         let (server_app, server_run) = (job_app.clone(), run.clone());
         jobs.start(&job_app, "server", move |server_log| async move {
             testrun::run_server(server_app, server_run, &server_pack, java, test_dir, run_args, ready_tx, tested, server_log).await
         })
         .map_err(anyhow::Error::msg)?;
-        let Some(player) = player else { return Ok("Server starting".into()) };
-        log.info("Waiting for the server to finish starting");
-        while !*ready_rx.borrow() {
-            if ready_rx.changed().await.is_err() {
-                anyhow::bail!("the server stopped before it finished starting");
-            }
+        if !clients.contains(&Slot::First) {
+            return Ok("Server starting".into());
         }
-        let client_pack = Pack::open(&pack.dir)?;
-        let client_app = job_app.clone();
-        jobs.start(&job_app, "client", move |client_log| async move {
-            testrun::run_client(client_app, run, &settings, &client_pack, natives, true, player, client_log).await
-        })
-        .map_err(anyhow::Error::msg)?;
-        Ok("Server ready, client launching".into())
+        log.info("Waiting for the server to finish starting");
+        wait_until_ready(ready_rx).await?;
+        launcher.start(Slot::First, true, None, None).map_err(anyhow::Error::msg)?;
+        Ok(if clients.len() > 1 { "Server ready, clients launching" } else { "Server ready, client launching" }.into())
     })
+    .map(|()| warning)
+}
+
+fn already_running(slot: Slot) -> &'static str {
+    match slot {
+        Slot::First => "The client is already running.",
+        Slot::Second => "The second client is already running.",
+    }
+}
+
+fn memory_warning(settings: &Settings, pack: &Pack, server: bool, clients: &[Slot]) -> Option<MemoryWarning> {
+    let memory = Memory::now()?;
+    let mut launches = Vec::new();
+    if server {
+        let extra_jvm = settings.combined_run_args(&settings.instance_dir).server_jvm();
+        launches.push(memory.launch(Process::Server, &export::server_heap_args(pack, &extra_jvm)));
+    }
+    let client_args = launch::client_heap_args(settings, pack);
+    for slot in clients {
+        launches.push(memory.launch(if *slot == Slot::First { Process::Client } else { Process::SecondClient }, &client_args));
+    }
+    memory.check(launches)
+}
+
+async fn wait_until_ready(mut ready: watch::Receiver<bool>) -> Result<()> {
+    while !*ready.borrow_and_update() {
+        if ready.changed().await.is_err() {
+            anyhow::bail!("the test server stopped before it finished starting");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct ClientLauncher {
+    app: AppHandle,
+    jobs: Jobs,
+    run: Arc<TestRun>,
+    sessions: Arc<Sessions>,
+    settings: Settings,
+    pack_data: PathBuf,
+}
+
+impl ClientLauncher {
+    fn new(app: &AppHandle, state: &AppState) -> Self {
+        Self { app: app.clone(), jobs: state.jobs.clone(), run: state.test.clone(), sessions: state.minecraft.clone(), settings: state.settings(), pack_data: state.pack_data() }
+    }
+
+    fn start(&self, slot: Slot, join: bool, server_ready: Option<watch::Receiver<bool>>, warning: Option<MemoryWarning>) -> Result<(), String> {
+        let this = self.clone();
+        self.jobs.start(&self.app, testrun::client_job(slot), move |log| async move {
+            if let Some(warning) = warning {
+                warning.log(&log);
+            }
+            let player = crate::minecraft_commands::signed_in_player(&this.sessions, slot).await?;
+            testrun::announce_player(&this.app, slot, &player);
+            let dirs = testrun::client_dirs(slot, &this.settings.instance_dir, &this.pack_data);
+            if slot == Slot::Second {
+                let (instance, game, sync_log) = (this.settings.instance_dir.clone(), dirs.game.clone(), log.clone());
+                tokio::task::spawn_blocking(move || testrun::sync_second_client(&instance, &game, &sync_log)).await??;
+            }
+            if let Some(ready) = server_ready {
+                log.info("Waiting for the test server to finish starting");
+                wait_until_ready(ready).await?;
+            }
+            let pack = Pack::open(&this.settings.instance_dir)?;
+            testrun::run_client(this.app, this.run, &this.settings, &pack, slot, dirs, join, player, log).await
+        })
+    }
 }
 
 #[tauri::command]
-pub fn start_client(app: AppHandle, state: State<'_, AppState>, join: bool) -> CmdResult<()> {
+pub fn start_client(app: AppHandle, state: State<'_, AppState>, join: bool, slot: Slot) -> CmdResult<Option<MemoryWarning>> {
     if mods_changing(&state) {
         return Err(MODS_CHANGING.into());
     }
-    if crate::minecraft_auth::account().is_none() {
-        return Err(crate::minecraft_commands::SIGN_IN_FIRST.into());
+    if crate::minecraft_auth::account(slot).is_none() {
+        return Err(slot.sign_in_first().into());
+    }
+    if state.test.client_running(slot) {
+        return Err(already_running(slot).into());
     }
     let settings = state.settings();
-    let pack = state.pack().map_err(err)?;
-    let natives = state.pack_data().join("natives");
-    let run = state.test.clone();
-    let minecraft = state.minecraft.clone();
-    let job_app = app.clone();
-    state.jobs.start(&app, "client", move |log| async move {
-        let player = crate::minecraft_commands::signed_in_player(&minecraft).await?;
-        testrun::announce_player(&job_app, &player);
-        testrun::run_client(job_app, run, &settings, &pack, natives, join, player, log).await
-    })
+    let warning = memory_warning(&settings, &state.pack().map_err(err)?, false, &[slot]);
+    ClientLauncher::new(&app, &state).start(slot, join, None, warning.clone())?;
+    Ok(warning)
 }
 
 #[tauri::command]
@@ -902,7 +981,11 @@ pub async fn server_command(state: State<'_, AppState>, line: String) -> CmdResu
 
 #[tauri::command]
 pub fn kill_process(state: State<'_, AppState>, which: String) -> CmdResult<()> {
-    let slot = if which == "server" { &state.test.server } else { &state.test.client };
+    let slot = match which.as_str() {
+        "server" => &state.test.server,
+        "second-client" => &state.test.second_client,
+        _ => &state.test.client,
+    };
     if let Some(process) = slot.lock().unwrap().as_ref() {
         process.kill();
     }

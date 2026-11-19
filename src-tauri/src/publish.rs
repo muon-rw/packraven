@@ -12,7 +12,7 @@ use crate::modrinth;
 use crate::git;
 use crate::jobs::Log;
 use crate::git::Identity;
-use crate::pack::{version_problem, LockEntry, ModLoader, ModrinthFile, Pack, Platform, CHANGELOG_ARCHIVE};
+use crate::pack::{version_problem, ChangelogType, LockEntry, ModLoader, ModrinthFile, Pack, Platform, CHANGELOG_ARCHIVE};
 use crate::{links, twins};
 use crate::sides::{self, MetadataCache};
 use crate::modsync;
@@ -130,6 +130,8 @@ pub struct ServerPackUpload {
     pub upload_page: String,
     pub display_name: Option<String>,
     pub file_name: Option<String>,
+    pub changelog: Option<String>,
+    pub changelog_type: ChangelogType,
     pub error: Option<String>,
     /// Whether packraven can try the upload again.
     pub retryable: bool,
@@ -502,7 +504,17 @@ pub async fn publish(ctx: PublishContext, options: PublishOptions, log: Log) -> 
         let mut curseforge = CurseforgeRelease { project_id: pack.config.curseforge.project_id, file_id, server_file_id: None, unsent_server_pack: Some(unsent), server_pack_uploaded_by_you: false, last_upload: Some(chrono::Utc::now().to_rfc3339()) };
         release.curseforge = Some(curseforge.clone());
         record(&pack, &releases_path, &release, &notes, &baseline_path)?;
-        if let Err(error) = upload_server_pack(&mut curseforge, &server_zip, server_names, &release_type, &log).await {
+        if let Err(error) = upload_server_pack(
+            &mut curseforge,
+            &server_zip,
+            server_names,
+            &release_type,
+            &pack.config.curseforge.server_changelog,
+            pack.config.curseforge.server_changelog_type,
+            &log,
+        )
+        .await
+        {
             log.stream("err", &format!("Couldn't upload the server pack: {error:#}"));
         }
         release.curseforge = Some(curseforge);
@@ -655,8 +667,26 @@ fn warn_if_unconfirmed(error: anyhow::Error, project_id: u64, what: &str) -> any
     }
 }
 
+fn server_pack_metadata(names: &UploadNames, parent_file_id: u64, release_type: &str, changelog: &str, changelog_type: ChangelogType) -> serde_json::Value {
+    json!({
+        "changelog": changelog,
+        "changelogType": changelog_type.as_str(),
+        "displayName": names.display_name,
+        "parentFileID": parent_file_id,
+        "releaseType": release_type,
+    })
+}
+
 // Either way the outcome goes on the release: the server file, or why it isn't there.
-async fn upload_server_pack(curseforge: &mut CurseforgeRelease, zip: &Path, names: UploadNames, release_type: &str, log: &Log) -> Result<ServerPackOutcome> {
+async fn upload_server_pack(
+    curseforge: &mut CurseforgeRelease,
+    zip: &Path,
+    names: UploadNames,
+    release_type: &str,
+    changelog: &str,
+    changelog_type: ChangelogType,
+    log: &Log,
+) -> Result<ServerPackOutcome> {
     let size = std::fs::metadata(zip)?.len();
     if size > curseforge::UPLOAD_LIMIT {
         let error = format!("The server pack is {}, more than packraven can upload to CurseForge", curseforge::gigabytes(size));
@@ -665,13 +695,7 @@ async fn upload_server_pack(curseforge: &mut CurseforgeRelease, zip: &Path, name
         return Ok(ServerPackOutcome::TooLarge(size));
     }
     log.info(format!("Uploading {} as {}", zip.display(), names.file_name));
-    // We put the release notes on the client pack only; repeating them here just clutters the file list.
-    let metadata = json!({
-        "changelog": "",
-        "displayName": names.display_name,
-        "parentFileID": curseforge.file_id,
-        "releaseType": release_type,
-    });
+    let metadata = server_pack_metadata(&names, curseforge.file_id, release_type, changelog, changelog_type);
     match curseforge::upload(curseforge.project_id, zip, names.file_name.clone(), metadata, log).await {
         Ok(server_file_id) => {
             log.info(format!("Uploaded the server pack as file {server_file_id}"));
@@ -708,6 +732,8 @@ pub fn awaiting_server_pack(pack: Option<&Pack>, pack_data: &Path, release: &Rel
         upload_page: curseforge::additional_file_page(curseforge.project_id, curseforge.file_id),
         display_name: unsent.map(|u| u.names.display_name.clone()),
         file_name: unsent.map(|u| u.names.file_name.clone()),
+        changelog: pack.map(|p| p.config.curseforge.server_changelog.as_str()).filter(|s| !s.trim().is_empty()).map(str::to_string),
+        changelog_type: pack.map(|p| p.config.curseforge.server_changelog_type).unwrap_or_default(),
         error: unsent.map(|u| u.error.clone()),
         tag: release_tag(&release.version),
     })
@@ -740,7 +766,16 @@ pub async fn upload_release_server_pack(pack: &Pack, paths: &ReleasePaths, versi
     curseforge::check_website_upload_size(&zip, "server pack")?;
     let names = curseforge.unsent_server_pack.as_ref().map_or_else(|| default_server_names(pack), |u| u.names.clone());
     let names = UploadNames { display_name: names.display_name.replace(VERSION_TOKEN, version), file_name: names.file_name.replace(VERSION_TOKEN, version) };
-    let outcome = upload_server_pack(curseforge, &zip, names, &release_type, log).await;
+    let outcome = upload_server_pack(
+        curseforge,
+        &zip,
+        names,
+        &release_type,
+        &pack.config.curseforge.server_changelog,
+        pack.config.curseforge.server_changelog_type,
+        log,
+    )
+    .await;
     save_release(&releases_path, &release)?;
     outcome
 }
@@ -1161,12 +1196,36 @@ mod tests {
         std::fs::File::create(&path).unwrap().set_len(crate::curseforge::UPLOAD_LIMIT + 1).unwrap();
         let mut curseforge = super::CurseforgeRelease { project_id: 5, file_id: 6, server_file_id: None, unsent_server_pack: None, server_pack_uploaded_by_you: false, last_upload: None };
         let names = super::UploadNames { display_name: "Server Pack 1.0".into(), file_name: "pack-server.zip".into() };
-        let outcome = super::upload_server_pack(&mut curseforge, &path, names, "release", &crate::jobs::Log::console("test")).await.unwrap();
+        let outcome = super::upload_server_pack(
+            &mut curseforge,
+            &path,
+            names,
+            "release",
+            "",
+            super::ChangelogType::Markdown,
+            &crate::jobs::Log::console("test"),
+        )
+        .await
+        .unwrap();
         std::fs::remove_file(&path).unwrap();
         assert!(matches!(outcome, super::ServerPackOutcome::TooLarge(size) if size == crate::curseforge::UPLOAD_LIMIT + 1));
         let unsent = curseforge.unsent_server_pack.as_ref().unwrap();
         assert!(unsent.too_large && unsent.error == "The server pack is 1.07 GB, more than packraven can upload to CurseForge", "{}", unsent.error);
         assert!(curseforge.awaits_server_pack());
+    }
+
+    #[test]
+    fn server_pack_metadata_includes_changelog_and_type() {
+        let names = super::UploadNames { display_name: "Server Pack 1.0".into(), file_name: "pack-server.zip".into() };
+        let md = super::server_pack_metadata(&names, 42, "beta", "Made with [packraven](https://packraven.app)", super::ChangelogType::Markdown);
+        assert_eq!(md["changelog"], "Made with [packraven](https://packraven.app)");
+        assert_eq!(md["changelogType"], "markdown");
+        assert_eq!(md["parentFileID"], 42);
+        assert_eq!(md["releaseType"], "beta");
+
+        let html = super::server_pack_metadata(&names, 42, "release", "<p>Custom</p>", super::ChangelogType::Html);
+        assert_eq!(html["changelog"], "<p>Custom</p>");
+        assert_eq!(html["changelogType"], "html");
     }
 
     #[test]

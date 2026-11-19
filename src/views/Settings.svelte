@@ -8,11 +8,11 @@
   import { open } from '@tauri-apps/plugin-dialog'
   import { disable, enable, isEnabled } from '@tauri-apps/plugin-autostart'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type CredentialsView, type DefenderView, type RunArgs, type Settings, type UpdateView } from '../lib/api'
+  import { api, errorText, type ClientSlot, type CredentialsView, type DefenderView, type RunArgs, type Settings, type UpdateView } from '../lib/api'
   import { installNow, openUpdateChangelog, selfUpdate, updateWaiting } from '../lib/selfUpdate.svelte'
   import { javas, scanJava } from '../lib/java.svelte'
   import { trackSave } from '../lib/launch.svelte'
-  import { cancelSignIn, minecraft, signIn, signOut } from '../lib/minecraft.svelte'
+  import { accountIn, cancelSignIn, minecraft, signIn, signOut } from '../lib/minecraft.svelte'
   import { appSettingsView } from '../lib/nav.svelte'
 
   let { onchange }: { onchange: () => void } = $props()
@@ -88,52 +88,53 @@
     await Promise.all([loadCredentials(), loadAccount()])
   }
 
-  let account = $derived(minecraft.account)
-  let signingIn = $derived(minecraft.signingIn)
-  let accountError = $state<{ text: string; retry: () => void } | null>(null)
-  // We keep one live region and change its text, since screen readers often miss a status that appears.
-  let accountStatus = $state('')
-  let accountButton: HTMLButtonElement | undefined = $state()
+  type AccountUi = { error: { text: string; retry: () => void } | null; status: string; button?: HTMLButtonElement }
+  // We keep one live region per account and change its text, since screen readers often miss a status that appears.
+  const accountUi = $state<Record<ClientSlot, AccountUi>>({ first: { error: null, status: '' }, second: { error: null, status: '' } })
 
   // Each state swaps the button you just pressed for another, so we move focus to the new one.
-  async function focusAccountButton() {
+  async function focusAccountButton(slot: ClientSlot) {
     await tick()
-    accountButton?.focus()
+    accountUi[slot].button?.focus()
   }
 
   async function loadAccount() {
     try {
-      minecraft.account = await api.minecraftAccount()
-      accountError = null
+      const accounts = await api.minecraftAccounts()
+      minecraft.account = accounts.first
+      minecraft.second = accounts.second
+      accountUi.first.error = null
     } catch (error) {
-      accountError = { text: `Couldn't read your Minecraft sign-in: ${errorText(error)}`, retry: loadAccount }
+      accountUi.first.error = { text: `Couldn't read your Minecraft sign-ins: ${errorText(error)}`, retry: loadAccount }
     }
   }
 
-  async function startSignIn() {
-    accountError = null
-    accountStatus = 'Waiting for you to sign in with Microsoft in your browser.'
-    const signingIn = signIn()
-    focusAccountButton()
+  async function startSignIn(slot: ClientSlot) {
+    const ui = accountUi[slot]
+    ui.error = null
+    ui.status = 'Waiting for you to sign in with Microsoft in your browser.'
+    const signingIn = signIn(slot)
+    focusAccountButton(slot)
     try {
       const signedIn = await signingIn
-      accountStatus = signedIn ? `Signed in as ${signedIn.name}.` : 'Sign-in cancelled.'
+      ui.status = signedIn ? `Signed in as ${signedIn.name}.` : 'Sign-in cancelled.'
     } catch (error) {
-      accountStatus = ''
-      accountError = { text: errorText(error), retry: startSignIn }
+      ui.status = ''
+      ui.error = { text: errorText(error), retry: () => startSignIn(slot) }
     } finally {
-      focusAccountButton()
+      focusAccountButton(slot)
     }
   }
 
-  async function startSignOut() {
-    accountError = null
+  async function startSignOut(slot: ClientSlot) {
+    const ui = accountUi[slot]
+    ui.error = null
     try {
-      await signOut()
-      accountStatus = 'Signed out of Minecraft.'
-      focusAccountButton()
+      await signOut(slot)
+      ui.status = slot === 'first' ? 'Signed out of Minecraft.' : 'Signed out of the second account.'
+      focusAccountButton(slot)
     } catch (error) {
-      accountError = { text: errorText(error), retry: startSignOut }
+      ui.error = { text: errorText(error), retry: () => startSignOut(slot) }
     }
   }
 
@@ -557,11 +558,11 @@
   {#if appSettingsView.tab === 'accounts'}
   <section class="account" id="minecraft-account" aria-labelledby="minecraft-account-title">
     <h3 id="minecraft-account-title" tabindex="-1">Minecraft account</h3>
-    {#if account}
+    {#if minecraft.account}
       <p>
-        Signed in as <strong>{account.name}</strong>. Test clients on this computer launch as this account.
+        Signed in as <strong>{minecraft.account.name}</strong>. Test clients on this computer launch as this account.
       </p>
-    {:else if signingIn}
+    {:else if minecraft.signingIn === 'first'}
       <p class="muted">Finish signing in with Microsoft in your browser. packraven is waiting.</p>
     {:else}
       <p class="muted">
@@ -569,25 +570,60 @@
         launch test clients. You can start test servers without signing in.
       </p>
     {/if}
-    <div class="identity-row">
-      {#if account}
-        <button type="button" bind:this={accountButton} onclick={startSignOut}>Sign out</button>
-      {:else if signingIn}
-        <button type="button" bind:this={accountButton} onclick={cancelSignIn}>Cancel</button>
-      {:else}
-        <button type="button" class="primary" bind:this={accountButton} onclick={startSignIn}>Sign in with Microsoft</button>
-      {/if}
-    </div>
-    <p class="visually-hidden" role="status">{accountStatus}</p>
-    {#if accountError}
-      <Notice tone="error">
-        <p>{accountError.text}</p>
-        <p><button type="button" onclick={accountError.retry}>Try again</button></p>
-      </Notice>
+    {@render accountControls('first')}
+  </section>
+
+  <section class="account" id="second-minecraft-account" aria-labelledby="second-account-title">
+    <h3 id="second-account-title" tabindex="-1">Second account</h3>
+    {#if minecraft.second}
+      <p>
+        Signed in as <strong>{minecraft.second.name}</strong>. Run launches the second client as this account, from a copy of the pack's instance with its own
+        settings and worlds.
+      </p>
+    {:else if minecraft.signingIn === 'second'}
+      <p class="muted">
+        Finish signing in with Microsoft in your browser. If Microsoft offers {minecraft.account?.name ?? 'your main account'}, choose Use another account.
+      </p>
+    {:else}
+      <p class="muted">
+        To test with two players, sign in with a second Microsoft account that owns Minecraft: Java Edition. Run can then launch a second client as that account,
+        from a copy of the pack's instance with its own settings and worlds.
+      </p>
     {/if}
+    {@render accountControls('second')}
     <p class="muted hint">packraven is not an official Minecraft product, and is not approved by or associated with Mojang or Microsoft.</p>
   </section>
   {/if}
+
+  {#snippet accountControls(slot: ClientSlot)}
+    {@const ui = accountUi[slot]}
+    {@const other = minecraft.signingIn !== null && minecraft.signingIn !== slot}
+    <div class="identity-row">
+      {#if accountIn(slot)}
+        <button type="button" bind:this={ui.button} onclick={() => startSignOut(slot)}>Sign out</button>
+      {:else if minecraft.signingIn === slot}
+        <button type="button" bind:this={ui.button} onclick={cancelSignIn}>Cancel</button>
+      {:else}
+        <!-- Starting a second sign-in cancels the one in progress, so we wait for it instead. -->
+        <button
+          type="button"
+          class="primary"
+          bind:this={ui.button}
+          aria-disabled={other}
+          aria-describedby={other ? `${slot}-sign-in-wait` : undefined}
+          onclick={() => !other && startSignIn(slot)}>Sign in with Microsoft</button
+        >
+        {#if other}<span class="muted hint" id="{slot}-sign-in-wait">Finish or cancel the other sign-in first.</span>{/if}
+      {/if}
+    </div>
+    <p class="visually-hidden" role="status">{ui.status}</p>
+    {#if ui.error}
+      <Notice tone="error">
+        <p>{ui.error.text}</p>
+        <p><button type="button" onclick={ui.error.retry}>Try again</button></p>
+      </Notice>
+    {/if}
+  {/snippet}
 
   {#if appSettingsView.tab === 'general'}
   <div class="app-switches">

@@ -83,7 +83,7 @@ async fn classify_sides() {
 #[ignore]
 fn client_command() {
     let (settings, pack) = pack();
-    let launch = launch::client(&settings, &pack, &launch::Player { name: "Dev".into(), uuid: "0".repeat(32), access_token: "0".into() }, Some("127.0.0.1:25565"), &scratch().join("natives")).unwrap();
+    let launch = launch::client(&settings, &pack, &launch::Player { name: "Dev".into(), uuid: "0".repeat(32), access_token: "0".into() }, Some("127.0.0.1:25565"), &settings.instance_dir, &scratch().join("natives")).unwrap();
     println!("java {}", launch.java.display());
     for arg in &launch.args {
         if arg.len() > 200 {

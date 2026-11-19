@@ -4,7 +4,7 @@
 import demoFixtures from './demo-fixtures.json'
 import defaultServerReadme from '../../src-tauri/resources/server-readme.txt?raw'
 import { changedParts } from '../lib/fileNames'
-import type { PendingStep, Platform, ReleaseStatus, ServerPackUpload, UpdateType } from '../lib/api'
+import type { ChangelogType, PendingStep, Platform, ReleaseStatus, ServerPackUpload, UpdateType } from '../lib/api'
 
 // Add `?scenario=` to the URL to put the pack in one of the states we review the UI in.
 const scenarios = {
@@ -17,6 +17,8 @@ const scenarios = {
 type Scenario = keyof typeof scenarios
 const requested = new URLSearchParams(location.search).get('scenario')
 const scenario: Scenario = requested && requested in scenarios ? (requested as Scenario) : 'dirty'
+// `?accounts=2` signs in a second Minecraft account, and `?memory=low` makes each run warn that memory is short.
+const mockOptions = new URLSearchParams(location.search)
 
 type Fixtures = {
   instance: string
@@ -85,7 +87,15 @@ let activePack = pack.dir
 
 const config = {
   author: 'muon-rw',
-  curseforge: { project_id: scenario === 'empty' ? 0 : 1234567, release_type: 'beta', manual_release: false, allowed_override_jars: [] as string[], exclude: [] as string[] },
+  curseforge: {
+    project_id: scenario === 'empty' ? 0 : 1234567,
+    release_type: 'beta',
+    manual_release: false,
+    server_changelog: 'Made with [packraven](https://packraven.app)',
+    server_changelog_type: 'markdown' as ChangelogType,
+    allowed_override_jars: [] as string[],
+    exclude: [] as string[],
+  },
   // In the dirty scenario, you included an older Prominent-GLOBAL before updating it.
   modrinth: { project_id: scenario === 'empty' ? '' : 'ravens-high-fantasy', allowed_override_jars: scenario === 'dirty' ? ['mods/Prominent-GLOBAL-MC1.21.1-4.1.4.jar'] : [], exclude: [] as string[], allowed_authors: [] as string[] },
   export: { exclude: [] },
@@ -118,6 +128,8 @@ const unsentServerPack = (version: string, fileId: number, error: string, { pack
   uploadPage: `https://authors.curseforge.com/#/projects/1234567/files/${fileId}/create-additional-file`,
   displayName: `Server Pack ${version}`,
   fileName: `${zipStem(version)}-server.zip`,
+  changelog: config.curseforge.server_changelog.trim() ? config.curseforge.server_changelog : null,
+  changelogType: config.curseforge.server_changelog_type,
   error,
   retryable: !tooLarge,
   rebuild: zipGone,
@@ -833,8 +845,30 @@ const mockJavas = [
   { path: 'C:/Program Files/Eclipse Adoptium/jdk-17.0.16.8-hotspot/bin/java.exe', major: 17, version: '17.0.16', distribution: 'Temurin', source: 'javaHome', foreignArch: null },
   { path: 'C:/Users/you/.gradle/jdks/eclipse_adoptium-17-amd64-windows/jdk-17.0.16+8/bin/java.exe', major: 17, version: '17.0.16', distribution: 'Temurin', source: 'gradle', foreignArch: null },
 ]
-let minecraftAccount: { name: string; uuid: string } | null = scenario === 'empty' ? null : { name: 'muonr', uuid: '0f6c1e5a2b3d4c5e8f9a0b1c2d3e4f50' }
-const SIGN_IN_FIRST = 'Sign in to Minecraft to launch the client.'
+type MockAccount = { name: string; uuid: string }
+type MockSlot = 'first' | 'second'
+const mockAccountsBySlot: Record<MockSlot, MockAccount> = {
+  first: { name: 'muonr', uuid: '0f6c1e5a2b3d4c5e8f9a0b1c2d3e4f50' },
+  second: { name: 'RavenAlt', uuid: '7a1b2c3d4e5f60718293a4b5c6d7e8f9' },
+}
+const minecraftAccounts: Record<MockSlot, MockAccount | null> = {
+  first: scenario === 'empty' ? null : mockAccountsBySlot.first,
+  second: scenario !== 'empty' && mockOptions.get('accounts') === '2' ? mockAccountsBySlot.second : null,
+}
+const SIGN_IN_FIRST: Record<MockSlot, string> = {
+  first: 'Sign in to Minecraft to launch the client.',
+  second: 'Sign in a second Minecraft account under App settings to launch a second client.',
+}
+const GIB = 2 ** 30
+
+function mockMemoryWarning(server: boolean, clients: MockSlot[]) {
+  if (mockOptions.get('memory') !== 'low') return null
+  const launches = [
+    ...(server ? [{ process: 'server', heap: 6 * GIB }] : []),
+    ...clients.map((slot) => ({ process: slot === 'first' ? 'client' : 'secondClient', heap: 8 * GIB })),
+  ]
+  return { available: 11.4 * GIB, needed: launches.reduce((sum, l) => sum + l.heap + GIB, 0), launches }
+}
 let autoUpdate = true
 let discordShowsPack = true
 let pickedImages = 0
@@ -993,7 +1027,8 @@ function emit(event: string, payload: unknown) {
 
 // The mock's server and client stand in for processes: they run until you stop or kill them.
 let serverRunning = false
-let clientRunning = false
+const clientRunning: Record<MockSlot, boolean> = { first: false, second: false }
+const clientJob = (slot: MockSlot) => (slot === 'first' ? 'client' : 'second-client')
 
 function startMockServer() {
   serverRunning = true
@@ -1009,9 +1044,13 @@ function stopMockServer() {
   emit('test-event', { kind: 'server-stopped', detail: '' })
 }
 
-function startMockClient() {
-  clientRunning = true
-  emit('test-event', { kind: 'client-started', detail: '' })
+function startMockClient(slot: MockSlot = 'first') {
+  clientRunning[slot] = true
+  emit('test-event', { kind: 'client-started', detail: clientJob(slot) })
+}
+
+function resolvePlayer(slot: MockSlot) {
+  emit('test-event', { kind: slot === 'first' ? 'player-resolved' : 'second-player-resolved', detail: minecraftAccounts[slot]!.name })
 }
 
 const noRunArgs = () => ({ clientJvmArgs: [] as string[], clientArgs: [] as string[], serverJvmArgs: [] as string[], serverArgs: [] as string[] })
@@ -1144,23 +1183,29 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       modrinthProjectId: config.modrinth.project_id,
       runningJobs: [],
       serverRunning,
-      clientRunning,
+      clientRunning: clientRunning.first,
+      secondClientRunning: clientRunning.second,
       hooks: 'current',
     }
   },
-  start_test: ({ connect }) => {
-    if (connect && !minecraftAccount) throw SIGN_IN_FIRST
-    if (connect) emit('test-event', { kind: 'player-resolved', detail: minecraftAccount!.name })
-    return mockJob('test', ['Syncing changed files to the test server folder'], 'Server starting', () => {
+  start_test: ({ connect, secondClient }) => {
+    const clients: MockSlot[] = connect ? (secondClient ? ['first', 'second'] : ['first']) : []
+    for (const slot of clients) if (!minecraftAccounts[slot]) throw SIGN_IN_FIRST[slot]
+    clients.forEach(resolvePlayer)
+    if (clients.includes('second')) mockJob('second-client', ['Syncing changed files to the second client\'s copy of the instance', 'Waiting for the test server to finish starting'], '', () => startMockClient('second'))
+    mockJob('test', ['Syncing changed files to the test server folder'], 'Server starting', () => {
       emit('test-event', { kind: 'server-online', detail: 'true' })
       startMockServer()
       if (connect) startMockClient()
     })
+    return mockMemoryWarning(true, clients)
   },
-  start_client: () => {
-    if (!minecraftAccount) throw SIGN_IN_FIRST
-    emit('test-event', { kind: 'player-resolved', detail: minecraftAccount.name })
-    return mockJob('client', ['Launching the client'], '', startMockClient)
+  start_client: ({ slot }) => {
+    const which = (slot ?? 'first') as MockSlot
+    if (!minecraftAccounts[which]) throw SIGN_IN_FIRST[which]
+    resolvePlayer(which)
+    mockJob(clientJob(which), [which === 'second' ? 'Launching the second client' : 'Launching the client'], '', () => startMockClient(which))
+    return mockMemoryWarning(false, [which])
   },
   server_command: ({ line }) => {
     emit('job-log', { job: 'server', stream: 'info', text: `> ${line}` })
@@ -1169,26 +1214,28 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   kill_process: ({ which }) => {
     if (which === 'server') stopMockServer()
     else {
-      clientRunning = false
-      emit('test-event', { kind: 'client-stopped', detail: '' })
+      const slot: MockSlot = which === 'second-client' ? 'second' : 'first'
+      clientRunning[slot] = false
+      emit('test-event', { kind: 'client-stopped', detail: clientJob(slot) })
     }
   },
   accept_minecraft_eula: () => {
     eulaAccepted = true
   },
-  minecraft_account: () => minecraftAccount,
-  minecraft_sign_in: async () => {
+  minecraft_accounts: () => ({ ...minecraftAccounts }),
+  minecraft_sign_in: async ({ slot }) => {
     const cancelled = await new Promise<boolean>((resolve) => {
       cancelSignIn = () => resolve(true)
       setTimeout(() => resolve(false), 1500)
     })
     if (cancelled) return null
-    minecraftAccount = { name: 'muonr', uuid: '0f6c1e5a2b3d4c5e8f9a0b1c2d3e4f50' }
-    return minecraftAccount
+    const which = slot as MockSlot
+    minecraftAccounts[which] = mockAccountsBySlot[which]
+    return minecraftAccounts[which]
   },
   minecraft_sign_in_cancel: () => cancelSignIn(),
-  minecraft_sign_out: () => {
-    minecraftAccount = null
+  minecraft_sign_out: ({ slot }) => {
+    minecraftAccounts[slot as MockSlot] = null
   },
   get_settings: () => ({ instanceDir: pack.dir, packs: [pack.dir], installDir: 'C:/curseforge/minecraft/Install', javaByMajor: { ...javaByMajor }, defenderExcluded: [], defenderDismissed: false, minecraftEulaAccepted: eulaAccepted, editorAskMb: 50, editorMaxMb: 100, gitName: '', gitEmail: '', autoUpdate, discordShowsPack, runArgs: appRunArgs }),
   save_settings: (a) => {

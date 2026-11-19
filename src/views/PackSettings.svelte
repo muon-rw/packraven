@@ -257,6 +257,18 @@
     saveConfigField('manual-release', (c) => (c.curseforge.manual_release = next))
   }
 
+  function saveServerChangelog() {
+    if (!config || !savedConfig || config.curseforge.server_changelog === savedConfig.curseforge.server_changelog) return
+    const next = config.curseforge.server_changelog
+    saveConfigField('server-changelog', (c) => (c.curseforge.server_changelog = next))
+  }
+
+  function saveServerChangelogType() {
+    if (!config || !savedConfig || config.curseforge.server_changelog_type === savedConfig.curseforge.server_changelog_type) return
+    const next = config.curseforge.server_changelog_type
+    saveConfigField('server-changelog', (c) => (c.curseforge.server_changelog_type = next))
+  }
+
   function savePort() {
     if (!savedConfig || portInvalid || portDraft === null || portDraft === savedConfig.test.port) return
     const next = portDraft
@@ -468,6 +480,39 @@
             <input type="checkbox" bind:checked={config.curseforge.manual_release} onchange={saveManualRelease} /> Hold approved files until I release them on CurseForge
           </label>
           {@render badge('manual-release')}
+        </div>
+        <div class="block">
+          <div class="label-row controls">
+            <label for="server-changelog">Server pack changelog</label>
+            <div class="field-controls">
+              {@render badge('server-changelog')}
+              <select
+                id="server-changelog-type"
+                class="format-select"
+                aria-label="Server pack changelog format"
+                bind:value={config.curseforge.server_changelog_type}
+                onchange={saveServerChangelogType}
+              >
+                <option value="markdown">Markdown</option>
+                <option value="html">HTML</option>
+              </select>
+            </div>
+          </div>
+          <textarea
+            id="server-changelog"
+            rows="3"
+            bind:value={config.curseforge.server_changelog}
+            oninput={() => scheduleSave('server-changelog', saveServerChangelog)}
+            onchange={() => flushField('server-changelog', saveServerChangelog)}
+            placeholder={config.curseforge.server_changelog_type === 'html'
+              ? '<p>Made with <a href="https://packraven.app">packraven</a></p>'
+              : 'Made with [packraven](https://packraven.app)'}
+            spellcheck={config.curseforge.server_changelog_type !== 'html'}
+            aria-describedby="server-changelog-hint"
+          ></textarea>
+          <p class="hint" id="server-changelog-hint">
+            packraven sends this on every CurseForge server pack upload, unchanged between versions. Leave it empty to upload server packs without a changelog.
+          </p>
         </div>
       </section>
       {:else if packSettingsView.tab === 'test'}
@@ -816,6 +861,21 @@
     gap: 8px;
     color: var(--text);
     font-size: var(--step-0);
+  }
+
+  .label-row.controls {
+    align-items: center;
+  }
+
+  .field-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .format-select {
+    padding: 4px 8px;
+    font-size: var(--step--1);
   }
 
   .label-row > label {

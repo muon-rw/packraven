@@ -16,6 +16,7 @@ pub const CHANGELOG_ARCHIVE: &str = "changelogs";
 pub const SERVER_ICON: &str = "server-icon.png";
 pub const SERVER_README: &str = "server-readme.txt";
 pub const DEFAULT_SERVER_README: &str = include_str!("../resources/server-readme.txt");
+pub const DEFAULT_SERVER_CHANGELOG: &str = "Made with [packraven](https://packraven.app)";
 pub const BCC_PROJECT_ID: u64 = 551894;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,12 +112,31 @@ impl Default for DiscordConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangelogType {
+    #[default]
+    Markdown,
+    Html,
+}
+
+impl ChangelogType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ChangelogType::Markdown => "markdown",
+            ChangelogType::Html => "html",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct CurseforgeConfig {
     pub project_id: u64,
     pub release_type: String,
     pub manual_release: bool,
+    pub server_changelog: String,
+    pub server_changelog_type: ChangelogType,
     /// Files CurseForge doesn't host that it allows in packs, so the CurseForge pack carries them.
     pub allowed_override_jars: Vec<String>,
     /// Files the CurseForge pack leaves out, which the Modrinth pack still ships.
@@ -231,7 +251,15 @@ impl Default for PackConfig {
 
 impl Default for CurseforgeConfig {
     fn default() -> Self {
-        Self { project_id: 0, release_type: "release".into(), manual_release: false, allowed_override_jars: Vec::new(), exclude: Vec::new() }
+        Self {
+            project_id: 0,
+            release_type: "release".into(),
+            manual_release: false,
+            server_changelog: DEFAULT_SERVER_CHANGELOG.into(),
+            server_changelog_type: ChangelogType::Markdown,
+            allowed_override_jars: Vec::new(),
+            exclude: Vec::new(),
+        }
     }
 }
 
@@ -934,5 +962,20 @@ mod tests {
         pack.set_version("2.0").unwrap();
         assert_eq!(pack.version().as_deref(), Some("2.0"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn server_changelog_defaults_and_preserves_empty_or_html() {
+        let missing: PackConfig = toml::from_str("[curseforge]\nproject_id = 42\n").unwrap();
+        assert_eq!(missing.curseforge.server_changelog, DEFAULT_SERVER_CHANGELOG);
+        assert_eq!(missing.curseforge.server_changelog_type, ChangelogType::Markdown);
+
+        let cleared: PackConfig = toml::from_str("[curseforge]\nserver_changelog = \"\"\n").unwrap();
+        assert_eq!(cleared.curseforge.server_changelog, "");
+        assert_eq!(cleared.curseforge.server_changelog_type, ChangelogType::Markdown);
+
+        let html: PackConfig = toml::from_str("[curseforge]\nserver_changelog = \"<p>Hi</p>\"\nserver_changelog_type = \"html\"\n").unwrap();
+        assert_eq!(html.curseforge.server_changelog, "<p>Hi</p>");
+        assert_eq!(html.curseforge.server_changelog_type, ChangelogType::Html);
     }
 }

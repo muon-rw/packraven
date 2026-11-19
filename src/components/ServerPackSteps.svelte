@@ -29,6 +29,7 @@
   let error = $state<string | null>(null)
   let retrying = $state(false)
   let copied = $state(false)
+  let copiedChangelog = $state(false)
   let linkOpen = $state(false)
   let zipName = $derived(upload.zip?.split(/[\\/]/).pop() ?? null)
   // CurseForge's messages sometimes end in their own period.
@@ -99,6 +100,16 @@
       error = `Couldn't copy the name: ${errorText(e)}`
     }
   }
+
+  async function copyChangelog() {
+    try {
+      await navigator.clipboard.writeText(upload.changelog!)
+      copiedChangelog = true
+      setTimeout(() => (copiedChangelog = false), 2000)
+    } catch (e) {
+      error = `Couldn't copy the changelog: ${errorText(e)}`
+    }
+  }
 </script>
 
 {#if retry && upload.tooLarge}
@@ -149,6 +160,12 @@
       <span class="muted small measure">
         Upload the zip there as an additional file of {clientName}, with <span class="ui-label">Additional File Info</span> set to <span class="ui-label">Server Pack</span>{#if upload.displayName}, named
           <span class="name-pair">"{upload.displayName}". <button type="button" class="link" onclick={copyName}>{copied ? 'Copied' : 'Copy name'}</button></span>{:else}.{/if}
+        {#if upload.changelog}
+          <span class="name-pair">
+            <button type="button" class="link" onclick={copyChangelog}>{copiedChangelog ? 'Copied changelog' : 'Copy changelog'}</button>
+            ({upload.changelogType === 'html' ? 'HTML' : 'Markdown'})
+          </span>
+        {/if}
       </span>
     </div>
   </li>
@@ -168,7 +185,7 @@
     onmarked?.(fileId)
   }}
 />
-<span class="visually-hidden" role="status">{copied ? `Copied "${upload.displayName}"` : ''}</span>
+<span class="visually-hidden" role="status">{copied ? `Copied "${upload.displayName}"` : copiedChangelog ? 'Copied server pack changelog' : ''}</span>
 {#if error}<p class="failed small" role="alert"><LinkedText text={error} /></p>{/if}
 
 <style>

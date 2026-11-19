@@ -14,6 +14,7 @@ use tokio::sync::{oneshot, watch};
 use crate::export::{local_dev_jars, server_args};
 use crate::jobs::Log;
 use crate::launch::{self, Player};
+use crate::minecraft_auth::Slot;
 use crate::mirror::{mirror, FilePlan, MirrorReport, Planned};
 use crate::pack::{LockEntry, ModKey, Pack};
 use crate::process::{spawn_watched, LineHook};
@@ -24,6 +25,12 @@ const KEPT_ON_RESYNC: [&str; 5] = ["world", "logs", "crash-reports", "usercache.
 // We join by IP rather than "localhost", which can resolve to IPv6 first and miss a server bound to IPv4.
 const TEST_SERVER_IP: &str = "127.0.0.1";
 const TESTED_MODS: &str = "tested-mods.json";
+// The second client plays from a copy of the instance, so its options, worlds and logs don't collide
+// with the first client's. Each launch brings the copy up to date with the instance, apart from what
+// the second client writes for itself. We seed its options from the instance's once, so it starts
+// with your keybinds and resource packs.
+const SECOND_CLIENT_OWNS: [&str; 8] = ["saves", "logs", "crash-reports", "screenshots", ".fabric", "options.txt", "servers.dat", "usercache.json"];
+const SEEDED_FROM_INSTANCE: [&str; 2] = ["options.txt", "servers.dat"];
 
 #[derive(Default)]
 pub struct Managed {
@@ -51,15 +58,27 @@ impl Managed {
 pub struct TestRun {
     pub server: Mutex<Option<Arc<Managed>>>,
     pub client: Mutex<Option<Arc<Managed>>>,
+    pub second_client: Mutex<Option<Arc<Managed>>>,
 }
 
 impl TestRun {
+    pub fn client(&self, slot: Slot) -> &Mutex<Option<Arc<Managed>>> {
+        match slot {
+            Slot::First => &self.client,
+            Slot::Second => &self.second_client,
+        }
+    }
+
+    pub fn client_running(&self, slot: Slot) -> bool {
+        self.client(slot).lock().unwrap().is_some()
+    }
+
     pub fn running(&self) -> bool {
-        self.server.lock().unwrap().is_some() || self.client.lock().unwrap().is_some()
+        self.server.lock().unwrap().is_some() || self.client_running(Slot::First) || self.client_running(Slot::Second)
     }
 
     pub async fn kill_all(&self) {
-        for slot in [&self.server, &self.client] {
+        for slot in [&self.server, &self.client, &self.second_client] {
             if let Some(process) = slot.lock().unwrap().as_ref() {
                 process.kill();
             }
@@ -86,8 +105,51 @@ fn emit(app: &AppHandle, kind: &'static str, detail: impl Into<String>) {
 }
 
 // The UI shows who you play as only once we've confirmed it, which a sign-in can't promise until a run renews it.
-pub fn announce_player(app: &AppHandle, player: &Player) {
-    emit(app, "player-resolved", &player.name);
+pub fn announce_player(app: &AppHandle, slot: Slot, player: &Player) {
+    emit(app, if slot == Slot::First { "player-resolved" } else { "second-player-resolved" }, &player.name);
+}
+
+pub fn client_job(slot: Slot) -> &'static str {
+    match slot {
+        Slot::First => "client",
+        Slot::Second => "second-client",
+    }
+}
+
+pub struct ClientDirs {
+    pub game: PathBuf,
+    pub natives: PathBuf,
+}
+
+// Two clients extracting natives into one folder could each find the other's half-written files.
+pub fn client_dirs(slot: Slot, instance: &Path, pack_data: &Path) -> ClientDirs {
+    match slot {
+        Slot::First => ClientDirs { game: instance.to_path_buf(), natives: pack_data.join("natives") },
+        Slot::Second => ClientDirs { game: pack_data.join("second-client"), natives: pack_data.join("natives-second") },
+    }
+}
+
+pub fn sync_second_client(instance: &Path, dest: &Path, log: &Log) -> Result<()> {
+    let mut plan = FilePlan::new();
+    let walk = walkdir::WalkDir::new(instance).min_depth(1).into_iter();
+    let copied = walk.filter_entry(|entry| entry.depth() > 1 || !(entry.file_name() == ".git" || SECOND_CLIENT_OWNS.iter().any(|owned| entry.file_name() == *owned)));
+    for entry in copied {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            let relative = entry.path().strip_prefix(instance)?.to_string_lossy().replace('\\', "/");
+            plan.insert(relative, Planned::Copy(entry.into_path()));
+        }
+    }
+    log.info(format!("Syncing changed files to the second client's copy of the instance at {}", dest.display()));
+    let report = mirror(dest, &plan, &SECOND_CLIENT_OWNS, false).context("couldn't update the second client's copy of the instance. Is a second client from an earlier run still open?")?;
+    log.info(report.to_string());
+    for name in SEEDED_FROM_INSTANCE {
+        let (from, to) = (instance.join(name), dest.join(name));
+        if from.is_file() && !to.exists() {
+            std::fs::copy(&from, &to).with_context(|| format!("copying {name} to the second client"))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn announce_server_online(app: &AppHandle, online: bool) {
@@ -256,26 +318,26 @@ pub async fn run_server(app: AppHandle, run: Arc<TestRun>, pack: &Pack, java: Pa
     result
 }
 
-pub async fn run_client(app: AppHandle, run: Arc<TestRun>, settings: &Settings, pack: &Pack, natives: PathBuf, join: bool, player: Player, log: Log) -> Result<String> {
-    if run.client.lock().unwrap().is_some() {
-        bail!("the client is already running");
+pub async fn run_client(app: AppHandle, run: Arc<TestRun>, settings: &Settings, pack: &Pack, slot: Slot, dirs: ClientDirs, join: bool, player: Player, log: Log) -> Result<String> {
+    if run.client_running(slot) {
+        bail!(if slot == Slot::First { "the client is already running" } else { "the second client is already running" });
     }
     let address = join.then(|| format!("{TEST_SERVER_IP}:{}", pack.config.test.port));
-    std::fs::create_dir_all(&natives)?;
-    let launch = launch::client(settings, pack, &player, address.as_deref(), &natives)?;
+    std::fs::create_dir_all(&dirs.natives)?;
+    let launch = launch::client(settings, pack, &player, address.as_deref(), &dirs.game, &dirs.natives)?;
     let target = address.as_deref().map_or_else(|| "to the title screen".to_string(), |a| format!("joining {a}"));
     log.info(format!("Launching {} as {}, {target}", pack.lock.loader()?, player.name));
     remind_to_update(launch.java.clone(), log.clone());
     let run_args = settings.combined_run_args(&settings.instance_dir);
     log_extra_args(&log, &run_args.client_jvm(), &run_args.client());
     let mut command = Command::new(&launch.java);
-    command.current_dir(&settings.instance_dir).args(&launch.args);
+    command.current_dir(&dirs.game).args(&launch.args);
     let child = spawn_watched(command, &log, false, None)?;
     let managed = Arc::new(Managed::default());
-    *run.client.lock().unwrap() = Some(managed.clone());
-    emit(&app, "client-started", "");
-    let result = supervise(child, managed, &run.client).await;
-    emit(&app, "client-stopped", "");
+    *run.client(slot).lock().unwrap() = Some(managed.clone());
+    emit(&app, "client-started", client_job(slot));
+    let result = supervise(child, managed, run.client(slot)).await;
+    emit(&app, "client-stopped", client_job(slot));
     result
 }
 
@@ -317,6 +379,32 @@ mod tests {
 
     fn hosted(path: &str, project_id: u64, sha1: &str) -> LockEntry {
         LockEntry::curseforge(path.into(), sha1.into(), 1, crate::pack::CurseforgeFile { project_id, file_id: 1, url: String::new() })
+    }
+
+    #[test]
+    fn the_second_client_copies_the_instance_but_keeps_its_own_options_and_worlds() {
+        let root = std::env::temp_dir().join(format!("packraven-second-client-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (instance, copy) = (root.join("instance"), root.join("copy"));
+        for (path, text) in [("mods/a.jar", "a"), ("config/a.toml", "x=1"), ("options.txt", "lang:en_us"), ("saves/World/level.dat", "first"), (".git/HEAD", "ref")] {
+            let file = instance.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        sync_second_client(&instance, &copy, &Log::console("second-client")).unwrap();
+        let seeded = std::fs::read_to_string(copy.join("options.txt")).unwrap();
+        std::fs::write(copy.join("options.txt"), "lang:de_de").unwrap();
+        std::fs::write(copy.join("config/generated.toml"), "y=2").unwrap();
+        std::fs::remove_file(instance.join("mods/a.jar")).unwrap();
+        std::fs::write(instance.join("mods/b.jar"), "b").unwrap();
+        sync_second_client(&instance, &copy, &Log::console("second-client")).unwrap();
+        let kept = std::fs::read_to_string(copy.join("options.txt")).unwrap();
+        let exists = |path: &str| copy.join(path).exists();
+        let found = [exists("mods/a.jar"), exists("mods/b.jar"), exists("config/a.toml"), exists("config/generated.toml"), exists("saves"), exists(".git")];
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(seeded, "lang:en_us");
+        assert_eq!(kept, "lang:de_de");
+        assert_eq!(found, [false, true, true, false, false, false]);
     }
 
     #[test]

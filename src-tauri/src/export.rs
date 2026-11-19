@@ -838,6 +838,12 @@ fn user_jvm_args(pack: &Pack) -> String {
     text
 }
 
+pub fn server_heap_args(pack: &Pack, extra_jvm: &[String]) -> Vec<String> {
+    let lines = user_jvm_args(pack);
+    let flags = lines.lines().map(str::trim).filter(|line| !line.starts_with('#')).flat_map(crate::launch::split_args);
+    flags.chain(extra_jvm.iter().cloned()).collect()
+}
+
 fn script_args(args: &[String], windows: bool) -> String {
     args.iter()
         .map(|arg| arg.trim())

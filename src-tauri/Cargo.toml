@@ -50,6 +50,7 @@ tar = "0.4"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 tauri-plugin-updater = "2"
 discord-rich-presence = "1.1.0"
+sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 
 [target."cfg(not(windows))".dependencies]
 drag = "2.1.1"

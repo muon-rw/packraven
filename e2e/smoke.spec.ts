@@ -1315,3 +1315,35 @@ test('Releases can abort a release and clear its tag', async ({ page }) => {
   await expect(page.locator('.aborted')).toBeFocused()
   await expect(page.getByRole('button', { name: 'Abort release 0.1.1' })).toHaveCount(0)
 })
+
+test('Releases shows newest first and loads older releases only when opened', async ({ page }) => {
+  await page.goto('/?view=releases&scenario=ready&manyreleases&slowolder')
+  const versions = page.locator('.releases table tbody tr td:first-child .file')
+  await expect(versions).toHaveText(['0.1.1', '0.1.0', '0.0.6', '0.0.5', '0.0.4'])
+
+  const toggle = page.locator('.older-toggle')
+  await expect(toggle).toHaveText('Older releases (3)')
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+  await expect(page.locator('#older-releases')).toBeHidden()
+
+  await toggle.focus()
+  await page.keyboard.press('Enter')
+  await expect(toggle).toHaveText('Checking 3 older releases')
+  await expect(toggle).toHaveAttribute('aria-disabled', 'true')
+  await expect(toggle).toBeFocused()
+
+  await expect(versions).toHaveText(['0.1.1', '0.1.0', '0.0.6', '0.0.5', '0.0.4', '0.0.3', '0.0.2', '0.0.1'])
+  await expect(toggle).toHaveAttribute('aria-expanded', 'true')
+  await expect(page.getByRole('status').filter({ hasText: 'Loaded 3 older releases.' })).toHaveCount(1)
+
+  await toggle.click()
+  await expect(toggle).toHaveAttribute('aria-expanded', 'false')
+  await expect(page.locator('#older-releases')).toBeHidden()
+
+  // A failed older-release load shows an inline alert and retries cleanly on the next click.
+  await page.goto('/?view=releases&scenario=ready&manyreleases&failolder')
+  await page.getByRole('button', { name: 'Older releases (3)' }).click()
+  await expect(page.locator('.older-toggle-wrap [role="alert"]')).toContainText('CurseForge did not answer')
+  await page.getByRole('button', { name: 'Older releases (3)' }).click()
+  await expect(versions).toHaveText(['0.1.1', '0.1.0', '0.0.6', '0.0.5', '0.0.4', '0.0.3', '0.0.2', '0.0.1'])
+})

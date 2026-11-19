@@ -18,7 +18,19 @@
 
   let { onsettings, onappsettings, onchange, onpublish }: { onsettings: () => void; onappsettings: () => void; onchange?: () => void; onpublish?: () => void } = $props()
 
-  let releases: ReleaseStatus[] = $state([])
+  const RECENT_LIMIT = 5
+
+  let recentReleases = $state<ReleaseStatus[]>([])
+  let olderReleases = $state<ReleaseStatus[] | null>(null)
+  let totalReleases = $state(0)
+  let olderOpen = $state(false)
+  let loadingOlder = $state(false)
+  let olderError: string | null = $state(null)
+  let olderAnnouncement = $state('')
+  let loadGeneration = 0
+  let releases = $derived(olderReleases ? [...recentReleases, ...olderReleases] : recentReleases)
+  let visibleReleases = $derived(olderOpen && olderReleases ? [...recentReleases, ...olderReleases] : recentReleases)
+  let olderCount = $derived(olderReleases ? olderReleases.length : Math.max(0, totalReleases - recentReleases.length))
   let releasesError: string | null = $state(null)
   let loading = $state(true)
   let hasWebhook = $state(false)
@@ -71,7 +83,10 @@
     abortError = null
     try {
       aborted = await api.abortRelease(version)
-      releases = releases.filter((r) => r.version !== version)
+      recentReleases = recentReleases.filter((r) => r.version !== version)
+      if (olderReleases) olderReleases = olderReleases.filter((r) => r.version !== version)
+      totalReleases = Math.max(0, totalReleases - 1)
+      if (olderCount === 0) olderOpen = false
       onchange?.()
       await tick()
       abortedNotice?.focus()
@@ -149,10 +164,10 @@
     waiting = { ...waiting, [key]: on }
   }
   let releaseType = $state('release')
-  let showCurseforge = $derived(releases.some((r) => r.curseforge))
-  let showModrinth = $derived(releases.some((r) => r.modrinth || r.modrinthMissing))
+  let showCurseforge = $derived(visibleReleases.some((r) => r.curseforge))
+  let showModrinth = $derived(visibleReleases.some((r) => r.modrinth || r.modrinthMissing))
   let checkerRepo = $derived(updateChecker?.kind === 'github' ? updateChecker.repo : null)
-  let showUpdateChecker = $derived(!!checkerRepo || releases.some((r) => r.updateChecker))
+  let showUpdateChecker = $derived(!!checkerRepo || visibleReleases.some((r) => r.updateChecker))
   let columns = $derived(2 + (showCurseforge ? 1 : 0) + (showModrinth ? 1 : 0) + (showUpdateChecker ? 1 : 0))
 
   onMount(() => {
@@ -164,7 +179,7 @@
       defaultUpdateType = c.update_checker.update_type
     }, () => {})
     api.updateCheckerSetup().then((setup) => (updateChecker = setup), () => (updateChecker = null))
-    const unlisten = [listen('release-announced', () => loadReleases()), listen('release-update-checker', () => loadReleases())]
+    const unlisten = [listen('release-announced', () => loadReleases(false)), listen('release-update-checker', () => loadReleases(false))]
     return () => {
       for (const stop of unlisten) stop.then((stop) => stop())
     }
@@ -382,15 +397,70 @@
     }
   }
 
-  async function loadReleases() {
+  async function loadReleases(includeOlder = olderOpen) {
+    const generation = ++loadGeneration
+    const fetchAll = includeOlder && olderOpen
     loading = true
+    loadingOlder = false
+    olderError = null
     try {
-      releases = await api.releases()
+      const page = await api.releases(0, fetchAll ? undefined : RECENT_LIMIT)
+      if (generation !== loadGeneration) return
+      if (fetchAll) {
+        recentReleases = page.releases.slice(0, RECENT_LIMIT)
+        const rest = page.releases.slice(RECENT_LIMIT)
+        olderReleases = rest.length ? rest : null
+        if (!rest.length) olderOpen = false
+      } else {
+        recentReleases = page.releases
+        if (olderOpen && olderReleases) {
+          const seen = new Set(page.releases.map((r) => r.version))
+          const kept = olderReleases.filter((r) => !seen.has(r.version))
+          olderReleases = kept.length ? kept : null
+          if (!kept.length) olderOpen = false
+        } else {
+          olderReleases = null
+        }
+      }
+      totalReleases = page.total
       releasesError = null
     } catch (e) {
+      if (generation !== loadGeneration) return
       releasesError = `Couldn't load releases: ${errorText(e)}`
     } finally {
-      loading = false
+      if (generation === loadGeneration) loading = false
+    }
+  }
+
+  async function toggleOlder() {
+    if (loadingOlder || loading) return
+    if (olderOpen) {
+      olderOpen = false
+      olderAnnouncement = ''
+      return
+    }
+    olderError = null
+    olderOpen = true
+    if (olderReleases !== null) return
+    const generation = loadGeneration
+    const countLabel = olderCount === 1 ? '1 older release' : `${olderCount} older releases`
+    loadingOlder = true
+    olderAnnouncement = `Checking ${countLabel}.`
+    try {
+      const page = await api.releases(recentReleases.length)
+      if (generation !== loadGeneration) return
+      const seen = new Set(recentReleases.map((r) => r.version))
+      const loaded = page.releases.filter((r) => !seen.has(r.version))
+      olderReleases = loaded
+      totalReleases = page.total
+      olderAnnouncement = `Loaded ${loaded.length === 1 ? '1 older release' : `${loaded.length} older releases`}.`
+    } catch (e) {
+      if (generation !== loadGeneration) return
+      olderError = `Couldn't load older releases: ${errorText(e)}`
+      olderOpen = false
+      olderAnnouncement = ''
+    } finally {
+      if (generation === loadGeneration) loadingOlder = false
     }
   }
 
@@ -477,7 +547,7 @@
     </div>
     <div class="actions">
       <button class="ghost settings" onclick={() => { packSettingsView.tab = 'discord'; nav.anchor = 'discord-title'; onsettings() }}>Discord settings</button>
-      <button class:busy={loading} disabled={loading} onclick={loadReleases}>{loading ? 'Checking' : 'Refresh'}</button>
+      <button class:busy={loading} disabled={loading} onclick={() => loadReleases()}>{loading ? 'Checking' : 'Refresh'}</button>
     </div>
   </header>
 
@@ -489,6 +559,7 @@
     </div>
   {/if}
   <p class="visually-hidden" role="status">{checkerAnnouncement}</p>
+  <p class="visually-hidden" role="status">{olderAnnouncement}</p>
   {#if aborted}
     <div class="aborted" tabindex="-1" bind:this={abortedNotice}>
       <Notice tone={aborted.remoteTagWarning ? 'warn' : 'ok'} live={false}>
@@ -510,7 +581,7 @@
     </div>
   {/if}
 
-  {#if releases.length}
+  {#if releases.length || totalReleases > 0}
     <!-- svelte-ignore a11y_no_noninteractive_tabindex (a scrollable region needs focus so you can scroll it with keys) -->
     <div class="scroll" role="region" aria-label="Releases" tabindex="0">
     <table>
@@ -523,8 +594,7 @@
           {#if showUpdateChecker}<th>Update Checker</th>{/if}
         </tr>
       </thead>
-      <tbody>
-        {#each [...releases].reverse() as release (release.version)}
+  {#snippet releaseRows(release: ReleaseStatus)}
           {@const problems = fileProblems(release)}
           {@const clientProblem = problems.some((p) => p.file === 'client')}
           <tr>
@@ -745,8 +815,46 @@
               </td>
             </tr>
           {/if}
+  {/snippet}
+      <tbody>
+        {#each recentReleases as release (release.version)}
+          {@render releaseRows(release)}
         {/each}
       </tbody>
+      {#if olderCount > 0}
+        <tbody>
+          <tr class="older-toggle-row">
+            <td colspan={columns}>
+              <div class="older-toggle-wrap">
+                <button
+                  class="ghost disclosure older-toggle"
+                  class:busy={loadingOlder}
+                  aria-busy={loadingOlder}
+                  aria-expanded={olderOpen}
+                  aria-controls="older-releases"
+                  aria-disabled={loadingOlder || loading}
+                  onclick={toggleOlder}
+                >
+                  {#if !loadingOlder}<Twisty open={olderOpen} />{/if}
+                  {#if loadingOlder}
+                    Checking {olderCount === 1 ? '1 older release' : `${olderCount} older releases`}
+                  {:else}
+                    Older releases ({olderCount})
+                  {/if}
+                </button>
+                {#if olderError}<span class="failed small" role="alert">{olderError}</span>{/if}
+              </div>
+            </td>
+          </tr>
+        </tbody>
+        <tbody id="older-releases" hidden={!olderOpen || !olderReleases}>
+          {#if olderOpen && olderReleases}
+            {#each olderReleases as release (release.version)}
+              {@render releaseRows(release)}
+            {/each}
+          {/if}
+        </tbody>
+      {/if}
     </table>
     </div>
     <p class="muted small" id="discohook-hint">
@@ -982,5 +1090,20 @@
   .cell-actions button {
     color: var(--forest);
     white-space: nowrap;
+  }
+
+  .older-toggle-wrap {
+    position: sticky;
+    left: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    max-width: 100cqi;
+    padding: 2px 4px;
+  }
+
+  .older-toggle {
+    color: var(--forest);
   }
 </style>

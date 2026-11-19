@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
+use futures_util::{stream, StreamExt};
 use serde::Serialize;
 use tauri::{AppHandle, State};
 use tokio::sync::watch;
@@ -1033,89 +1034,126 @@ fn describe_file(lookup: &Result<Option<curseforge::CfFile>>, recent: bool) -> (
     }
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleasesPage {
+    releases: Vec<ReleaseStatus>,
+    total: usize,
+}
+
+async fn release_status(pack: Option<&Pack>, pack_data: &std::path::Path, mut release: publish::Release) -> (ReleaseStatus, Option<(String, u64)>) {
+    let cf_release = release.curseforge.clone();
+    let mr_release = release.modrinth.clone();
+    let recent = release.uploaded_to_curseforge_recently();
+
+    let cf_fut = async {
+        let Some(published) = cf_release else { return (None, None) };
+        let (file_lookup, pre_server_lookup) = match published.server_file_id {
+            Some(id) => {
+                let (client, server) = tokio::join!(curseforge::file(published.project_id, published.file_id), curseforge::file(published.project_id, id));
+                (client, Some(server))
+            }
+            None => (curseforge::file(published.project_id, published.file_id).await, None),
+        };
+        let file = file_lookup.as_ref().ok().cloned().flatten();
+        let linked_server = file.as_ref().and_then(|f| f.server_pack_file_id);
+        let mut adopted_id = None;
+        let mut server_file_id = published.server_file_id;
+        let mut server_lookup = pre_server_lookup;
+        // A server pack you uploaded yourself shows up as the client pack's server pack once CurseForge makes the client pack public.
+        if let (None, Some(id)) = (server_file_id, linked_server) {
+            adopted_id = Some(id);
+            server_file_id = Some(id);
+            server_lookup = Some(curseforge::file(published.project_id, id).await);
+        }
+        let (status, state) = describe_file(&file_lookup, recent);
+        let (server_status, server_state) = match (&server_lookup, published.server_pack_uploaded_by_you) {
+            (Some(lookup), _) => describe_file(lookup, recent),
+            (None, true) => ("Uploaded by you".into(), None),
+            (None, false) => ("Not uploaded".into(), None),
+        };
+        let server_file = server_lookup.as_ref().and_then(|l| l.as_ref().ok()).and_then(Option::as_ref);
+        let uploaded = |lookup: Option<&Result<Option<curseforge::CfFile>>>| lookup.and_then(|l| l.as_ref().ok()).and_then(Option::as_ref).map(|f| f.file_date.clone()).filter(|d| !d.is_empty());
+        let cf_status = CurseforgeStatus {
+            project_id: published.project_id,
+            file_id: published.file_id,
+            status,
+            server_status,
+            server_pack_linked: server_file_id.and_then(|server_id| {
+                linked_server.map(|id| id == server_id).or_else(|| server_file.and_then(|f| f.is_server_pack))
+            }),
+            state,
+            server_state,
+            uploaded: uploaded(Some(&file_lookup)),
+            server_uploaded: uploaded(server_lookup.as_ref()),
+            page: curseforge::file_page(published.project_id, published.file_id),
+            server_page: server_file_id.map(|id| curseforge::file_page(published.project_id, id)),
+        };
+        (Some(cf_status), adopted_id)
+    };
+
+    let mr_fut = async {
+        let Some(published) = mr_release else { return None };
+        let status = match crate::modrinth::version(&published.version_id).await {
+            Ok(Some(version)) => version.status.as_deref().map_or_else(|| "Listed".to_string(), capitalized),
+            Ok(None) => "Deleted".into(),
+            Err(_) => "Unknown".into(),
+        };
+        Some(ModrinthStatus { status, url: format!("https://modrinth.com/project/{}/version/{}", published.project_id, published.version_id) })
+    };
+
+    let ((curseforge, adopted_id), modrinth) = tokio::join!(cf_fut, mr_fut);
+    let adopted = adopted_id.map(|id| {
+        publish::adopt_server_pack(&mut release, id);
+        (release.version.clone(), id)
+    });
+
+    let status = ReleaseStatus {
+        modrinth_missing: pack.and_then(|pack| publish::awaiting_modrinth(pack, pack_data, &release)).and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned())),
+        server_pack_missing: publish::awaiting_server_pack(pack, pack_data, &release),
+        pack_changed: pack.is_some_and(|pack| publish::changed_since(pack, &release)),
+        client_zip_present: pack.is_some_and(|pack| pack_data.join("builds").join(&release.version).join(pack.client_zip_name(&release.version)).exists()),
+        display_name: release.display_name,
+        release_type: release.release_type,
+        version: release.version,
+        published_at: release.published_at,
+        announce: release.announce,
+        announced_at: release.announced_at,
+        announcement_images: release.announcement_images,
+        update_checker: release.update_checker,
+        curseforge,
+        modrinth,
+    };
+    (status, adopted)
+}
+
 #[tauri::command]
-pub async fn releases(state: State<'_, AppState>) -> CmdResult<Vec<ReleaseStatus>> {
-    let mut result = Vec::new();
+pub async fn releases(state: State<'_, AppState>, offset: Option<usize>, limit: Option<usize>) -> CmdResult<ReleasesPage> {
     let pack = state.pack().ok();
     let pack_data = state.pack_data();
     let releases_path = pack_data.join("releases.json");
-    let mut releases = publish::load_releases(&releases_path);
-    let mut adopted = false;
-    for release in releases.iter_mut().rev() {
-        let curseforge = match &release.curseforge {
-            Some(published) => {
-                let file_lookup = curseforge::file(published.project_id, published.file_id).await;
-                let file = file_lookup.as_ref().ok().cloned().flatten();
-                let linked_server = file.as_ref().and_then(|f| f.server_pack_file_id);
-                // A server pack you uploaded yourself shows up as the client pack's server pack once CurseForge makes the client pack public.
-                if let (None, Some(id)) = (published.server_file_id, linked_server) {
-                    publish::adopt_server_pack(release, id);
-                    adopted = true;
-                }
-                let published = release.curseforge.as_ref().expect("checked above");
-                let server_lookup = match published.server_file_id {
-                    Some(id) => Some(curseforge::file(published.project_id, id).await),
-                    None => None,
-                };
-                let recent = release.uploaded_to_curseforge_recently();
-                let (status, state) = describe_file(&file_lookup, recent);
-                let (server_status, server_state) = match (&server_lookup, published.server_pack_uploaded_by_you) {
-                    (Some(lookup), _) => describe_file(lookup, recent),
-                    (None, true) => ("Uploaded by you".into(), None),
-                    (None, false) => ("Not uploaded".into(), None),
-                };
-                let server_file = server_lookup.as_ref().and_then(|l| l.as_ref().ok()).and_then(Option::as_ref);
-                let uploaded = |lookup: Option<&Result<Option<curseforge::CfFile>>>| lookup.and_then(|l| l.as_ref().ok()).and_then(Option::as_ref).map(|f| f.file_date.clone()).filter(|d| !d.is_empty());
-                Some(CurseforgeStatus {
-                    project_id: published.project_id,
-                    file_id: published.file_id,
-                    status,
-                    server_status,
-                    server_pack_linked: published.server_file_id.and_then(|server_id| {
-                        linked_server.map(|id| id == server_id).or_else(|| server_file.and_then(|f| f.is_server_pack))
-                    }),
-                    state,
-                    server_state,
-                    uploaded: uploaded(Some(&file_lookup)),
-                    server_uploaded: uploaded(server_lookup.as_ref()),
-                    page: curseforge::file_page(published.project_id, published.file_id),
-                    server_page: published.server_file_id.map(|id| curseforge::file_page(published.project_id, id)),
-                })
-            }
-            None => None,
-        };
-        let modrinth = match &release.modrinth {
-            Some(published) => {
-                let status = match crate::modrinth::version(&published.version_id).await {
-                    Ok(Some(version)) => version.status.as_deref().map_or_else(|| "Listed".to_string(), capitalized),
-                    Ok(None) => "Deleted".into(),
-                    Err(_) => "Unknown".into(),
-                };
-                Some(ModrinthStatus { status, url: format!("https://modrinth.com/project/{}/version/{}", published.project_id, published.version_id) })
-            }
-            None => None,
-        };
-        result.push(ReleaseStatus {
-            modrinth_missing: pack.as_ref().and_then(|pack| publish::awaiting_modrinth(pack, &pack_data, release)).and_then(|path| path.file_name().map(|n| n.to_string_lossy().into_owned())),
-            server_pack_missing: publish::awaiting_server_pack(pack.as_ref(), &pack_data, release),
-            pack_changed: pack.as_ref().is_some_and(|pack| publish::changed_since(pack, release)),
-            client_zip_present: pack.as_ref().is_some_and(|pack| pack_data.join("builds").join(&release.version).join(pack.client_zip_name(&release.version)).exists()),
-            display_name: release.display_name.clone(),
-            release_type: release.release_type.clone(),
-            version: release.version.clone(),
-            published_at: release.published_at.clone(),
-            announce: release.announce,
-            announced_at: release.announced_at.clone(),
-            announcement_images: release.announcement_images.clone(),
-            update_checker: release.update_checker.clone(),
-            curseforge,
-            modrinth,
-        });
+    let stored = publish::load_releases(&releases_path);
+    let total = stored.len();
+    let slice: Vec<publish::Release> = stored.into_iter().rev().skip(offset.unwrap_or(0)).take(limit.unwrap_or(total)).collect();
+    let outcomes: Vec<_> = stream::iter(slice).map(|release| release_status(pack.as_ref(), &pack_data, release)).buffered(8).collect().await;
+    let mut result = Vec::with_capacity(outcomes.len());
+    let mut adopted = Vec::new();
+    for (status, maybe_adopted) in outcomes {
+        result.push(status);
+        if let Some(pair) = maybe_adopted {
+            adopted.push(pair);
+        }
     }
-    if adopted {
-        publish::save_releases(&releases_path, &releases).map_err(err)?;
+    if !adopted.is_empty() {
+        let mut current = publish::load_releases(&releases_path);
+        for (version, id) in adopted {
+            if let Some(release) = current.iter_mut().find(|r| r.version == version) {
+                publish::adopt_server_pack(release, id);
+            }
+        }
+        publish::save_releases(&releases_path, &current).map_err(err)?;
     }
-    Ok(result)
+    Ok(ReleasesPage { releases: result, total })
 }
 
 #[tauri::command]

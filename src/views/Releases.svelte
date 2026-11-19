@@ -357,9 +357,12 @@
     }
   }
 
-  async function markedReleaseUploaded(version: string) {
+  async function markedReleaseUploaded(version: string, fileId: number | null) {
     await loadReleases()
-    replaced = { text: `Recorded that you uploaded the ${version} server pack.`, serverPage: null }
+    replaced = {
+      text: fileId !== null ? `Tracking the ${version} server pack on CurseForge.` : `Recorded that you uploaded the ${version} server pack.`,
+      serverPage: null,
+    }
     await tick()
     replacedNotice?.focus()
   }
@@ -670,7 +673,7 @@
                         tagModalPage = null
                         retryingServer = release.version
                       }}
-                      onmarked={() => markedReleaseUploaded(release.version)}
+                      onmarked={(fileId) => markedReleaseUploaded(release.version, fileId)}
                     />
                   </Notice>
                 </section>

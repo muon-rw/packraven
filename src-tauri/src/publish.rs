@@ -819,12 +819,31 @@ pub async fn finish_release(pack: &Pack, identity: &Identity, paths: &ReleasePat
     })
 }
 
-/// Records that you uploaded a release's server pack yourself, so we stop offering to upload it.
-pub fn mark_server_pack_uploaded(pack_data: &Path, version: &str) -> Result<()> {
+/// Records that you uploaded a release's server pack yourself. When you give us its CurseForge
+/// download link or file ID, we store the file ID so packraven tracks its review directly.
+pub fn mark_server_pack_uploaded(pack_data: &Path, version: &str, link: Option<&str>) -> Result<Option<u64>> {
     let releases_path = pack_data.join("releases.json");
     let mut release = load_releases(&releases_path).into_iter().find(|r| r.version == version).with_context(|| format!("you haven't published {version} from this machine"))?;
-    release.curseforge.as_mut().with_context(|| format!("{version} isn't on CurseForge."))?.server_pack_uploaded_by_you = true;
-    save_release(&releases_path, &release)
+    let curseforge = release.curseforge.as_mut().with_context(|| format!("{version} isn't on CurseForge."))?;
+    let file_id = match link.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => {
+            let id = curseforge::parse_file_id(text)?;
+            if id == curseforge.file_id {
+                bail!("That's the client pack's file. Copy the download link from the server pack instead.");
+            }
+            curseforge.server_file_id = Some(id);
+            curseforge.unsent_server_pack = None;
+            curseforge.server_pack_uploaded_by_you = false;
+            curseforge.last_upload = Some(chrono::Utc::now().to_rfc3339());
+            Some(id)
+        }
+        None => {
+            curseforge.server_pack_uploaded_by_you = true;
+            None
+        }
+    };
+    save_release(&releases_path, &release)?;
+    Ok(file_id)
 }
 
 /// Returns whether the release's server pack is on CurseForge, or it has no CurseForge release.
@@ -1030,5 +1049,27 @@ mod tests {
         assert!(resolve(names("", "dir/pack")).is_err());
         assert!(resolve(names("", "pack?")).is_err());
         assert!(resolve(names("", ".zip")).is_err());
+    }
+
+    #[test]
+    fn mark_server_pack_uploaded_records_file_id_from_link_and_rejects_client_file() {
+        let dir = std::env::temp_dir().join(format!("packraven-mark-server-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("releases.json");
+        let json = r#"[{"version": "0.3.0", "curseforge": {"projectId": 1764125, "fileId": 9660100, "unsentServerPack": {"names": {"displayName": "Server Pack 0.3.0", "fileName": "server.zip"}, "error": "too large"}}, "publishedAt": "2026-11-01T00:00:00Z", "announce": false, "announcedAt": null}]"#;
+        std::fs::write(&path, json).unwrap();
+
+        assert!(super::mark_server_pack_uploaded(&dir, "0.3.0", Some("https://edge.forgecdn.net/files/9660/100/client.zip")).is_err());
+        let id = super::mark_server_pack_uploaded(&dir, "0.3.0", Some("https://edge.forgecdn.net/files/9660/156/Ravens-High-Fantasy-0.3.0-server.zip")).unwrap();
+        assert_eq!(id, Some(9_660_156));
+
+        let release = load_releases(&path).remove(0);
+        let cf = release.curseforge.unwrap();
+        assert_eq!(cf.server_file_id, Some(9_660_156));
+        assert!(cf.unsent_server_pack.is_none());
+        assert!(!cf.server_pack_uploaded_by_you);
+        assert!(cf.last_upload.is_some());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

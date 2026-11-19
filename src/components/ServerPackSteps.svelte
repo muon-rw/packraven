@@ -4,6 +4,7 @@
   import { api, errorText, type ServerPackUpload } from '../lib/api'
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import LinkedText from './LinkedText.svelte'
+  import ServerPackLinkDialog from './ServerPackLinkDialog.svelte'
 
   let {
     upload,
@@ -22,12 +23,13 @@
     // Whether the release has its tag yet, which you'd check out to rebuild the server pack as it shipped.
     tagged?: boolean
     onretry?: () => void
-    onmarked?: () => void
+    onmarked?: (fileId: number | null) => void
   } = $props()
 
   let error = $state<string | null>(null)
   let retrying = $state(false)
   let copied = $state(false)
+  let linkOpen = $state(false)
   let zipName = $derived(upload.zip?.split(/[\\/]/).pop() ?? null)
   // CurseForge's messages sometimes end in their own period.
   let reason = $derived(upload.error?.trim().replace(/[.!]+$/, '') ?? null)
@@ -71,13 +73,9 @@
     }
   }
 
-  async function markUploaded() {
-    try {
-      await api.markServerPackUploaded(version)
-      onmarked?.()
-    } catch (e) {
-      error = `Couldn't record it: ${errorText(e)}`
-    }
+  function openLinkDialog() {
+    error = null
+    linkOpen = true
   }
 
   function showZip() {
@@ -156,11 +154,20 @@
   </li>
   <li>
     <div class="step">
-      <button disabled={busy} onclick={markUploaded}>I uploaded it<span class="visually-hidden"> ({version} server pack)</span></button>
-      <span class="muted small measure">Then we stop asking you to upload it. You'll see it in Releases once CurseForge approves the client pack.</span>
+      <button disabled={busy} onclick={openLinkDialog}>I uploaded it<span class="visually-hidden"> ({version} server pack)</span></button>
+      <span class="muted small measure">Paste its download link from CurseForge so packraven can follow its review.</span>
     </div>
   </li>
 </ol>
+<ServerPackLinkDialog
+  open={linkOpen}
+  {version}
+  onclose={() => (linkOpen = false)}
+  onrecorded={(fileId) => {
+    linkOpen = false
+    onmarked?.(fileId)
+  }}
+/>
 <span class="visually-hidden" role="status">{copied ? `Copied "${upload.displayName}"` : ''}</span>
 {#if error}<p class="failed small" role="alert"><LinkedText text={error} /></p>{/if}
 

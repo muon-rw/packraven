@@ -46,12 +46,14 @@ async fn check(app: &AppHandle) -> bool {
         for mut release in publish::load_releases(&releases_path).into_iter().filter(|r| announces(r) || update_checker::awaits(r)) {
             // A release still waiting for its Modrinth upload or its server pack isn't out everywhere yet.
             let awaiting_modrinth = opened.as_ref().is_some_and(|opened| publish::awaiting_modrinth(opened, &pack_data, &release).is_some());
-            if awaiting_modrinth {
+            if awaiting_modrinth || release.curseforge.as_ref().is_some_and(|c| c.awaits_server_pack()) {
                 continue;
             }
+            let linked = publish::link_server_pack(&releases_path, &mut release).await;
             let listing = discord::listing(&release).await;
-            any_pending |= listing == Listing::Pending;
-            if listing != Listing::Public || !publish::link_server_pack(&releases_path, &mut release).await {
+            // CurseForge can take a while to report serverPackFileId on an approved client pack, so keep polling promptly.
+            any_pending |= listing == Listing::Pending || (listing == Listing::Public && !linked);
+            if listing != Listing::Public || !linked {
                 continue;
             }
             if let Some(webhook) = webhook.as_deref().filter(|_| announces(&release)) {

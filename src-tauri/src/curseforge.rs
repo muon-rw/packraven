@@ -506,9 +506,60 @@ pub fn additional_file_page(project_id: u64, parent_file_id: u64) -> String {
     format!("https://authors.curseforge.com/#/projects/{project_id}/files/{parent_file_id}/create-additional-file")
 }
 
+/// Extracts a CurseForge file ID from a CDN download link, a CurseForge file page URL, or a bare file ID.
+pub fn parse_file_id(input: &str) -> Result<u64> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("Paste the server pack's download link or file ID from CurseForge.");
+    }
+    if trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let id: u64 = trimmed.parse().context("That file ID is too large.")?;
+        if id > 0 {
+            return Ok(id);
+        }
+    }
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let path: Vec<&str> = url.path_segments().map(|s| s.filter(|p| !p.is_empty()).collect()).unwrap_or_default();
+        if host == "forgecdn.net" || host.ends_with(".forgecdn.net") {
+            if let [files, hi, lo, ..] = path.as_slice() {
+                if *files == "files" && !hi.is_empty() && !lo.is_empty() && lo.len() <= 3 && hi.bytes().all(|b| b.is_ascii_digit()) && lo.bytes().all(|b| b.is_ascii_digit()) {
+                    if let (Ok(hi), Ok(lo)) = (hi.parse::<u64>(), lo.parse::<u64>()) {
+                        if lo < 1000 {
+                            if let Some(id) = hi.checked_mul(1000).and_then(|n| n.checked_add(lo)).filter(|&id| id > 0) {
+                                return Ok(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if host == "curseforge.com" || host.ends_with(".curseforge.com") {
+            let find_after_files = |segments: &[&str]| {
+                segments.windows(2).find_map(|pair| {
+                    (pair[0] == "files" && !pair[1].is_empty() && pair[1].bytes().all(|b| b.is_ascii_digit()))
+                        .then(|| pair[1].parse::<u64>().ok().filter(|&id| id > 0))
+                        .flatten()
+                })
+            };
+            if let Some(id) = find_after_files(&path) {
+                return Ok(id);
+            }
+            if let Some(fragment) = url.fragment() {
+                let fragment_path = fragment.split('?').next().unwrap_or(fragment);
+                let segments: Vec<&str> = fragment_path.split('/').filter(|p| !p.is_empty()).collect();
+                if let Some(id) = find_after_files(&segments) {
+                    return Ok(id);
+                }
+            }
+        }
+    }
+    bail!("That doesn't look like a CurseForge download link or file ID.")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{check_upload_size, CfLogo, UPLOAD_LIMIT};
+    use super::{check_upload_size, parse_file_id, CfLogo, UPLOAD_LIMIT};
 
     #[test]
     fn falls_back_to_original_logo_when_curseforge_made_no_thumbnail() {
@@ -544,5 +595,30 @@ mod tests {
         drop(file);
         std::fs::remove_file(&path).unwrap();
         assert!(error.starts_with("The server pack is 1.07 GB"), "{error}");
+    }
+
+    #[test]
+    fn parses_file_ids_from_download_links_file_pages_and_raw_ids() {
+        assert_eq!(parse_file_id("https://edge.forgecdn.net/files/9660/156/Ravens-High-Fantasy-0.3.0-server.zip").unwrap(), 9_660_156);
+        assert_eq!(parse_file_id("https://mediafilez.forgecdn.net/files/9660/56/pack.zip").unwrap(), 9_660_056);
+        assert_eq!(parse_file_id("https://edge.forgecdn.net/files/9660/056/pack.zip").unwrap(), 9_660_056);
+        assert_eq!(parse_file_id("https://edge.forgecdn.net/files/0/5/pack.zip").unwrap(), 5);
+        assert_eq!(parse_file_id("https://www.curseforge.com/minecraft/modpacks/ravens-high-fantasy/files/9660156").unwrap(), 9_660_156);
+        assert_eq!(parse_file_id("https://authors.curseforge.com/#/projects/1764125/files/9660156").unwrap(), 9_660_156);
+        assert_eq!(parse_file_id("  9660156 \n").unwrap(), 9_660_156);
+
+        for invalid in [
+            "",
+            "   ",
+            "0",
+            "not a link",
+            "https://edge.forgecdn.net/files/9660/1000/pack.zip",
+            "https://edge.forgecdn.net/files/0/0/pack.zip",
+            "https://example.com/files/9660/156/pack.zip",
+            "https://www.curseforge.com/projects/1764125",
+            "https://authors.curseforge.com/#/projects/1764125/files",
+        ] {
+            assert!(parse_file_id(invalid).is_err(), "should reject {invalid:?}");
+        }
     }
 }

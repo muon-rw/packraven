@@ -532,8 +532,10 @@ pub fn replace_curseforge_file(app: AppHandle, state: State<'_, AppState>, versi
 }
 
 #[tauri::command]
-pub fn mark_server_pack_uploaded(state: State<'_, AppState>, version: String) -> CmdResult<()> {
-    publish::mark_server_pack_uploaded(&state.pack_data(), &version).map_err(err)
+pub fn mark_server_pack_uploaded(state: State<'_, AppState>, version: String, link: Option<String>) -> CmdResult<Option<u64>> {
+    let file_id = publish::mark_server_pack_uploaded(&state.pack_data(), &version, link.as_deref()).map_err(err)?;
+    crate::announcer::check_soon();
+    Ok(file_id)
 }
 
 #[tauri::command]

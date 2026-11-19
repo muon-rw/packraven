@@ -4,10 +4,14 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 
 ## [0.5.1]
 ### Changed
+- Prompt to input the download link after you manually uploaded the server pack, so it can be tracked instantly
 - Java4shell mitigations:
 - - Auto-update server pack's Java version when they start.
 - - On packs using Java 16+ (Minecraft 1.17+), add `-XX:-UseBASE64Intrinsics` to the server pack's default flags and to test run clients
 - - Prompt to update GraalVM downloaded by packraven when Oracle publishes a newer build
+
+### Fixed
+- Approval status updating every 5 minutes instead of 30 seconds if you manually uploaded the server pack
 
 ## [0.5.0] - 2026-11-16
 ### Added

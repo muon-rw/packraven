@@ -162,7 +162,7 @@
   let resumable = $derived(unfinished.find((release) => release.version === trimmed && packravenCanFinish(release)) ?? null)
   let waitingOnYou = $derived(unfinished.find((release) => release.version === trimmed && !!release.serverPackMissing && !packravenCanFinish(release)) ?? null)
   // The version whose server pack you said you uploaded, which only your word confirms until CurseForge links it.
-  let uploadedByYou = $state<string | null>(null)
+  let uploadedByYou = $state<{ version: string; tracked: boolean } | null>(null)
 
   function leftToYouStep(upload: ServerPackUpload) {
     const reason = upload.error?.trim().replace(/[.!]+$/, '')
@@ -522,8 +522,8 @@
     target?.focus()
   }
 
-  async function markedPublishedUploaded(version: string) {
-    uploadedByYou = version
+  async function markedPublishedUploaded(version: string, fileId: number | null) {
+    uploadedByYou = { version, tracked: fileId !== null }
     loadUnfinished()
     const to = await api.publishedTo(version).catch(() => null)
     landed = to ?? 'unknown'
@@ -682,7 +682,7 @@
                 finishedServerPackPage = null
                 tagModalPage = null
               }}
-              onmarked={() => published && markedPublishedUploaded(published.version)}
+              onmarked={(fileId) => published && markedPublishedUploaded(published.version, fileId)}
             />
             {#if announces}<p class="muted small">packraven holds the Discord announcement until CurseForge has the server pack.</p>{/if}
           </Notice>
@@ -690,6 +690,7 @@
       {/if}
       {#if modrinthFailed}
         {@const modrinthHeadline = `${overview?.name} ${published.version} is on CurseForge, but the Modrinth upload failed.`}
+        {@const showTagStep = !landed.serverPackMissing && landed.serverPackPage && !tagModalPage && uploadedByYou?.version !== published.version}
         <div id="published-notice" tabindex="-1">
           <Notice tone="warn" live={false}>
             <p role="status">
@@ -698,21 +699,26 @@
             </p>
             {#if landed.modrinthError}<p class="muted"><LinkedText text={landed.modrinthError} /></p>{/if}
             <p><button onclick={onreleases}>Upload it from Releases</button></p>
-            {#if !landed.serverPackMissing && landed.serverPackPage && !tagModalPage}<ServerPackTagStep page={landed.serverPackPage} />{/if}
+            {#if showTagStep}<ServerPackTagStep page={landed.serverPackPage!} />{/if}
           </Notice>
         </div>
       {:else if !landed.serverPackMissing}
         {@const okHeadline = `${overview?.name} ${published.version} is on ${landedOn}.`}
         {@const jobSummary = publishJob.message && !publishJob.message.includes('without its server pack') ? `${publishJob.message.replace(/\.$/, '')}.` : ''}
+        {@const showTagStep = landed.serverPackPage && !tagModalPage && uploadedByYou?.version !== published.version}
         <div id="published-notice" tabindex="-1">
-          <Notice tone="ok" live={!landed.serverPackPage}>
-            <p role={landed.serverPackPage ? 'status' : undefined}><strong>{okHeadline}</strong> {tagged}.</p>
+          <Notice tone="ok" live={!showTagStep}>
+            <p role={showTagStep ? 'status' : undefined}><strong>{okHeadline}</strong> {tagged}.</p>
             <p class="muted">
               packraven archived its notes to <span class="file">changelogs/{published.version}.md</span> and cleared changelog.md for the next release.{jobSummary ? ` ${jobSummary}` : ''}
-              {#if uploadedByYou === published.version}You uploaded its server pack yourself, so you'll see it in Releases once CurseForge approves the client pack.{/if}
+              {#if uploadedByYou?.version === published.version}
+                {uploadedByYou.tracked
+                  ? 'packraven is tracking its server pack too.'
+                  : "You uploaded its server pack yourself, so you'll see it in Releases once CurseForge approves the client pack."}
+              {/if}
               <button class="link" onclick={onreleases}>Follow its review in Releases</button>.
             </p>
-            {#if landed.serverPackPage && !tagModalPage}<ServerPackTagStep page={landed.serverPackPage} />{/if}
+            {#if showTagStep}<ServerPackTagStep page={landed.serverPackPage!} />{/if}
           </Notice>
         </div>
       {/if}

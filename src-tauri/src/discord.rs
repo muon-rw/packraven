@@ -354,20 +354,32 @@ pub enum Listing {
     Held,
 }
 
+async fn curseforge_file_listing(project_id: u64, file_id: u64, recent: bool) -> Listing {
+    match curseforge::file(project_id, file_id).await {
+        Ok(Some(file)) => match curseforge::file_state(file.file_status) {
+            FileState::Approved => Listing::Public,
+            FileState::Processing | FileState::InReview => Listing::Pending,
+            _ => Listing::Held,
+        },
+        _ if recent => Listing::Pending,
+        _ => Listing::Held,
+    }
+}
+
 /// Returns whether every platform the release went to lists it, taking the slowest platform's listing.
 /// Modrinth usually lists a version on an approved project as soon as we upload it, but it can hold one
 /// for review too.
 pub async fn listing(release: &Release) -> Listing {
+    let recent = release.uploaded_to_curseforge_recently();
     let on_curseforge = match &release.curseforge {
-        Some(published) => match curseforge::file(published.project_id, published.file_id).await {
-            Ok(Some(file)) => match curseforge::file_state(file.file_status) {
-                FileState::Approved => Listing::Public,
-                FileState::Processing | FileState::InReview => Listing::Pending,
-                _ => Listing::Held,
-            },
-            _ if release.uploaded_to_curseforge_recently() => Listing::Pending,
-            _ => Listing::Held,
-        },
+        Some(published) => {
+            let client = curseforge_file_listing(published.project_id, published.file_id, recent).await;
+            let server = match published.server_file_id {
+                Some(server_id) => curseforge_file_listing(published.project_id, server_id, recent).await,
+                None => Listing::Public,
+            };
+            client.max(server)
+        }
         None => Listing::Public,
     };
     let on_modrinth = match &release.modrinth {

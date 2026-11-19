@@ -1423,8 +1423,35 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     }),
   mark_server_pack_uploaded: (a) => {
     const release = releases.find((r) => r.version === a.version)!
+    const raw = typeof a.link === 'string' ? a.link.trim() : ''
+    let fileId: number | null = null
+    if (raw) {
+      if (/^\d+$/.test(raw) && Number(raw) > 0) {
+        fileId = Number(raw)
+      } else {
+        const cdn = raw.match(/^https?:\/\/(?:[\w-]+\.)?forgecdn\.net\/files\/(\d+)\/(\d{1,3})(?:\/|$)/i)
+        const page = raw.match(/^https?:\/\/(?:[\w-]+\.)?curseforge\.com\/(?:[^#]*\/)?files\/(\d+)(?:[/?#]|$)/i)
+        if (cdn && Number(cdn[2]) < 1000) fileId = Number(cdn[1]) * 1000 + Number(cdn[2])
+        else if (page) fileId = Number(page[1])
+      }
+      if (!fileId) throw new Error("That doesn't look like a CurseForge download link or file ID.")
+      if (release.curseforge && fileId === release.curseforge.fileId) {
+        throw new Error("That's the client pack's file. Copy the download link from the server pack instead.")
+      }
+    }
     release.serverPackMissing = null
-    release.curseforge = { ...release.curseforge!, serverStatus: 'Uploaded by you' }
+    if (fileId !== null) {
+      release.curseforge = {
+        ...release.curseforge!,
+        serverStatus: 'Processing',
+        serverState: 'processing',
+        serverUploaded: new Date().toISOString(),
+        serverPage: `https://authors.curseforge.com/#/projects/${release.curseforge!.projectId}/files/${fileId}`,
+      }
+    } else {
+      release.curseforge = { ...release.curseforge!, serverStatus: 'Uploaded by you' }
+    }
+    return fileId
   },
   finish_release: (a) => {
     const release = releases.find((r) => r.version === a.version)!

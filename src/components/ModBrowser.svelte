@@ -1,20 +1,36 @@
 <script lang="ts">
   import { untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
+  import ContextMenu from './ContextMenu.svelte'
+  import ModGallery from './ModGallery.svelte'
+  import ModLinks from './ModLinks.svelte'
   import Notice from './Notice.svelte'
   import RemoteHtml from './RemoteHtml.svelte'
-  import { api, errorText, type ModPreview, type ModRequest, type Platform, type SearchResult } from '../lib/api'
+  import { api, errorText, type ModDetails, type ModPreview, type ModRequest, type Platform, type SearchResult } from '../lib/api'
   import { remoteTextHtml } from '../lib/markdown'
-  import { browse, cancelChange, changeFor, modUpdates, point, projectKey, queuedButton } from '../lib/modUpdates.svelte'
+  import { fileIdCopyLabel, mavenCopyLabel, mavenSnippet, rawFileId, rawProjectId } from '../lib/maven'
+  import type { MenuItem } from '../lib/menu'
+  import { browse, cancelChange, changeFor, flashCopyNote, modUpdates, point, projectKey, queuedButton } from '../lib/modUpdates.svelte'
+  import { commandKey, isMac, shortcut } from '../lib/platform'
 
   let {
     platform,
     installedKeys,
     game,
+    minecraft,
+    loader,
     // The pack goes to both platforms, so results say when the other platform has the mod too.
     dual,
     install,
-  }: { platform: Platform; installedKeys: Set<string>; game: string; dual: boolean; install: (requests: ModRequest[], projects: string[], names: string[]) => Promise<void> } = $props()
+  }: {
+    platform: Platform
+    installedKeys: Set<string>
+    game: string
+    minecraft: string | null
+    loader: string | null
+    dual: boolean
+    install: (requests: ModRequest[], projects: string[], names: string[]) => Promise<void>
+  } = $props()
 
   // We wait for a pause in typing, so each keystroke doesn't spend a request.
   const SEARCH_DELAY_MS = 350
@@ -32,12 +48,19 @@
   // until focus leaves it and comes back.
   let pressed: string | null = $state(null)
   let previewError: { key: string; text: string } | null = $state(null)
+  type Detail = 'description' | 'gallery'
   let reading: string | null = $state(null)
+  let detail: Detail = $state('description')
   let descriptions: Record<string, string | { error: string }> = $state({})
+  let detailsByKey: Record<string, ModDetails | { error: string }> = $state({})
+  let loadingDetails = $state(new Set<string>())
+  let ctrlHeld = $state(false)
+  let copyError: string | null = $state(null)
+  let menu: { x: number; y: number; label: string; items: MenuItem[] } | null = $state(null)
   // The other platform's page of each result it has too.
   let elsewhere: Record<string, string> = $state({})
 
-  let resultsRegion: HTMLElement
+  let resultsRegion: HTMLElement | undefined = $state()
   let name = $derived(NAME[platform])
 
   let latestSearch = 0
@@ -84,14 +107,142 @@
     return () => clearTimeout(timer)
   })
 
-  async function toggleDescription(key: string) {
-    reading = reading === key ? null : key
-    if (reading === null || descriptions[key] !== undefined) return
+  function loadDetails(key: string, force = false) {
+    if ((!force && detailsByKey[key] !== undefined) || loadingDetails.has(key)) return
+    if (force) delete detailsByKey[key]
+    loadingDetails = new Set(loadingDetails).add(key)
+    api.modDetails(key, [key]).then(
+      (details) => {
+        detailsByKey[key] = details
+      },
+      (error) => {
+        detailsByKey[key] = { error: `Couldn't load details from ${name}: ${errorText(error)}` }
+      },
+    ).finally(() => {
+      loadingDetails = new Set([...loadingDetails].filter((k) => k !== key))
+    })
+  }
+
+  async function loadDescription(key: string, force = false) {
+    if (!force && descriptions[key] !== undefined) return
+    if (force) delete descriptions[key]
     try {
       descriptions[key] = remoteTextHtml(await api.modDescription(key)) || '<p>The author left this description empty.</p>'
     } catch (error) {
       descriptions[key] = { error: `Couldn't load the description from ${name}: ${errorText(error)}` }
     }
+  }
+
+  async function openDetail(key: string, show: Detail = detail) {
+    if (reading === key && detail === show) {
+      reading = null
+      return
+    }
+    reading = key
+    detail = show
+    loadDetails(key)
+    if (show === 'description' && descriptions[key] === undefined) {
+      await loadDescription(key)
+    }
+  }
+
+  function onRowClick(event: MouseEvent, result: SearchResult) {
+    if ((event.target as HTMLElement).closest('button, a, input, select, .reading, .confirm')) return
+    if (commandKey(event) && result.url) {
+      event.preventDefault()
+      openUrl(result.url)
+      return
+    }
+    openDetail(result.key)
+  }
+
+  function onNameClick(event: MouseEvent, result: SearchResult) {
+    if (commandKey(event) && result.url) {
+      event.preventDefault()
+      event.stopPropagation()
+      openUrl(result.url)
+      return
+    }
+    openDetail(result.key)
+  }
+
+  // Modrinth search doesn't return a version ID, so we resolve the newest fitting version on demand.
+  async function resolveFile(result: SearchResult): Promise<string | null> {
+    if (result.file) return result.file.file
+    const files = await api.modVersions(`${browse.kind}/`, result.key)
+    return files[0]?.file ?? null
+  }
+
+  async function copyText(text: string | null, label: string) {
+    if (!text) return
+    copyError = null
+    try {
+      await navigator.clipboard.writeText(text)
+      flashCopyNote(`Copied ${label}.`)
+    } catch (error) {
+      copyError = `Couldn't copy ${label}: ${errorText(error)}`
+    }
+  }
+
+  async function copySnippet(result: SearchResult) {
+    copyError = null
+    const label = platform === 'modrinth' ? 'Modrinth Maven snippet' : 'CurseMaven snippet'
+    try {
+      const file = await resolveFile(result)
+      const snippet = mavenSnippet({ key: result.key, file, slug: result.slug, minecraft, loader })
+      if (!snippet) {
+        copyError = `Couldn't find a matching file for ${result.name} on ${game}.`
+        return
+      }
+      await copyText(snippet, label)
+    } catch (error) {
+      copyError = `Couldn't copy ${label}: ${errorText(error)}`
+    }
+  }
+
+  async function copyFileId(result: SearchResult) {
+    copyError = null
+    const label = platform === 'modrinth' ? 'version ID' : 'file ID'
+    try {
+      const fileId = rawFileId(await resolveFile(result))
+      if (!fileId) {
+        copyError = `Couldn't find a matching file for ${result.name} on ${game}.`
+        return
+      }
+      await copyText(fileId, label)
+    } catch (error) {
+      copyError = `Couldn't copy ${label}: ${errorText(error)}`
+    }
+  }
+
+  function openMenu(event: MouseEvent, result: SearchResult) {
+    event.preventDefault()
+    const row = event.currentTarget as HTMLElement
+    const rect = row.getBoundingClientRect()
+    const keyboard = !event.clientX && !event.clientY
+    const hasCfFile = platform === 'curseforge' ? !!result.file : true
+    const hasSnippet = hasCfFile && (platform === 'modrinth' || !!result.slug)
+    const projectId = rawProjectId(result.key)
+    menu = {
+      x: keyboard ? rect.left + 24 : event.clientX,
+      y: keyboard ? rect.bottom : event.clientY,
+      label: `${result.name} actions`,
+      items: [
+        { label: 'Show description', run: () => openDetail(result.key, 'description') },
+        { label: 'Show gallery', run: () => openDetail(result.key, 'gallery') },
+        'separator',
+        { label: `Open on ${name}`, disabled: !result.url, run: () => result.url && openUrl(result.url) },
+        { label: 'Copy link', disabled: !result.url, run: () => copyText(result.url, 'link') },
+        'separator',
+        { label: mavenCopyLabel(platform), disabled: !hasSnippet, run: () => copySnippet(result) },
+        { label: fileIdCopyLabel(platform), disabled: !hasCfFile, run: () => copyFileId(result) },
+        ...(projectId ? [{ label: 'Copy project ID', run: () => copyText(projectId, 'project ID') }] : []),
+      ],
+    }
+  }
+
+  function onModifier(event: KeyboardEvent, down: boolean) {
+    if (isMac ? event.key === 'Meta' : event.key === 'Control') ctrlHeld = down
   }
 
   // Modrinth's search doesn't say which version fits the pack, so for its results we name the
@@ -142,7 +293,7 @@
   // Cancelling or confirming the dependency prompt removes the button you used, so focus falls to
   // the page. You may have moved on to another result by then, so we leave focus alone in that case.
   function recoverFocus() {
-    if (document.activeElement === document.body) resultsRegion.focus()
+    if (document.activeElement === document.body) resultsRegion?.focus()
   }
 
   function list(names: string[]) {
@@ -159,6 +310,8 @@
   const domId = (key: string) => key.replace(/[^\w-]/g, '_')
 </script>
 
+<svelte:window onkeydown={(e) => onModifier(e, true)} onkeyup={(e) => onModifier(e, false)} onblur={() => (ctrlHeld = false)} />
+
 <div class="browser">
   {#if searchError}
     <Notice tone="error">
@@ -166,13 +319,16 @@
       <p><button onclick={() => run(false)} disabled={searching}>Try again</button></p>
     </Notice>
   {/if}
+  {#if copyError}
+    <Notice tone="error"><p>{copyError}</p></Notice>
+  {/if}
 
   <p class="visually-hidden" role="status">
     {#if searching}Searching {name}.{:else if !searchError}{results.length} {results.length === 1 ? 'result' : 'results'}.{/if}
   </p>
 
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-  <div class="results" role="region" aria-label="Results from {name}" aria-busy={searching} tabindex="0" bind:this={resultsRegion}>
+  <div class="results" class:ctrl-open={ctrlHeld} role="region" aria-label="Results from {name}" aria-busy={searching} tabindex="0" bind:this={resultsRegion}>
     {#if !results.length && searching}
       <p class="muted empty">Searching {name}.</p>
     {:else if !results.length && !searchError}
@@ -193,11 +349,20 @@
         {@const checking = resolving.has(result.key)}
         {@const unavailable = !!change || checking || confirming?.result.key === result.key}
         {@const otherUrl = elsewhere[result.key]}
-        <li>
+        <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_noninteractive_element_interactions -->
+        <li class:has-url={!!result.url} onclick={(e) => onRowClick(e, result)} oncontextmenu={(e) => openMenu(e, result)}>
           {#if result.logo}<img src={result.logo} alt="" width="44" height="44" loading="lazy" />{:else}<span class="logo" aria-hidden="true"></span>{/if}
           <div class="about">
             <div class="title">
-              <button class="name" aria-expanded={reading === result.key} aria-controls="about-{domId(result.key)}" onclick={() => toggleDescription(result.key)}>{result.name}</button>
+              <button
+                class="name"
+                aria-expanded={reading === result.key}
+                aria-controls="about-{domId(result.key)}"
+                title={result.url ? `${shortcut('Ctrl+Click')} to open on ${name}` : undefined}
+                onclick={(e) => onNameClick(e, result)}
+              >
+                {result.name}{#if result.url}<svg class="ctrl-arrow" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2.5h5v5M9.5 2.5 3 9" /></svg>{/if}
+              </button>
               {#if result.authors.length}<span class="muted">by {result.authors.join(', ')}</span>{/if}
             </div>
             <p class="summary">{result.summary}</p>
@@ -267,18 +432,44 @@
           </div>
           {#if reading === result.key}
             {@const description = descriptions[result.key]}
+            {@const entryDetails = detailsByKey[result.key]}
+            {@const loadedDetails = entryDetails && !('error' in entryDetails) ? entryDetails : null}
+            {@const detailsError = entryDetails && 'error' in entryDetails ? entryDetails.error : null}
+            {@const galleryCount = loadedDetails?.gallery.length ?? 0}
             <div class="reading" id="about-{domId(result.key)}">
-              {#if description === undefined}
-                <p class="muted">Loading the description from {name}.</p>
+              <div class="detail-head">
+                <div class="modes" role="group" aria-label="Show">
+                  <button class="mode" aria-pressed={detail === 'description'} onclick={() => openDetail(result.key, 'description')}>Description</button>
+                  <button class="mode" aria-pressed={detail === 'gallery'} onclick={() => openDetail(result.key, 'gallery')}>
+                    Gallery{#if galleryCount}<span class="muted tab-count">{galleryCount}</span>{/if}
+                  </button>
+                </div>
+                <ModLinks platformName={name} url={result.url} links={loadedDetails?.links ?? null} />
+              </div>
+              {#if detail === 'gallery'}
+                <div class="gallery-wrap">
+                  <ModGallery
+                    name={result.name}
+                    platformName={name}
+                    items={loadedDetails?.gallery ?? []}
+                    loading={entryDetails === undefined}
+                    error={detailsError}
+                    onretry={() => loadDetails(result.key, true)}
+                  />
+                </div>
+              {:else if description === undefined}
+                <p class="muted" role="status">Loading the description from {name}.</p>
               {:else if typeof description !== 'string'}
-                <p class="failed">{description.error}</p>
+                <p class="failed">
+                  {description.error}{' '}
+                  <button class="link" onclick={() => loadDescription(result.key, true)}>Try again</button>
+                </p>
               {:else}
                 <!-- svelte-ignore a11y_no_noninteractive_tabindex (a long description needs to scroll by keyboard even when it has no links) -->
                 <section class="description" aria-label="Description of {result.name}" tabindex="0">
                   <RemoteHtml html={description} topHeading={3} />
                 </section>
               {/if}
-              {#if result.url}<button class="link" onclick={() => openUrl(result.url!)}>Open on {name}</button>{/if}
             </div>
           {/if}
         </li>
@@ -291,6 +482,10 @@
     {/if}
   </div>
 </div>
+
+{#if menu}
+  <ContextMenu x={menu.x} y={menu.y} label={menu.label} items={menu.items} scroller={resultsRegion} onclose={() => (menu = null)} />
+{/if}
 
 <style>
   .browser {
@@ -322,6 +517,11 @@
     gap: 14px;
     align-items: start;
     padding: 14px 16px;
+    cursor: pointer;
+  }
+
+  li:hover {
+    background: var(--paper);
   }
 
   @media (max-height: 700px) {
@@ -391,6 +591,9 @@
   }
 
   .name {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     padding: 0;
     font: inherit;
     font-weight: 700;
@@ -406,12 +609,61 @@
     text-underline-offset: 0.18em;
   }
 
+  .ctrl-arrow {
+    display: none;
+    width: 12px;
+    height: 12px;
+    flex: none;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .results.ctrl-open li.has-url:hover {
+    cursor: alias;
+  }
+
+  .results.ctrl-open li.has-url:hover .name {
+    color: var(--forest);
+    text-decoration: underline;
+    text-underline-offset: 0.18em;
+  }
+
+  .results.ctrl-open li.has-url:hover .ctrl-arrow {
+    display: inline-block;
+  }
+
   .reading {
     grid-column: 2 / -1;
     display: grid;
-    justify-items: start;
+    justify-items: stretch;
     gap: 8px;
     max-width: 90ch;
+    cursor: auto;
+  }
+
+  .detail-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 16px;
+  }
+
+  .modes {
+    width: fit-content;
+  }
+
+  .tab-count {
+    margin-left: 6px;
+    font-weight: 400;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .gallery-wrap {
+    min-width: 0;
   }
 
   .reading p {

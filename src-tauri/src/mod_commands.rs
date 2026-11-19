@@ -7,7 +7,7 @@ use crate::commands::AppState;
 use crate::curseforge;
 use crate::history::{self, Action};
 use crate::jobs::Log;
-use crate::mod_updates::{self, AddonKind, Category, InstalledMods, ModCheck, ModFile, ModRequest, RemoteText, SearchPage, SearchRequest};
+use crate::mod_updates::{self, AddonKind, Category, InstalledMods, ModCheck, ModDetails, ModFile, ModRequest, RemoteText, SearchPage, SearchRequest};
 use crate::modsync;
 use crate::pack::{ModKey, Pack, Platform, ReleaseType, BCC_PROJECT_ID};
 use crate::sides::MetadataCache;
@@ -128,6 +128,11 @@ pub fn set_mod_locked(state: State<'_, AppState>, key: String, locked: bool) -> 
 #[tauri::command]
 pub async fn mod_description(key: String) -> CmdResult<RemoteText> {
     mod_updates::description(&key).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn mod_details(key: String, keys: Vec<String>) -> CmdResult<ModDetails> {
+    mod_updates::details(&key, &keys).await.map_err(err)
 }
 
 const DISABLED_SUFFIX: &str = ".disabled";

@@ -817,7 +817,7 @@
     {:else if pane === 'changes'}
       <Changes {overview} onchange={refresh} />
     {:else if pane === 'mods'}
-      <Mods pack={packs?.active ?? null} {publishesTo} game={overview ? `${overview.minecraft} ${loaderName(overview.loader).split(' ')[0]}` : 'this pack'} clientRunning={!!overview?.clientRunning} ontest={() => showFrom('test', index)} />
+      <Mods pack={packs?.active ?? null} {publishesTo} game={overview ? `${overview.minecraft} ${loaderName(overview.loader).split(' ')[0]}` : 'this pack'} minecraft={overview?.minecraft ?? null} loader={overview?.loader ?? null} clientRunning={!!overview?.clientRunning} ontest={() => showFrom('test', index)} />
     {:else if pane === 'server'}
       <Server {overview} onfiles={(path) => openFileBesideIfRoom(path, index)} />
     {:else if pane === 'test'}

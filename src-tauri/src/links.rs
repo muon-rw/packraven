@@ -231,6 +231,24 @@ pub async fn modrinth_counterparts(ids: &[u64]) -> Result<Vec<(u64, String)>> {
         .collect())
 }
 
+/// Returns the matching Modrinth project for a CurseForge mod, checked by slug plus source repo or author.
+pub async fn modrinth_counterpart_project(cf: &CfMod) -> Result<Option<Project>> {
+    let slugs: Vec<String> = std::iter::once(cf.slug.as_str()).chain(twins::slug_for_every_loader(&cf.slug)).map(str::to_lowercase).collect();
+    let found = modrinth::projects(&slugs).await?;
+    let slug = cf.slug.to_lowercase();
+    let candidate = found.values().find(|p| p.slug.eq_ignore_ascii_case(&slug)).or_else(|| {
+        twins::slug_for_every_loader(&slug).and_then(|s| found.values().find(|p| p.slug.eq_ignore_ascii_case(s)))
+    });
+    let Some(modrinth) = candidate else { return Ok(None) };
+    let same_source = cf.links.source_url.as_deref().and_then(repository).is_some_and(|ours| modrinth.source_url.as_deref().and_then(repository) == Some(ours));
+    if same_source {
+        return Ok(Some(modrinth.clone()));
+    }
+    let names: HashSet<String> = cf.authors.iter().map(|a| simplify(&a.name)).collect();
+    let theirs = modrinth::authors(&[modrinth]).await?.remove(&modrinth.id).unwrap_or_default();
+    Ok(theirs.iter().any(|name| names.contains(&simplify(name))).then(|| modrinth.clone()))
+}
+
 /// Returns the CurseForge page of each Modrinth project CurseForge has too, by Modrinth project ID.
 /// CurseForge can only look up one slug at a time, so we ask about a page of results, not more.
 pub async fn curseforge_counterparts(ids: &[String]) -> Result<Vec<(String, String)>> {

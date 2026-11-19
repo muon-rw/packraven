@@ -139,8 +139,48 @@ const clientHeld = new URLSearchParams(location.search).has('clientheld')
 const serverDeleted = new URLSearchParams(location.search).has('serverdeleted')
 // Add `firstheld` to have CurseForge hold the first release's server pack for manual review.
 const firstHeld = new URLSearchParams(location.search).has('firstheld')
+// Add `manyreleases` for enough releases to collapse older ones, `slowolder` to pause while loading them, and `failolder` to fail the first older load.
+const manyReleases = new URLSearchParams(location.search).has('manyreleases')
+const slowOlderReleases = new URLSearchParams(location.search).has('slowolder')
+let failOlderReleases = new URLSearchParams(location.search).has('failolder')
+const olderMockReleases: ReleaseStatus[] = manyReleases
+  ? Array.from({ length: 6 }, (_, index) => {
+      const n = index + 1
+      const version = `0.0.${n}`
+      const day = String(10 + n).padStart(2, '0')
+      return {
+        version,
+        publishedAt: `2026-09-${day}T18:00:00Z`,
+        announce: true,
+        announcedAt: `2026-09-${day}T18:30:00Z`,
+        announcementImages: [],
+        displayName: `${pack.name} ${version}`,
+        releaseType: 'beta',
+        modrinth: modrinthRelease(version),
+        modrinthMissing: null,
+        serverPackMissing: null,
+        curseforge: {
+          projectId: 1234567,
+          fileId: 6900000 + n * 10,
+          status: 'Approved',
+          serverStatus: 'Approved',
+          serverPackLinked: true,
+          state: 'approved',
+          serverState: 'approved',
+          uploaded: `2026-09-${day}T18:00:00Z`,
+          serverUploaded: `2026-09-${day}T18:02:00Z`,
+          page: `https://authors.curseforge.com/#/projects/1234567/files/${6900000 + n * 10}`,
+          serverPage: `https://authors.curseforge.com/#/projects/1234567/files/${6900000 + n * 10 + 1}`,
+        },
+        packChanged: false,
+        clientZipPresent: true,
+        updateChecker: { updateType: 'minor_breaking', addedAt: `2026-09-${day}T18:30:00Z` },
+      }
+    })
+  : []
 // The newest release missed Modrinth and its server pack in the dirty scenario, so Releases offers to upload them.
 const releases: ReleaseStatus[] = scenario === 'empty' ? [] : [
+  ...olderMockReleases,
   { version: '0.1.0', publishedAt: '2026-10-03T18:20:00Z', announce: true, announcedAt: '2026-10-03T19:02:00Z', announcementImages: [], displayName: `${pack.name} 0.1.0`, releaseType: 'beta', modrinth: modrinthRelease('0.1.0'), modrinthMissing: null, serverPackMissing: null,
     curseforge: { projectId: 1234567, fileId: 7001001, status: 'Approved', serverStatus: 'Approved', serverPackLinked: true, state: 'approved', serverState: firstHeld ? 'manualReview' : 'approved', uploaded: '2026-10-03T18:20:00Z', serverUploaded: '2026-10-03T18:22:00Z', page: 'https://authors.curseforge.com/#/projects/1234567/files/7001001', serverPage: 'https://authors.curseforge.com/#/projects/1234567/files/7001002' }, packChanged: false, clientZipPresent: true,
     updateChecker: { updateType: 'minor_breaking', addedAt: '2026-10-03T19:02:00Z' } },
@@ -171,7 +211,7 @@ const releases: ReleaseStatus[] = scenario === 'empty' ? [] : [
 
 // In the dirty scenario the newest release also stopped before its commit, tag and push, and the mods changed since.
 const unfinishedSteps = new Map<string, { pending: PendingStep[]; packChanged: boolean }>(
-  scenario === 'dirty' ? [[releases[1].version, { pending: [{ step: 'tag', message: `Release ${releases[1].version}` }, { step: 'push' }], packChanged: true }]] : [],
+  scenario === 'dirty' && releases.length ? [[releases.at(-1)!.version, { pending: [{ step: 'tag', message: `Release ${releases.at(-1)!.version}` }, { step: 'push' }], packChanged: true }]] : [],
 )
 
 // Files a platform doesn't host, which a dual pack has to ship there or keep off it.
@@ -443,18 +483,22 @@ function searchMods(request: { platform: Platform; text: string; kind: string; c
     .filter((p) => p.fileName && p.kind === request.kind && (!text || p.name.toLowerCase().includes(text) || p.summary.toLowerCase().includes(text)))
     .sort((a, b) => (request.sort === 'updated' ? b.updated.localeCompare(a.updated) : b.downloads - a.downloads))
   const modrinth = request.platform === 'modrinth'
-  const results = sorted.slice(request.index, request.index + 8).map((p) => ({
-    key: `${modrinth ? 'mr' : 'cf'}:${p.projectId}`,
-    name: p.name,
-    summary: p.summary,
-    authors: p.authors,
-    downloads: p.downloads,
-    updated: p.updated,
-    logo: projectLogo(p),
-    url: modrinth ? `https://modrinth.com/project/${p.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}` : cfUrl(p.name.toLowerCase().replace(/[^a-z0-9]+/g, '-')),
-    // Modrinth's search doesn't name a file, so packraven picks one when you install.
-    file: modrinth ? null : toFile({ fileId: p.projectId * 10, fileName: p.fileName, releaseType: p.releaseType ?? 'release', fileDate: null }),
-  }))
+  const results = sorted.slice(request.index, request.index + 8).map((p) => {
+    const slug = p.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
+    return {
+      key: `${modrinth ? 'mr' : 'cf'}:${p.projectId}`,
+      name: p.name,
+      slug,
+      summary: p.summary,
+      authors: p.authors,
+      downloads: p.downloads,
+      updated: p.updated,
+      logo: projectLogo(p),
+      url: modrinth ? `https://modrinth.com/project/${slug}` : cfUrl(slug),
+      // Modrinth's search doesn't name a file, so packraven picks one when you install.
+      file: modrinth ? null : toFile({ fileId: p.projectId * 10, fileName: p.fileName, releaseType: p.releaseType ?? 'release', fileDate: null }),
+    }
+  })
   const nextIndex = request.index + 8 < sorted.length ? request.index + 8 : null
   return new Promise((resolve) => setTimeout(() => resolve({ results, nextIndex }), 250))
 }
@@ -1326,7 +1370,17 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   paste_files: () => {
     throw 'The clipboard has no files to paste.'
   },
-  releases: () => releases,
+  releases: async (a) => {
+    const newestFirst = [...releases].reverse()
+    const offset = typeof a.offset === 'number' ? a.offset : 0
+    const limit = typeof a.limit === 'number' ? a.limit : newestFirst.length
+    if (slowOlderReleases && offset > 0) await new Promise((resolve) => setTimeout(resolve, 250))
+    if (failOlderReleases && offset > 0) {
+      failOlderReleases = false
+      throw 'CurseForge did not answer'
+    }
+    return { releases: newestFirst.slice(offset, offset + limit), total: newestFirst.length }
+  },
   get_notes: () => notes,
   changelog_preview: () => ({ diff: modDiff, markdown: renderChangelog() }),
   publish_preflight: () => {
@@ -1549,7 +1603,17 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   discover_instances: () => [pack, { ...pack, dir: 'C:/Instances/Shared Pack', name: 'Shared Pack', addonCount: 0, hasGit: false, hasLock: false, remote: null, added: false }],
   server_sides: () => serverSides,
   installed_mods: () => ({
-    mods: installedMods.map(({ path, projectId, fileId, name, url, logo }) => ({ path, key: `cf:${projectId}`, keys: [`cf:${projectId}`, `mr:${projectId}`], file: `cf:${fileId}`, name, url, logo, authors: authorsOf[projectId] ?? [] })),
+    mods: installedMods.map(({ path, projectId, fileId, name, url, logo }) => ({
+      path,
+      key: `cf:${projectId}`,
+      keys: [`cf:${projectId}`, `mr:${projectId}`],
+      file: `cf:${fileId}`,
+      name,
+      slug: url?.split('/').filter(Boolean).at(-1) ?? name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+      url,
+      logo,
+      authors: authorsOf[projectId] ?? [],
+    })),
     locked: config.updates.locked,
   }),
   set_mods_enabled: (a) =>
@@ -1585,6 +1649,31 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
         250,
       ),
     ),
+  mod_details: (a) => {
+    const key = String(a.key ?? '')
+    const slug = key.replace(/^(cf|mr):/, '')
+    const shot = (title: string, bg: string, accent: string) =>
+      `data:image/svg+xml,${encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360"><rect width="640" height="360" fill="${bg}"/><circle cx="520" cy="90" r="70" fill="${accent}" opacity="0.35"/><rect x="48" y="230" width="240" height="18" rx="4" fill="${accent}" opacity="0.75"/><text x="48" y="295" font-family="system-ui,sans-serif" font-size="28" font-weight="700" fill="#f7f5ef">${title}</text></svg>`)}`
+    return new Promise((resolve) =>
+      setTimeout(
+        () =>
+          resolve({
+            links: {
+              discord: `https://discord.gg/${slug}`,
+              source: `https://github.com/example/${slug}`,
+              wiki: `https://github.com/example/${slug}/wiki`,
+              issues: `https://github.com/example/${slug}/issues`,
+            },
+            gallery: [
+              { url: shot('Overworld Showcase', '#2b3d28', '#a7bd7f'), thumbnail: shot('Overworld Showcase', '#2b3d28', '#a7bd7f'), title: 'Overworld Showcase', description: 'In-game view with default lighting.' },
+              { url: shot('Crafting Station', '#3b2d1f', '#e3c46f'), thumbnail: shot('Crafting Station', '#3b2d1f', '#e3c46f'), title: 'Crafting Station', description: 'Custom workstation and recipe UI.' },
+              { url: shot('Boss Arena', '#2d2336', '#d68ba0'), thumbnail: shot('Boss Arena', '#2d2336', '#d68ba0'), title: 'Boss Arena', description: null },
+            ],
+          }),
+        200,
+      ),
+    )
+  },
   check_mod_updates: () =>
     new Promise((resolve) =>
       setTimeout(
@@ -1603,7 +1692,12 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       ),
     ),
   mod_versions: (a) => {
-    const mod = installedMods.find((m) => m.path === a.path)!
+    const mod = installedMods.find((m) => m.path === a.path)
+    if (!mod) {
+      const id = String(a.key ?? '').replace(/^(cf|mr):/, '')
+      const prefix = String(a.key ?? '').startsWith('mr:') ? 'mr' : 'cf'
+      return [{ file: `${prefix}:${id}0`, fileName: `${id}-1.21.1.jar`, releaseType: 'release', fileDate: new Date(Date.UTC(2026, 9, 12)).toISOString(), onModrinth: true }]
+    }
     const base = mod.path.slice(mod.path.indexOf('/') + 1).replace(/\.disabled$/, '')
     return [...mod.newer, { fileId: mod.fileId, fileName: base, releaseType: mod.releaseType, fileDate: null as string | null }, { fileId: mod.fileId - 90000, fileName: base.replace(/(\d+)(\.\w+)$/, (_, n, ext) => `${Math.max(0, Number(n) - 1)}${ext}`), releaseType: 'release', fileDate: null }].map((f, i) => ({
       ...toFile({ ...f, fileDate: new Date(Date.UTC(2026, 9, 12 - i * 21)).toISOString() }, config.modrinth.project_id && i === 0 ? !behindOnModrinth.has(mod.path) : null),

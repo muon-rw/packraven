@@ -64,6 +64,8 @@ struct SideMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectName {
     pub name: String,
+    #[serde(default)]
+    pub slug: Option<String>,
     pub url: Option<String>,
     // Caches written before we kept authors have none, so None means "fetch again".
     #[serde(default)]
@@ -77,7 +79,7 @@ pub struct ProjectName {
 
 impl ProjectName {
     pub fn of_file(path: &str) -> Self {
-        Self { name: path.rsplit('/').next().unwrap_or(path).to_string(), url: None, authors: None, logo: None, license: None }
+        Self { name: path.rsplit('/').next().unwrap_or(path).to_string(), slug: None, url: None, authors: None, logo: None, license: None }
     }
 }
 
@@ -150,7 +152,7 @@ impl MetadataCache {
             for (id, m) in curseforge::mods(&from_curseforge).await? {
                 let authors = Some(m.authors.into_iter().map(|a| a.name).collect());
                 let license = Some(m.license_type.unwrap_or_default());
-                self.names.insert(ModKey::Curseforge(id), ProjectName { name: m.name, url: m.links.website_url, authors, logo: m.logo.as_ref().and_then(curseforge::CfLogo::url), license });
+                self.names.insert(ModKey::Curseforge(id), ProjectName { name: m.name, slug: Some(m.slug), url: m.links.website_url, authors, logo: m.logo.as_ref().and_then(curseforge::CfLogo::url), license });
             }
         }
         if !from_modrinth.is_empty() {
@@ -158,7 +160,7 @@ impl MetadataCache {
             let mut authors = modrinth::authors(&projects.values().collect::<Vec<_>>()).await?;
             for (id, project) in projects {
                 let license = Some(project.license.as_ref().map(modrinth::ProjectLicense::display).unwrap_or_default());
-                let name = ProjectName { url: Some(project.url()), authors: Some(authors.remove(&id).unwrap_or_default()), logo: project.icon_url, license, name: project.title };
+                let name = ProjectName { url: Some(project.url()), slug: Some(project.slug), authors: Some(authors.remove(&id).unwrap_or_default()), logo: project.icon_url, license, name: project.title };
                 self.names.insert(ModKey::Modrinth(id), name);
             }
         }
@@ -191,7 +193,7 @@ impl MetadataCache {
             ModKey::Curseforge(id) => id.to_string(),
             ModKey::Modrinth(id) => id.clone(),
         };
-        self.names.get(key).cloned().unwrap_or(ProjectName { name: format!("Project {id}"), url: None, authors: None, logo: None, license: None })
+        self.names.get(key).cloned().unwrap_or(ProjectName { name: format!("Project {id}"), slug: None, url: None, authors: None, logo: None, license: None })
     }
 
     // A jar we can't read counts as requiring nothing, so it keeps whatever its tags say. We don't

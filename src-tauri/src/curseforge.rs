@@ -41,6 +41,32 @@ pub struct CfMod {
     pub date_modified: String,
     #[serde(default)]
     pub license_type: Option<String>,
+    #[serde(default)]
+    pub screenshots: Vec<CfScreenshot>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CfScreenshot {
+    pub id: u64,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub thumbnail_url: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+impl CfScreenshot {
+    pub fn thumbnail(&self) -> Option<&str> {
+        [self.thumbnail_url.as_str(), self.url.as_str()].into_iter().find(|u| !u.is_empty())
+    }
+
+    pub fn full(&self) -> Option<&str> {
+        [self.url.as_str(), self.thumbnail_url.as_str()].into_iter().find(|u| !u.is_empty())
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -100,6 +126,10 @@ impl CfLogo {
 #[serde(rename_all = "camelCase")]
 pub struct CfLinks {
     pub website_url: Option<String>,
+    #[serde(default)]
+    pub wiki_url: Option<String>,
+    #[serde(default)]
+    pub issues_url: Option<String>,
     #[serde(default)]
     pub source_url: Option<String>,
 }

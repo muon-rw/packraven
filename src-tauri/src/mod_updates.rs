@@ -50,6 +50,7 @@ pub struct InstalledMod {
     keys: Vec<String>,
     file: Option<String>,
     name: String,
+    slug: Option<String>,
     url: Option<String>,
     authors: Vec<String>,
     logo: Option<String>,
@@ -201,13 +202,16 @@ pub async fn installed(pack: &Pack, cache: &mut MetadataCache) -> InstalledMods 
                 (None, Some(file)) => Some(FileRef::Modrinth(file.version_id.clone())),
                 (None, None) => None,
             };
+            let url = name.and_then(|n| n.url.clone());
+            let slug = name.and_then(|n| n.slug.clone()).or_else(|| url.as_deref().and_then(slug_from_url));
             InstalledMod {
                 path: entry.path.clone(),
                 key: key.as_ref().map(ToString::to_string),
                 keys: project_keys(entry).iter().map(ToString::to_string).collect(),
                 file: file.map(|f| f.to_string()),
                 name: name.map_or_else(|| file_name(&entry.path).to_string(), |n| n.name.clone()),
-                url: name.and_then(|n| n.url.clone()),
+                slug,
+                url,
                 authors: name.and_then(|n| n.authors.clone()).unwrap_or_default(),
                 logo: name.and_then(|n| n.logo.clone()),
             }
@@ -219,6 +223,12 @@ pub async fn installed(pack: &Pack, cache: &mut MetadataCache) -> InstalledMods 
 
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
+}
+
+fn slug_from_url(url: &str) -> Option<String> {
+    let trimmed = url.split('?').next().unwrap_or(url).trim_end_matches('/');
+    let slug = trimmed.rsplit('/').next()?;
+    (!slug.is_empty()).then(|| slug.to_string())
 }
 
 pub async fn check(pack: &Pack) -> Result<Vec<ModCheck>> {
@@ -476,6 +486,7 @@ pub struct SearchRequest {
 pub struct SearchResult {
     key: String,
     name: String,
+    slug: Option<String>,
     summary: String,
     authors: Vec<String>,
     downloads: u64,
@@ -552,6 +563,7 @@ async fn search_curseforge(pack: &Pack, request: &SearchRequest) -> Result<Searc
                 logo: project.logo.as_ref().and_then(curseforge::CfLogo::url),
                 url: project.links.website_url,
                 name: project.name,
+                slug: Some(project.slug),
                 summary: project.summary,
                 downloads: project.download_count,
                 updated: project.date_modified,
@@ -593,6 +605,7 @@ async fn search_modrinth(pack: &Pack, request: &SearchRequest) -> Result<SearchP
             key: ModKey::Modrinth(hit.project_id).to_string(),
             url: Some(format!("https://modrinth.com/project/{}", hit.slug)),
             name: hit.title,
+            slug: (!hit.slug.is_empty()).then_some(hit.slug),
             summary: hit.description,
             authors: vec![hit.author],
             downloads: hit.downloads,
@@ -653,6 +666,105 @@ pub async fn description(key: &str) -> Result<RemoteText> {
     match key.parse::<ModKey>().map_err(anyhow::Error::msg)? {
         ModKey::Curseforge(id) => Ok(RemoteText { body: curseforge::description(id).await?, markdown: false }),
         ModKey::Modrinth(id) => Ok(RemoteText { body: modrinth::project(&id).await?.context("Modrinth has no such project")?.body, markdown: true }),
+    }
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModLinks {
+    pub source: Option<String>,
+    pub wiki: Option<String>,
+    pub issues: Option<String>,
+    pub discord: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GalleryItem {
+    pub url: String,
+    pub thumbnail: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModDetails {
+    pub links: ModLinks,
+    pub gallery: Vec<GalleryItem>,
+}
+
+fn clean_url(url: Option<String>) -> Option<String> {
+    let url = url?.trim().to_string();
+    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
+}
+
+fn clean_text(text: Option<String>) -> Option<String> {
+    let text = text?.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn modrinth_gallery(mut images: Vec<modrinth::GalleryImage>) -> Vec<GalleryItem> {
+    images.sort_by_key(|image| (!image.featured, image.ordering));
+    images
+        .into_iter()
+        .filter_map(|image| {
+            let thumbnail = clean_url(Some(image.url))?;
+            let url = clean_url(image.raw_url).unwrap_or_else(|| thumbnail.clone());
+            Some(GalleryItem { url, thumbnail, title: clean_text(image.title), description: clean_text(image.description) })
+        })
+        .collect()
+}
+
+pub async fn details(key: &str, keys: &[String]) -> Result<ModDetails> {
+    match key.parse::<ModKey>().map_err(anyhow::Error::msg)? {
+        ModKey::Curseforge(id) => {
+            let project = curseforge::mods(&[id]).await?.remove(&id).with_context(|| format!("CurseForge has no project {id}"))?;
+            let mut links = ModLinks {
+                source: clean_url(project.links.source_url.clone()),
+                wiki: clean_url(project.links.wiki_url.clone()),
+                issues: clean_url(project.links.issues_url.clone()),
+                discord: None,
+            };
+            let mut gallery: Vec<GalleryItem> = project
+                .screenshots
+                .iter()
+                .filter_map(|shot| {
+                    let url = clean_url(shot.full().map(str::to_string))?;
+                    let thumbnail = clean_url(shot.thumbnail().map(str::to_string)).unwrap_or_else(|| url.clone());
+                    Some(GalleryItem { url, thumbnail, title: clean_text(Some(shot.title.clone())), description: clean_text(Some(shot.description.clone())) })
+                })
+                .collect();
+            // CurseForge has no Discord link field, so we also check the Modrinth counterpart when available.
+            let known_modrinth = keys.iter().find_map(|k| match k.parse::<ModKey>().ok()? {
+                ModKey::Modrinth(mr_id) => Some(mr_id),
+                ModKey::Curseforge(_) => None,
+            });
+            let counterpart = match known_modrinth {
+                Some(mr_id) => modrinth::project(&mr_id).await.ok().flatten(),
+                None => crate::links::modrinth_counterpart_project(&project).await.ok().flatten(),
+            };
+            if let Some(mr) = counterpart {
+                links.discord = links.discord.or_else(|| clean_url(mr.discord_url));
+                links.source = links.source.or_else(|| clean_url(mr.source_url));
+                links.wiki = links.wiki.or_else(|| clean_url(mr.wiki_url));
+                links.issues = links.issues.or_else(|| clean_url(mr.issues_url));
+                if gallery.is_empty() {
+                    gallery = modrinth_gallery(mr.gallery);
+                }
+            }
+            Ok(ModDetails { links, gallery })
+        }
+        ModKey::Modrinth(id) => {
+            let project = modrinth::project(&id).await?.context("Modrinth has no such project")?;
+            let links = ModLinks {
+                source: clean_url(project.source_url),
+                wiki: clean_url(project.wiki_url),
+                issues: clean_url(project.issues_url),
+                discord: clean_url(project.discord_url),
+            };
+            Ok(ModDetails { links, gallery: modrinth_gallery(project.gallery) })
+        }
     }
 }
 

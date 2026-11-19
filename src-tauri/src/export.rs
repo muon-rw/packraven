@@ -1095,7 +1095,7 @@ mod tests {
         let mut pack = Pack { dir: dir.clone(), config: Default::default(), lock: crate::pack::Lockfile { minecraft: None, loader: None, files: vec![file("mods/a.jar", 1), file("mods/b.jar", 2)] } };
         let mut cache = MetadataCache::default();
         for (id, author) in [(1, "ElocinDev"), (2, "Someone")] {
-            let name = ProjectName { name: format!("Mod {id}"), url: None, authors: Some(vec![author.into()]), logo: None, license: Some(String::new()) };
+            let name = ProjectName { name: format!("Mod {id}"), slug: None, url: None, authors: Some(vec![author.into()]), logo: None, license: Some(String::new()) };
             cache.remember(ModKey::Curseforge(id), name);
         }
         pack.config.modrinth.allowed_authors = vec!["elocindev".into()];

@@ -219,6 +219,7 @@ pub fn run() {
             mod_commands::set_mods_enabled,
             mod_commands::mod_changelog,
             mod_commands::mod_description,
+            mod_commands::mod_details,
             mod_commands::remove_mods,
             commands::publish_preflight,
             commands::build_client_export,

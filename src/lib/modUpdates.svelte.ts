@@ -21,7 +21,19 @@ export const modUpdates = $state({
   cancelNotes: [] as string[],
   // The change whose Cancel you're pointing at, so every row it covers can show what you'd cancel.
   pointing: null as number | null,
+  // Brief confirmation after copying a link, Maven snippet, or ID.
+  copyNote: null as string | null,
 })
+
+let copyTimer: ReturnType<typeof setTimeout> | undefined
+
+export function flashCopyNote(note: string) {
+  clearTimeout(copyTimer)
+  modUpdates.copyNote = note
+  copyTimer = setTimeout(() => {
+    if (modUpdates.copyNote === note) modUpdates.copyNote = null
+  }, 3000)
+}
 
 export function projectKey(key: string): string {
   return `project:${key}`

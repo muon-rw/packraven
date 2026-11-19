@@ -2,6 +2,16 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Added
+- Many features for the Browse tab:
+- - Added support for gallery view, website, wiki, and discord/source links if mods have them
+- - Right-click a mod or version anywhere to copy a cursemaven/modrinth snippet
+- - Ctrl+click to open a mod page in your browser rather than viewing it in-app
+
+### Changed
+- Improved responsiveness of opening the Releases tab once your pack had several versions released
+
 ## [0.5.2] - 2026-11-18
 ### Changed
 - Show progress of client/server pack zipping during publish

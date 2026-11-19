@@ -106,11 +106,34 @@ pub struct Project {
     #[serde(default)]
     pub source_url: Option<String>,
     #[serde(default)]
+    pub issues_url: Option<String>,
+    #[serde(default)]
+    pub wiki_url: Option<String>,
+    #[serde(default)]
+    pub discord_url: Option<String>,
+    #[serde(default)]
+    pub gallery: Vec<GalleryImage>,
+    #[serde(default)]
     pub license: Option<ProjectLicense>,
     #[serde(default)]
     pub project_type: String,
     #[serde(default)]
     pub body: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct GalleryImage {
+    pub url: String,
+    #[serde(default)]
+    pub raw_url: Option<String>,
+    #[serde(default)]
+    pub featured: bool,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub ordering: i64,
 }
 
 #[derive(Deserialize, Clone, Debug)]

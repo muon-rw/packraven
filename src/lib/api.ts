@@ -117,6 +117,7 @@ export interface InstalledMod {
   keys: string[]
   file: string | null
   name: string
+  slug: string | null
   url: string | null
   authors: string[]
   logo: string | null
@@ -160,6 +161,7 @@ export interface SearchRequest {
 export interface SearchResult {
   key: string
   name: string
+  slug: string | null
   summary: string
   authors: string[]
   downloads: number
@@ -168,6 +170,25 @@ export interface SearchResult {
   url: string | null
   // The file packraven would install, when the search says. Modrinth's search doesn't, so packraven picks one when you install.
   file: ModFile | null
+}
+
+export interface ModLinks {
+  source: string | null
+  wiki: string | null
+  issues: string | null
+  discord: string | null
+}
+
+export interface GalleryItem {
+  url: string
+  thumbnail: string
+  title: string | null
+  description: string | null
+}
+
+export interface ModDetails {
+  links: ModLinks
+  gallery: GalleryItem[]
 }
 
 export interface ModPreview {
@@ -371,6 +392,11 @@ export interface ComposedAnnouncement {
   attachments: { path: string; filename: string }[]
   linksStripped: boolean
   truncated: boolean
+}
+
+export interface ReleasesPage {
+  releases: ReleaseStatus[]
+  total: number
 }
 
 export interface ReleaseStatus {
@@ -844,6 +870,7 @@ export const api = {
   setModsEnabled: (paths: string[], enabled: boolean) => invoke<string[]>('set_mods_enabled', { paths, enabled }),
   modChangelog: (key: string, file: string) => invoke<RemoteText>('mod_changelog', { key, file }),
   modDescription: (key: string) => invoke<RemoteText>('mod_description', { key }),
+  modDetails: (key: string, keys: string[] = []) => invoke<ModDetails>('mod_details', { key, keys }),
   removeMods: (paths: string[]) => invoke<void>('remove_mods', { paths }),
   publishPreflight: (version: string) =>
     invoke<{ problems: string[]; warnings: string[]; untested: Untested | null; tagTaken: boolean; client: UploadNames; server: UploadNames; modrinthFile: string; curseforgeShipped: OverrideFileView[]; curseforgeLeftOut: OverrideFileView[]; modrinthShipped: OverrideFileView[]; modrinthLeftOut: OverrideFileView[] }>('publish_preflight', { version }),
@@ -870,7 +897,7 @@ export const api = {
   serverCommand: (line: string) => invoke<void>('server_command', { line }),
   killProcess: (which: 'server' | 'client') => invoke<void>('kill_process', { which }),
   publish: (options: { version: string; message: string; push: boolean; client: UploadNames; server: UploadNames; updateChecker: UpdateType | null; announcementImages: string[] }) => invoke<void>('publish', { options }),
-  releases: () => invoke<ReleaseStatus[]>('releases'),
+  releases: (offset?: number, limit?: number) => invoke<ReleasesPage>('releases', { offset: offset ?? null, limit: limit ?? null }),
   outputDir: () => invoke<string>('output_dir'),
 }
 

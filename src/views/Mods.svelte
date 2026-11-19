@@ -5,6 +5,8 @@
   import ContextMenu from '../components/ContextMenu.svelte'
   import Tip from '../components/Tip.svelte'
   import RemoteHtml from '../components/RemoteHtml.svelte'
+  import ModLinks from '../components/ModLinks.svelte'
+  import ModGallery from '../components/ModGallery.svelte'
   import ClientLaunch from '../components/ClientLaunch.svelte'
   import DisableDialog, { type Dependent } from '../components/DisableDialog.svelte'
   import UpdateReview, { type PendingUpdate } from '../components/UpdateReview.svelte'
@@ -12,24 +14,29 @@
   import { openUrl } from '@tauri-apps/plugin-opener'
   import { listen } from '@tauri-apps/api/event'
   import { ask } from '@tauri-apps/plugin-dialog'
-  import { api, errorText, type InstalledMod, type ModCheck, type ModFile, type Platform, type ReleaseType, type ModRequest } from '../lib/api'
+  import { api, errorText, type InstalledMod, type ModCheck, type ModDetails, type ModFile, type Platform, type ReleaseType, type ModRequest } from '../lib/api'
   import { job, onJobEnd, serverPack } from '../lib/jobs.svelte'
-  import { availableUpdate, browse, cancelChange, cancelMenuLabel, changeFor, changeQueued, downloadingCount, dropChange, isLocked, modUpdates, newestOnChannel, point, projectKey, queuedButton, startChange, waitingOnModrinth } from '../lib/modUpdates.svelte'
+  import { availableUpdate, browse, cancelChange, cancelMenuLabel, changeFor, changeQueued, downloadingCount, dropChange, flashCopyNote, isLocked, modUpdates, newestOnChannel, point, projectKey, queuedButton, startChange, waitingOnModrinth } from '../lib/modUpdates.svelte'
   import { remoteTextHtml } from '../lib/markdown'
   import { changedPart } from '../lib/fileNames'
+  import { fileIdCopyLabel, mavenCopyLabel, mavenSnippet, rawFileId, rawProjectId } from '../lib/maven'
   import type { MenuItem } from '../lib/menu'
-  import { commandKey, shortcut, trashName } from '../lib/platform'
+  import { commandKey, isMac, shortcut, trashName } from '../lib/platform'
   import { paneFocus } from '../lib/panes.svelte'
 
   let {
     pack,
     game,
+    minecraft,
+    loader,
     publishesTo,
     clientRunning,
     ontest,
   }: {
     pack: string | null
     game: string
+    minecraft: string | null
+    loader: string | null
     // The platforms with a project in Pack settings. You can add mods from either platform before you set one.
     publishesTo: Platform[]
     clientRunning: boolean
@@ -42,7 +49,7 @@
 
   type Kind = 'mods' | 'resourcepacks' | 'shaderpacks' | 'datapacks'
   type SortKey = 'enabled' | 'name' | 'author' | 'update' | 'locked'
-  type Detail = 'versions' | 'description'
+  type Detail = 'versions' | 'description' | 'gallery'
 
   // We ask CurseForge and Modrinth again when you open the view after this long.
   const CHECK_MAX_AGE_MS = 15 * 60 * 1000
@@ -62,6 +69,9 @@
   let versionsError: string | null = $state(null)
   let descriptions: Record<string, string> = $state({})
   let descriptionError: string | null = $state(null)
+  let detailsByKey: Record<string, ModDetails | { error: string }> = $state({})
+  let loadingDetails = $state(new Set<string>())
+  let ctrlHeld = $state(false)
   let removing: string | null = $state(null)
   let toggling: string | null = $state(null)
   let menu: { x: number; y: number; label: string; items: MenuItem[] } | null = $state(null)
@@ -301,9 +311,10 @@
     if (chosen.length) update(chosen.map((u) => ({ file: u.file.file, replaces: u.mod.path })))
   }
 
-  async function showChangelog(key: string, file: string) {
+  async function showChangelog(key: string, file: string, force = false) {
     openChangelog = file
-    if (changelogs[file] !== undefined) return
+    if (!force && changelogs[file] !== undefined) return
+    if (force) delete changelogs[file]
     try {
       changelogs[file] = remoteTextHtml(await api.modChangelog(key, file)) || '<p>The author left this changelog empty.</p>'
     } catch (error) {
@@ -384,6 +395,44 @@
     }
   }
 
+  function loadDetails(mod: InstalledMod, force = false) {
+    const key = mod.key
+    if (!key || (!force && detailsByKey[key] !== undefined) || loadingDetails.has(key)) return
+    if (force) delete detailsByKey[key]
+    loadingDetails = new Set(loadingDetails).add(key)
+    api.modDetails(key, mod.keys).then(
+      (details) => {
+        detailsByKey[key] = details
+      },
+      (error) => {
+        detailsByKey[key] = { error: `Couldn't load details from ${PLATFORM_NAMES[platformOf(key)]}: ${errorText(error)}` }
+      },
+    ).finally(() => {
+      loadingDetails = new Set([...loadingDetails].filter((k) => k !== key))
+    })
+  }
+
+  async function loadDescription(mod: InstalledMod) {
+    if (!mod.key) return
+    descriptionError = null
+    try {
+      descriptions[mod.key] = remoteTextHtml(await api.modDescription(mod.key)) || '<p>The author left this description empty.</p>'
+    } catch (error) {
+      if (expanded === mod.path) descriptionError = `Couldn't load the description from ${PLATFORM_NAMES[platformOf(mod.key)]}: ${errorText(error)}`
+    }
+  }
+
+  async function copyText(text: string | null, label: string) {
+    if (!text) return
+    actionError = null
+    try {
+      await navigator.clipboard.writeText(text)
+      flashCopyNote(`Copied ${label}.`)
+    } catch (error) {
+      actionError = `Couldn't copy ${label}: ${errorText(error)}`
+    }
+  }
+
   async function expand(mod: InstalledMod, show: Detail = detail) {
     if (expanded === mod.path && show === detail) {
       expanded = null
@@ -392,6 +441,7 @@
     const opening = expanded !== mod.path
     expanded = mod.path
     detail = show
+    loadDetails(mod)
     if (opening) {
       versions = null
       versionsError = null
@@ -411,17 +461,29 @@
         )
     }
     if (show === 'description' && mod.key && descriptions[mod.key] === undefined) {
-      try {
-        descriptions[mod.key] = remoteTextHtml(await api.modDescription(mod.key)) || '<p>The author left this description empty.</p>'
-      } catch (error) {
-        if (expanded === mod.path) descriptionError = `Couldn't load the description from ${PLATFORM_NAMES[platformOf(mod.key)]}: ${errorText(error)}`
-      }
+      await loadDescription(mod)
     }
   }
 
   // The whole row opens its details, except the controls that have a job of their own.
+  // Ctrl+click (Cmd+click on macOS) opens the project page directly instead of expanding.
   function onRowClick(event: MouseEvent, mod: InstalledMod) {
     if ((event.target as HTMLElement).closest('button, a, input, select')) return
+    if (commandKey(event) && mod.url) {
+      event.preventDefault()
+      openUrl(mod.url)
+      return
+    }
+    expand(mod)
+  }
+
+  function onNameClick(event: MouseEvent, mod: InstalledMod) {
+    if (commandKey(event) && mod.url) {
+      event.preventDefault()
+      event.stopPropagation()
+      openUrl(mod.url)
+      return
+    }
     expand(mod)
   }
 
@@ -433,6 +495,10 @@
     const lockedHere = isLocked(mod.key)
     const disabled = mod.path.endsWith('.disabled')
     const change = changeFor(mod.path)
+    const platform = platformOf(mod.key)
+    const snippet = mavenSnippet({ key: mod.key, file: mod.file, slug: mod.slug, minecraft, loader })
+    const fileId = rawFileId(mod.file)
+    const projectId = rawProjectId(mod.key)
     menu = {
       x: keyboard ? rect.left + 24 : event.clientX,
       y: keyboard ? rect.bottom : event.clientY,
@@ -444,16 +510,40 @@
             ? [{ label: `Update to ${updates.get(mod.path)!.fileName}`, disabled: clientRunning, run: () => update([{ file: updates.get(mod.path)!.file, replaces: mod.path }]) }, 'separator' as const]
             : []),
         { label: 'Show versions', run: () => expand(mod, 'versions') },
-        { label: 'Show description', run: () => expand(mod, 'description') },
+        { label: 'Show description', disabled: !mod.key, run: () => expand(mod, 'description') },
+        { label: 'Show gallery', disabled: !mod.key, run: () => expand(mod, 'gallery') },
         'separator',
-        { label: `Open on ${PLATFORM_NAMES[platformOf(mod.key)]}`, disabled: !mod.url, run: () => mod.url && openUrl(mod.url) },
-        { label: 'Copy link', disabled: !mod.url, run: () => mod.url && navigator.clipboard.writeText(mod.url) },
+        { label: `Open on ${PLATFORM_NAMES[platform]}`, disabled: !mod.url, run: () => mod.url && openUrl(mod.url) },
+        { label: 'Copy link', disabled: !mod.url, run: () => copyText(mod.url, 'link') },
+        { label: mavenCopyLabel(platform), disabled: !snippet, run: () => copyText(snippet, platform === 'modrinth' ? 'Modrinth Maven snippet' : 'CurseMaven snippet') },
+        { label: fileIdCopyLabel(platform), disabled: !fileId, run: () => copyText(fileId, platform === 'modrinth' ? 'version ID' : 'file ID') },
+        ...(projectId ? [{ label: 'Copy project ID', run: () => copyText(projectId, 'project ID') }] : []),
         'separator',
         // While a change runs, the version you'd lock to is about to change.
         { label: lockedHere ? 'Unlock' : 'Lock to this version', disabled: !!change, run: () => setLocked(mod, !lockedHere) },
         { label: disabled ? 'Enable' : 'Disable', disabled: disabled ? updating : blocked, run: () => setEnabled([mod], disabled) },
         'separator',
         { label: `Move to ${trashName}`, danger: true, disabled: blocked, run: () => remove([mod]) },
+      ],
+    }
+  }
+
+  function openVersionMenu(event: MouseEvent, mod: InstalledMod, file: ModFile) {
+    event.preventDefault()
+    event.stopPropagation()
+    const row = event.currentTarget as HTMLElement
+    const rect = row.getBoundingClientRect()
+    const keyboard = !event.clientX && !event.clientY
+    const platform = platformOf(mod.key)
+    const snippet = mavenSnippet({ key: mod.key, file: file.file, slug: mod.slug, minecraft, loader })
+    const fileId = rawFileId(file.file)
+    menu = {
+      x: keyboard ? rect.left + 24 : event.clientX,
+      y: keyboard ? rect.bottom : event.clientY,
+      label: `${file.fileName} actions`,
+      items: [
+        { label: mavenCopyLabel(platform), disabled: !snippet, run: () => copyText(snippet, platform === 'modrinth' ? 'Modrinth Maven snippet' : 'CurseMaven snippet') },
+        { label: fileIdCopyLabel(platform), disabled: !fileId, run: () => copyText(fileId, platform === 'modrinth' ? 'version ID' : 'file ID') },
       ],
     }
   }
@@ -572,6 +662,7 @@
     const notes = modUpdates.cancelNotes
     const downloading = downloadingCount()
     if (updating) return [downloading ? `Downloading ${downloading} ${downloading === 1 ? 'file' : 'files'}.` : 'Changing mods.', ...notes].join(' ')
+    if (modUpdates.copyNote) return modUpdates.copyNote
     return [finishedHere && job('mods').phase === 'done' ? job('mods').message : null, ...notes].filter(Boolean).join(' ')
   })
 
@@ -651,9 +742,12 @@
     event.preventDefault()
     stopAdding()
   }
+  function onModifier(event: KeyboardEvent, down: boolean) {
+    if (isMac ? event.key === 'Meta' : event.key === 'Control') ctrlHeld = down
+  }
 </script>
 
-<svelte:window onkeydown={(e) => { onKey(e); onEscape(e) }} />
+<svelte:window onkeydown={(e) => { onModifier(e, true); onKey(e); onEscape(e) }} onkeyup={(e) => onModifier(e, false)} onblur={() => (ctrlHeld = false)} />
 
 <!-- Browsers won't break a line between a hyphen and a digit, so long jar names would hold the
      table wider than the view without these break points. -->
@@ -830,7 +924,7 @@
         </div>
       </div>
       {#key browse.platform}
-        <ModBrowser platform={browse.platform} {installedKeys} {game} dual={publishesTo.length > 1} install={update} />
+        <ModBrowser platform={browse.platform} {installedKeys} {game} {minecraft} {loader} dual={publishesTo.length > 1} install={update} />
       {/key}
     {:else}
       <div class="tools">
@@ -867,7 +961,7 @@
       {/if}
 
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-      <div class="table" role="region" aria-label="Installed mods" tabindex="0" bind:this={tableRegion}>
+      <div class="table" class:ctrl-open={ctrlHeld} role="region" aria-label="Installed mods" tabindex="0" bind:this={tableRegion}>
         <table aria-busy={loading && !mods.length}>
           <thead>
             <tr>
@@ -906,7 +1000,7 @@
                 {@const whyNoToggle = disabled ? whyNoEnable : whyNoChange}
                 {@const change = changeFor(mod.path)}
                 {@const logo = mod.logo ?? status?.logo}
-                <tr class="row" class:open={expanded === mod.path} class:off={disabled} class:picked={selected.has(mod.path)} onclick={(e) => onRowClick(e, mod)} oncontextmenu={(e) => openMenu(e, mod)}>
+                <tr class="row" class:has-url={!!mod.url} class:open={expanded === mod.path} class:off={disabled} class:picked={selected.has(mod.path)} onclick={(e) => onRowClick(e, mod)} oncontextmenu={(e) => openMenu(e, mod)}>
                   <td class="select">
                     <input type="checkbox" checked={selected.has(mod.path)} onchange={(e) => select(mod, e.currentTarget.checked)} aria-label="Select {mod.name}" />
                   </td>
@@ -932,7 +1026,15 @@
                       {#if logo}<img src={logo} alt="" width="32" height="32" loading="lazy" />{:else}<span class="logo" aria-hidden="true"></span>{/if}
                       <div class="about">
                         <div class="title-line">
-                          <button class="expand" aria-expanded={expanded === mod.path} aria-controls="details-{domId(`${mod.key ?? mod.path}-${mod.file}`)}" onclick={() => expand(mod)}>{mod.name}</button>
+                          <button
+                            class="expand"
+                            aria-expanded={expanded === mod.path}
+                            aria-controls="details-{domId(`${mod.key ?? mod.path}-${mod.file}`)}"
+                            title={mod.url ? `${shortcut('Ctrl+Click')} to open on ${PLATFORM_NAMES[platformOf(mod.key)]}` : undefined}
+                            onclick={(e) => onNameClick(e, mod)}
+                          >
+                            {mod.name}{#if mod.url}<svg class="ctrl-arrow" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2.5h5v5M9.5 2.5 3 9" /></svg>{/if}
+                          </button>
                           {#if duplicatePaths.has(mod.path)}<span class="chip fail">Two versions</span>{/if}
                         </div>
                         <!-- The installed file and its update share a line, so a pack of hundreds stays scannable. -->
@@ -1022,6 +1124,10 @@
                   </td>
                 </tr>
                 {#if expanded === mod.path}
+                  {@const entryDetails = mod.key ? detailsByKey[mod.key] : undefined}
+                  {@const loadedDetails = entryDetails && !('error' in entryDetails) ? entryDetails : null}
+                  {@const detailsError = entryDetails && 'error' in entryDetails ? entryDetails.error : null}
+                  {@const galleryCount = loadedDetails?.gallery.length ?? 0}
                   <tr class="details" id="details-{domId(`${mod.key ?? mod.path}-${mod.file}`)}">
                     <td colspan="7">
                       <div class="detail">
@@ -1029,8 +1135,11 @@
                           <div class="modes" role="group" aria-label="Show">
                             <button class="mode" aria-pressed={detail === 'versions'} onclick={() => expand(mod, 'versions')}>Versions</button>
                             <button class="mode" aria-pressed={detail === 'description'} onclick={() => expand(mod, 'description')}>Description</button>
+                            <button class="mode" aria-pressed={detail === 'gallery'} onclick={() => expand(mod, 'gallery')}>
+                              Gallery{#if galleryCount}<span class="muted tab-count">{galleryCount}</span>{/if}
+                            </button>
                           </div>
-                          {#if mod.url}<button class="link" onclick={() => openUrl(mod.url!)}>Open on {PLATFORM_NAMES[platformOf(mod.key)]}</button>{/if}
+                          <ModLinks platformName={PLATFORM_NAMES[platformOf(mod.key)]} url={mod.url} links={loadedDetails?.links ?? null} />
                         </div>
                         {#if detail === 'versions'}
                           {#if versionsError}
@@ -1048,7 +1157,7 @@
                               <ul class="files" aria-label="Versions of {mod.name}" onkeydown={(e) => pickByArrow(e, key)}>
                                 {#each versions as file (file.file)}
                                   {@const reads = file === reading}
-                                  <li class:reading={reads}>
+                                  <li class:reading={reads} oncontextmenu={(e) => openVersionMenu(e, mod, file)}>
                                     <button class="pick" tabindex={reads ? 0 : -1} aria-current={reads || undefined} aria-controls="changelog-{domId(key)}" onclick={() => showChangelog(key, file.file)}>
                                       <span class="visually-hidden">{file.fileName}</span>
                                       <span class="file" aria-hidden="true" title={file.fileName}>{versionLabel(file, versions)}</span>
@@ -1076,19 +1185,38 @@
                                 {#if changelog === undefined}
                                   <p class="muted" aria-hidden="true">Loading the changelog from {PLATFORM_NAMES[platformOf(key)]}.</p>
                                 {:else if typeof changelog !== 'string'}
-                                  <p class="failed" aria-hidden="true">{changelog.error}</p>
+                                  <p class="failed">
+                                    {changelog.error}{' '}
+                                    <button class="link" onclick={() => showChangelog(key, reading.file, true)}>Try again</button>
+                                  </p>
                                 {:else}
                                   <RemoteHtml html={changelog} topHeading={4} />
                                 {/if}
                               </section>
                             </div>
                           {/if}
+                        {:else if detail === 'gallery'}
+                          {#if !mod.key}
+                            <p class="muted">packraven doesn't know which project this file is from.</p>
+                          {:else}
+                            <ModGallery
+                              name={mod.name}
+                              platformName={PLATFORM_NAMES[platformOf(mod.key)]}
+                              items={loadedDetails?.gallery ?? []}
+                              loading={entryDetails === undefined}
+                              error={detailsError}
+                              onretry={() => loadDetails(mod, true)}
+                            />
+                          {/if}
                         {:else if descriptionError}
-                          <p class="failed">{descriptionError}</p>
+                          <p class="failed">
+                            {descriptionError}{' '}
+                            <button class="link" onclick={() => loadDescription(mod)}>Try again</button>
+                          </p>
                         {:else if !mod.key}
                           <p class="muted">packraven doesn't know which project this file is from.</p>
                         {:else if descriptions[mod.key] === undefined}
-                          <p class="muted">Loading the description from {PLATFORM_NAMES[platformOf(mod.key)]}.</p>
+                          <p class="muted" role="status">Loading the description from {PLATFORM_NAMES[platformOf(mod.key)]}.</p>
                         {:else}
                           <!-- svelte-ignore a11y_no_noninteractive_tabindex (a long description needs to scroll by keyboard even when it has no links) -->
                           <section class="description" aria-label="Description of {mod.name}" tabindex="0">
@@ -1572,6 +1700,9 @@
   }
 
   .expand {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     padding: 0;
     font: inherit;
     font-weight: 700;
@@ -1585,6 +1716,32 @@
     background: transparent;
     text-decoration: underline;
     text-underline-offset: 0.18em;
+  }
+
+  .ctrl-arrow {
+    display: none;
+    width: 12px;
+    height: 12px;
+    flex: none;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .table.ctrl-open .row.has-url:hover {
+    cursor: alias;
+  }
+
+  .table.ctrl-open .row.has-url:hover .expand {
+    color: var(--forest);
+    text-decoration: underline;
+    text-underline-offset: 0.18em;
+  }
+
+  .table.ctrl-open .row.has-url:hover .ctrl-arrow {
+    display: inline-block;
   }
 
   .version {
@@ -1648,6 +1805,10 @@
 
     .byline {
       display: block;
+    }
+
+    .details td {
+      padding: 4px 10px 12px 10px;
     }
   }
 

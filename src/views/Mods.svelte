@@ -16,7 +16,7 @@
   import { ask } from '@tauri-apps/plugin-dialog'
   import { api, errorText, type InstalledMod, type ModCheck, type ModDetails, type ModFile, type Platform, type ReleaseType, type ModRequest } from '../lib/api'
   import { job, onJobEnd, serverPack } from '../lib/jobs.svelte'
-  import { availableUpdate, browse, cancelChange, cancelMenuLabel, changeFor, changeQueued, downloadingCount, dropChange, flashCopyNote, isLocked, modUpdates, newestOnChannel, point, projectKey, queuedButton, startChange, waitingOnModrinth } from '../lib/modUpdates.svelte'
+  import { availableUpdate, browse, cancelChange, cancelMenuLabel, changeFor, changeQueued, downloadingCount, dropChange, flashCopyNote, isLocked, modUpdates, newestOnChannel, point, projectKey, queuedButton, startChange, waitingOnModrinth, type QueuedChange } from '../lib/modUpdates.svelte'
   import { remoteTextHtml } from '../lib/markdown'
   import { changedPart } from '../lib/fileNames'
   import { fileIdCopyLabel, mavenCopyLabel, mavenSnippet, rawFileId, rawProjectId } from '../lib/maven'
@@ -52,11 +52,28 @@
   type SortKey = 'enabled' | 'name' | 'author' | 'update' | 'locked'
   type Detail = 'versions' | 'description' | 'gallery'
 
+  const collator = new Intl.Collator()
+  const VIRTUAL_THRESHOLD = 60
+  const DEFAULT_ROW_HEIGHT = 60
+  const OVERSCAN = 15
+
   // We ask CurseForge and Modrinth again when you open the view after this long.
   const CHECK_MAX_AGE_MS = 15 * 60 * 1000
 
-  let mods: InstalledMod[] = $state([])
-  let loading = $state(true)
+  // App remounts this view when you switch packs, so we only compare the pack once.
+  untrack(() => {
+    // A refusal only makes sense next to the run it happened in.
+    if (job('mods').phase !== 'running') modUpdates.cancelNotes = []
+    if (modUpdates.pack === pack) return
+    modUpdates.pack = pack
+    modUpdates.mods = null
+    modUpdates.checks = null
+    modUpdates.checkedAt = 0
+    modUpdates.checkSerial++
+  })
+
+  let mods = $derived(modUpdates.mods ?? [])
+  let loading = $state(modUpdates.mods === null)
   let checking = $state(false)
   let loadError: string | null = $state(null)
   let checkError: string | null = $state(null)
@@ -94,23 +111,35 @@
   // until focus leaves it and comes back.
   let pressed: string | null = $state(null)
 
-  // App remounts this view when you switch packs, so we only compare the pack once.
-  untrack(() => {
-    // A refusal only makes sense next to the run it happened in.
-    if (job('mods').phase !== 'running') modUpdates.cancelNotes = []
-    if (modUpdates.pack === pack) return
-    modUpdates.pack = pack
-    modUpdates.checks = null
-    modUpdates.checkedAt = 0
-    modUpdates.checkSerial++
-  })
+  function sameMods(a: InstalledMod[] | null, b: InstalledMod[]): boolean {
+    if (!a || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i]
+      const y = b[i]
+      if (x.path !== y.path || x.key !== y.key || x.file !== y.file || x.name !== y.name || x.slug !== y.slug || x.url !== y.url || x.logo !== y.logo || x.authors.length !== y.authors.length || x.keys.length !== y.keys.length) return false
+      for (let j = 0; j < x.authors.length; j++) if (x.authors[j] !== y.authors[j]) return false
+      for (let j = 0; j < x.keys.length; j++) if (x.keys[j] !== y.keys[j]) return false
+    }
+    return true
+  }
+
+  function sameStringSet(a: Set<string>, b: string[]): boolean {
+    if (a.size !== b.length) return false
+    for (const item of b) if (!a.has(item)) return false
+    return true
+  }
+
+  function hasUnchecked() {
+    return mods.some((m) => m.key !== null && !modUpdates.checks?.has(m.path))
+  }
 
   async function load() {
     try {
       const installed = await api.installedMods()
       if (modUpdates.pack !== pack) return
-      mods = installed.mods
-      modUpdates.locked = new Set(installed.locked)
+      if (installed.channel && modUpdates.channel !== installed.channel) modUpdates.channel = installed.channel
+      if (!sameMods(modUpdates.mods, installed.mods)) modUpdates.mods = installed.mods
+      if (!sameStringSet(modUpdates.locked, installed.locked)) modUpdates.locked = new Set(installed.locked)
       loadError = null
     } catch (error) {
       if (modUpdates.pack === pack) loadError = `Couldn't read the mod list: ${errorText(error)}`
@@ -136,16 +165,8 @@
   }
 
   onMount(async () => {
-    api
-      .getPackConfig()
-      .then((config) => {
-        if (modUpdates.pack === pack) modUpdates.channel = config.updates.channel
-      })
-      .catch(() => {})
     await load()
-    const unchecked = mods.some((m) => !modUpdates.checks?.has(m.path))
-    if (modUpdates.pack === pack && mods.length && (unchecked || Date.now() - modUpdates.checkedAt > CHECK_MAX_AGE_MS)) await check()
-
+    if (modUpdates.pack === pack && mods.length && (hasUnchecked() || Date.now() - modUpdates.checkedAt > CHECK_MAX_AGE_MS)) await check()
   })
 
   // The backend's file watcher updates mods.lock.json when something else changes the folder,
@@ -153,8 +174,7 @@
   // lose its update flags. A run reloads the list when it ends, so we leave its own changes to it.
   function checkIfStale() {
     if (checking || updating || document.hidden || modUpdates.pack !== pack || !mods.length) return
-    const unchecked = mods.some((m) => !modUpdates.checks?.has(m.path))
-    if (unchecked || Date.now() - modUpdates.checkedAt > CHECK_MAX_AGE_MS) check()
+    if (hasUnchecked() || Date.now() - modUpdates.checkedAt > CHECK_MAX_AGE_MS) check()
   }
 
   onMount(() => {
@@ -172,7 +192,7 @@
 
   async function reload() {
     await load()
-    if (modUpdates.pack === pack && mods.some((m) => !modUpdates.checks?.has(m.path))) await check()
+    if (modUpdates.pack === pack && hasUnchecked()) await check()
   }
 
   // You may have just uploaded a jar that CurseForge has since approved, so we ask about every jar it
@@ -214,6 +234,7 @@
   async function setLocked(mod: InstalledMod, lock: boolean) {
     const key = mod.key
     if (key === null) return
+    const wasInTable = !!tableRegion?.contains(document.activeElement)
     actionError = null
     try {
       await api.setModLocked(key, lock)
@@ -221,6 +242,7 @@
       if (lock) locked.add(key)
       else locked.delete(key)
       modUpdates.locked = locked
+      if (wasInTable) await restoreRowFocus(mod.path, 'button.lock')
     } catch (error) {
       actionError = `Couldn't ${lock ? 'lock' : 'unlock'} ${mod.name}: ${errorText(error)}`
     }
@@ -250,7 +272,7 @@
     if (!targets.length) return
     if (!enabled) {
       // We only know what depends on a file from a check, so we finish one before asking.
-      if (modUpdates.pack === pack && mods.some((m) => !modUpdates.checks?.has(m.path))) await check()
+      if (modUpdates.pack === pack && hasUnchecked()) await check()
       const dependents = dependentsOf(...targets)
       if (dependents.length) {
         disabling = { targets, name: targets.length === 1 ? targets[0].name : `the ${targets.length} selected files`, dependents }
@@ -263,6 +285,7 @@
   async function setFilesEnabled(targets: InstalledMod[], enabled: boolean) {
     // We leave the switches enabled while files rename, so they keep keyboard focus, and drop repeats.
     if (toggling) return
+    const wasInTable = !!tableRegion?.contains(document.activeElement)
     toggling = targets[0].path
     actionError = null
     try {
@@ -271,12 +294,13 @@
       // Checks are keyed by path, so they follow each file to its new name.
       if (modUpdates.checks) modUpdates.checks = new Map([...modUpdates.checks].map(([key, value]) => [renamed.get(key) ?? key, { ...value, path: renamed.get(key) ?? key }]))
       if (expanded) expanded = renamed.get(expanded) ?? expanded
-      mods = mods.map((m) => (renamed.has(m.path) ? { ...m, path: renamed.get(m.path)! } : m))
+      modUpdates.mods = mods.map((m) => (renamed.has(m.path) ? { ...m, path: renamed.get(m.path)! } : m))
       selected = new Set([...selected].map((path) => renamed.get(path) ?? path))
       serverPack.changedSinceBuild = true
       serverPack.changedSinceTest = true
       // Turning several files off at once is easy to regret, so we offer to turn them back on.
       undo = !enabled && targets.length > 1 ? { message: `Disabled ${list(targets.map((m) => m.name))}.`, paths: paths } : null
+      if (wasInTable && targets.length === 1) await restoreRowFocus(paths[0], 'button.switch')
     } catch (error) {
       const what = targets.length === 1 ? targets[0].name : `${targets.length} files`
       actionError = `Couldn't ${enabled ? 'enable' : 'disable'} ${what}: ${errorText(error)}`
@@ -370,7 +394,7 @@
 
   async function remove(targets: InstalledMod[]) {
     // We only know what depends on a mod from a check, so we finish one before warning you.
-    if (modUpdates.pack === pack && mods.some((m) => !modUpdates.checks?.has(m.path))) await check()
+    if (modUpdates.pack === pack && hasUnchecked()) await check()
     const what = targets.length === 1 ? targets[0].name : `${targets.length} files`
     const dependents = dependentsOf(...targets).map((d) => d.name)
     const lines = [targets.length === 1 ? `Move ${fileName(targets[0].path)} to the ${trashName}?` : `Move these ${targets.length} files to the ${trashName}? ${list(targets.map((m) => m.name))}.`]
@@ -578,11 +602,22 @@
   const typeLabels: Record<ReleaseType, string> = { release: 'Release', beta: 'Beta', alpha: 'Alpha' }
   const kindLabels: Record<Kind, string> = { mods: 'Mods', resourcepacks: 'Resource packs', shaderpacks: 'Shaders', datapacks: 'Data packs' }
 
+  let changeByKey = $derived.by(() => {
+    const map = new Map<string, QueuedChange>()
+    for (const change of modUpdates.changes) for (const key of change.keys) if (!map.has(key)) map.set(key, change)
+    return map
+  })
+
   let updates = $derived(new Map(mods.map((m) => [m.path, availableUpdate(modUpdates.checks?.get(m.path))] as const).filter(([, file]) => file)) as Map<string, ModFile>)
-  let updatable = $derived([...updates.keys()].filter((path) => !changeFor(path)).length)
+  let updatable = $derived([...updates.keys()].filter((path) => !changeByKey.has(path)).length)
   let duplicates = $derived.by(() => {
     const byProject = new Map<string, InstalledMod[]>()
-    for (const mod of mods.filter((m) => isMod(m) && !m.path.endsWith('.disabled') && m.key)) byProject.set(mod.key!, [...(byProject.get(mod.key!) ?? []), mod])
+    for (const mod of mods) {
+      if (!isMod(mod) || mod.path.endsWith('.disabled') || !mod.key) continue
+      const group = byProject.get(mod.key)
+      if (group) group.push(mod)
+      else byProject.set(mod.key, [mod])
+    }
     return [...byProject.values()].filter((group) => group.length > 1)
   })
   let duplicatePaths = $derived(new Set(duplicates.flat().map((m) => m.path)))
@@ -597,17 +632,15 @@
 
   // Each column sorts the interesting rows first: updates, locked or disabled mods, and A to Z.
   function compare(a: InstalledMod, b: InstalledMod): number {
-    const byName = a.name.localeCompare(b.name)
+    const byName = collator.compare(a.name, b.name)
     const flag = (value: (m: InstalledMod) => boolean) => Number(value(b)) - Number(value(a)) || byName
     switch (sort.key) {
-      case 'update':
-        return updateTier(a) - updateTier(b) || byName
       case 'locked':
         return flag((m) => isLocked(m.key))
       case 'enabled':
         return flag((m) => m.path.endsWith('.disabled'))
       case 'author':
-        return (a.authors[0] ?? '￿').localeCompare(b.authors[0] ?? '￿') || byName
+        return collator.compare(a.authors[0] ?? '\uffff', b.authors[0] ?? '\uffff') || byName
       default:
         return byName
     }
@@ -617,16 +650,194 @@
     return sort.reversed ? -compare(a, b) : compare(a, b)
   }
 
+  let searchQuery = $derived(search.trim().toLowerCase())
+
   function matches(mod: InstalledMod) {
-    const query = search.trim().toLowerCase()
-    return !query || mod.name.toLowerCase().includes(query) || mod.path.toLowerCase().includes(query) || mod.authors.some((a) => a.toLowerCase().includes(query))
+    return !searchQuery || mod.name.toLowerCase().includes(searchQuery) || mod.path.toLowerCase().includes(searchQuery) || mod.authors.some((a) => a.toLowerCase().includes(searchQuery))
   }
 
   // While you search, each type tab counts its matches, so a match on another tab isn't missed.
-  let matchCounts = $derived(mods.filter(matches).reduce((counts, m) => counts.set(folder(m.path), (counts.get(folder(m.path)) ?? 0) + 1), new Map<Kind, number>()))
-  let visible = $derived(mods.filter((m) => folder(m.path) === kindFilter && matches(m)).sort(sorted))
+  let matchCounts = $derived(
+    searchQuery
+      ? mods.reduce((counts, m) => (matches(m) ? counts.set(folder(m.path), (counts.get(folder(m.path)) ?? 0) + 1) : counts), new Map<Kind, number>())
+      : kindCounts,
+  )
+  let visible = $derived.by(() => {
+    const list = mods.filter((m) => folder(m.path) === kindFilter && matches(m))
+    if (sort.key === 'update') {
+      const tiers = new Map<string, number>()
+      for (const m of list) tiers.set(m.path, updateTier(m))
+      list.sort((a, b) => {
+        const cmp = tiers.get(a.path)! - tiers.get(b.path)! || collator.compare(a.name, b.name)
+        return sort.reversed ? -cmp : cmp
+      })
+      return list
+    }
+    return list.sort(sorted)
+  })
+  let hasUpdateCol = $derived(visible.some((m) => updates.has(m.path) || changeByKey.has(m.path) || (isLocked(m.key) && !!newestOnChannel(checkFor(m)))))
   let selectedMods = $derived(mods.filter((m) => selected.has(m.path)))
   let allVisibleSelected = $derived(visible.length > 0 && visible.every((m) => selected.has(m.path)))
+
+  let tbodyEl: HTMLTableSectionElement | undefined = $state()
+  let viewTop = $state(0)
+  let viewBottom = $state(900)
+  const rowHeights = new Map<string, number>()
+  let detailsHeight = $state(0)
+
+  let virtualized = $derived(visible.length > VIRTUAL_THRESHOLD)
+  let expandedIndex = $derived(expanded ? visible.findIndex((m) => m.path === expanded) : -1)
+
+  function rowSpan(mod: InstalledMod) {
+    return (rowHeights.get(mod.path) ?? DEFAULT_ROW_HEIGHT) + (expanded === mod.path ? detailsHeight : 0)
+  }
+
+  let windowSlice = $derived.by(() => {
+    if (!virtualized) return { start: 0, end: visible.length, topPad: 0, bottomPad: 0 }
+    const n = visible.length
+    let start = 0
+    let y = 0
+    const topEdge = Math.max(0, viewTop)
+    while (start < n) {
+      const h = rowSpan(visible[start])
+      if (y + h > topEdge) break
+      y += h
+      start++
+    }
+    const sliceStart = Math.max(0, start - OVERSCAN)
+    let topPad = 0
+    for (let i = 0; i < sliceStart; i++) topPad += rowSpan(visible[i])
+    let end = start
+    let bottomY = y
+    while (end < n && bottomY < viewBottom) {
+      bottomY += rowSpan(visible[end])
+      end++
+    }
+    const sliceEnd = Math.min(n, end + OVERSCAN)
+    let bottomPad = 0
+    for (let i = sliceEnd; i < n; i++) bottomPad += rowSpan(visible[i])
+    return { start: sliceStart, end: sliceEnd, topPad, bottomPad }
+  })
+
+  let rendered = $derived(virtualized ? visible.slice(windowSlice.start, windowSlice.end) : visible)
+
+  function activeScroller(): HTMLElement | null {
+    if (!tableRegion) return null
+    // In short windows the table grows with the page, even if a narrow pane enables horizontal scrolling.
+    if (window.matchMedia('(max-height: 700px)').matches) return tableRegion.closest<HTMLElement>('.view')
+    const overflowY = getComputedStyle(tableRegion).overflowY
+    if (overflowY === 'auto' || overflowY === 'scroll') return tableRegion
+    return tableRegion.closest<HTMLElement>('.view')
+  }
+
+  function measureViewport() {
+    if (!tbodyEl) return
+    const scroller = activeScroller()
+    if (!scroller) return
+    const scrollerRect = scroller.getBoundingClientRect()
+    const tbodyTop = tbodyEl.getBoundingClientRect().top
+    const nextTop = Math.max(0, scrollerRect.top - tbodyTop)
+    const nextBottom = Math.max(nextTop + 400, scrollerRect.bottom - tbodyTop)
+    if (Math.abs(nextTop - viewTop) > 16 || Math.abs(nextBottom - viewBottom) > 16) {
+      viewTop = nextTop
+      viewBottom = nextBottom
+    }
+  }
+
+  async function restoreRowFocus(path: string, controlSelector: string) {
+    await tick()
+    if (tableRegion?.contains(document.activeElement) && document.activeElement !== tableRegion) return
+    const index = visible.findIndex((m) => m.path === path)
+    if (index < 0) {
+      tableRegion?.focus()
+      return
+    }
+    if (virtualized && tbodyEl && (index < windowSlice.start || index >= windowSlice.end)) {
+      const scroller = activeScroller()
+      if (scroller) {
+        let y = 0
+        for (let i = 0; i < index; i++) y += rowSpan(visible[i])
+        const tbodyOffset = tbodyEl.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop
+        scroller.scrollTop = Math.max(0, tbodyOffset + y - scroller.clientHeight / 3)
+        measureViewport()
+        await tick()
+      }
+    }
+    const control = tbodyEl?.querySelector<HTMLElement>(`tr.row[data-path="${CSS.escape(path)}"] ${controlSelector}`)
+    if (control) control.focus()
+    else tableRegion?.focus()
+  }
+
+  $effect(() => {
+    const region = tableRegion
+    if (!region) {
+      viewTop = 0
+      viewBottom = 900
+      return
+    }
+    const outer = region.closest<HTMLElement>('.view')
+    let lastWidth = region.clientWidth
+    let raf = 0
+    const schedule = () => {
+      if (raf) return
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        measureViewport()
+      })
+    }
+    measureViewport()
+    region.addEventListener('scroll', schedule, { passive: true })
+    outer?.addEventListener('scroll', schedule, { passive: true })
+    const observer = new ResizeObserver(() => {
+      if (region.clientWidth !== lastWidth) {
+        lastWidth = region.clientWidth
+        rowHeights.clear()
+      }
+      schedule()
+    })
+    observer.observe(region)
+    if (outer) observer.observe(outer)
+    return () => {
+      if (raf) cancelAnimationFrame(raf)
+      region.removeEventListener('scroll', schedule)
+      outer?.removeEventListener('scroll', schedule)
+      observer.disconnect()
+    }
+  })
+
+  let prevFilterKey = ''
+  $effect(() => {
+    const key = `${kindFilter}\0${searchQuery}`
+    if (prevFilterKey && prevFilterKey !== key) {
+      const scroller = activeScroller()
+      if (scroller) scroller.scrollTop = 0
+      viewTop = 0
+      viewBottom = Math.max(scroller?.clientHeight ?? 900, 600)
+    }
+    prevFilterKey = key
+  })
+
+  $effect(() => {
+    if (!virtualized || !tbodyEl) return
+    void rendered
+    for (const el of tbodyEl.querySelectorAll<HTMLTableRowElement>('tr.row[data-path]')) {
+      const path = el.dataset.path
+      if (path) rowHeights.set(path, el.offsetHeight)
+    }
+    const detailRow = expanded ? tbodyEl.querySelector<HTMLTableRowElement>('tr.details') : null
+    if (!detailRow) {
+      if (untrack(() => detailsHeight) !== 0) detailsHeight = 0
+      return
+    }
+    const syncDetail = () => {
+      const next = detailRow.offsetHeight
+      if (Math.abs(next - untrack(() => detailsHeight)) > 1) detailsHeight = next
+    }
+    syncDetail()
+    const observer = new ResizeObserver(syncDetail)
+    observer.observe(detailRow)
+    return () => observer.disconnect()
+  })
 
   function select(mod: InstalledMod, on: boolean) {
     const next = new Set(selected)
@@ -994,9 +1205,11 @@
 
       <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
       <div class="table" class:ctrl-open={ctrlHeld} role="region" aria-label="Installed mods" tabindex="0" bind:this={tableRegion}>
-        <table aria-busy={loading && !mods.length}>
+        {#if whyNoUpdate}<span hidden id="mods-why-no-update">{whyNoUpdate}</span>{/if}
+        {#if whyNoEnable}<span hidden id="mods-why-no-enable">{whyNoEnable}</span>{/if}
+        <table class:has-update-col={hasUpdateCol} aria-busy={loading && !mods.length} aria-rowcount={virtualized ? visible.length + 1 + (expandedIndex >= 0 ? 1 : 0) : undefined}>
           <thead>
-            <tr>
+            <tr aria-rowindex={virtualized ? 1 : undefined}>
               <th class="select">
                 <input type="checkbox" checked={allVisibleSelected} indeterminate={!allVisibleSelected && visible.some((m) => selected.has(m.path))} onchange={(e) => selectVisible(e.currentTarget.checked)} aria-label="Select every {kindLabels[kindFilter].toLowerCase().replace(/s$/, '')} shown" disabled={!visible.length} />
               </th>
@@ -1008,7 +1221,7 @@
               <th class="trash"><span class="visually-hidden">Remove</span></th>
             </tr>
           </thead>
-          <tbody>
+          <tbody bind:this={tbodyEl}>
             {#if loading && !mods.length}
               {#each { length: 8 } as _, row (row)}
                 <tr class="skeleton" aria-hidden="true">
@@ -1022,36 +1235,50 @@
                 </tr>
               {/each}
             {:else}
+              {#if windowSlice.topPad > 0}
+                <tr class="spacer" aria-hidden="true"><td colspan="7" style:height="{windowSlice.topPad}px"></td></tr>
+              {/if}
               <!-- Disabling a file renames it, so we key rows by what stays put and keep focus on the switch. -->
-              {#each visible as mod (`${mod.key ?? mod.path}:${mod.file}`)}
+              {#each rendered as mod, rowOffset (`${mod.key ?? mod.path}:${mod.file}`)}
+                {@const absIndex = windowSlice.start + rowOffset}
                 {@const status = checkFor(mod)}
                 {@const next = updates.get(mod.path)}
                 {@const lockedHere = isLocked(mod.key)}
                 {@const held = newestOnChannel(status)}
+                {@const waiting = !lockedHere ? waitingOnModrinth(status) : undefined}
                 {@const disabled = mod.path.endsWith('.disabled')}
+                {@const plainName = fileName(mod.path).replace(/\.disabled$/, '')}
+                {@const whyNoChangeId = whyNoUpdate ? 'mods-why-no-update' : whyNoEnable ? 'mods-why-no-enable' : undefined}
                 {@const whyNoToggle = disabled ? whyNoEnable : whyNoChange}
-                {@const change = changeFor(mod.path)}
+                {@const whyNoToggleId = disabled ? (whyNoEnable ? 'mods-why-no-enable' : undefined) : whyNoChangeId}
+                {@const change = changeByKey.get(mod.path)}
                 {@const logo = mod.logo ?? status?.logo}
-                <tr class="row" class:has-url={!!mod.url} class:open={expanded === mod.path} class:off={disabled} class:picked={selected.has(mod.path)} onclick={(e) => onRowClick(e, mod)} oncontextmenu={(e) => openMenu(e, mod)}>
+                <tr
+                  class="row"
+                  class:has-url={!!mod.url}
+                  class:open={expanded === mod.path}
+                  class:off={disabled}
+                  class:picked={selected.has(mod.path)}
+                  data-path={mod.path}
+                  aria-rowindex={virtualized ? absIndex + 2 + (expandedIndex >= 0 && absIndex > expandedIndex ? 1 : 0) : undefined}
+                  onclick={(e) => onRowClick(e, mod)}
+                  oncontextmenu={(e) => openMenu(e, mod)}
+                >
                   <td class="select">
                     <input type="checkbox" checked={selected.has(mod.path)} onchange={(e) => select(mod, e.currentTarget.checked)} aria-label="Select {mod.name}" />
                   </td>
                   <td class="enabled">
-                    <Tip tip={whyNoToggle}>
-                      {#snippet children(why)}
-                        <button
-                          class="switch"
-                          role="switch"
-                          aria-checked={!disabled}
-                          aria-label="Enable {mod.name}"
-                          title={whyNoToggle ? undefined : disabled ? 'Disabled. We won\'t include it in exports.' : 'Enabled'}
-                          aria-disabled={!!whyNoToggle}
-                          aria-describedby={why}
-                          aria-busy={toggling === mod.path}
-                          onclick={() => !whyNoToggle && setEnabled([mod], disabled)}
-                        ></button>
-                      {/snippet}
-                    </Tip>
+                    <button
+                      class="switch"
+                      role="switch"
+                      aria-checked={!disabled}
+                      aria-label="Enable {mod.name}"
+                      title={whyNoToggle ?? (disabled ? "Disabled. We won't include it in exports." : 'Enabled')}
+                      aria-disabled={!!whyNoToggle}
+                      aria-describedby={whyNoToggleId}
+                      aria-busy={toggling === mod.path}
+                      onclick={() => !whyNoToggle && setEnabled([mod], disabled)}
+                    ></button>
                   </td>
                   <td class="name">
                     <div class="identity">
@@ -1071,22 +1298,21 @@
                         </div>
                         <!-- The installed file and its update share a line, so a pack of hundreds stays scannable. -->
                         <div class="version">
-                          {@render fileText(fileName(mod.path).replace(/\.disabled$/, ''))}
+                          {@render fileText(plainName)}
                           {#if status?.releaseType && status.releaseType !== 'release'}<span class="chip pending">{typeLabels[status.releaseType]}</span>{/if}
                           {#if lockedHere && held}
-                            <span class="held" title={held.fileName}>Locked; {changedPart(fileName(mod.path).replace(/\.disabled$/, ''), held.fileName)} is available</span>
+                            <span class="held" title={held.fileName}>Locked; {changedPart(plainName, held.fileName)} is available</span>
                           {:else if next}
                             <span class="next" title={next.fileName}>
                               <span class="visually-hidden">Update available: {next.fileName}</span>
                               <svg viewBox="0 0 12 12" aria-hidden="true"><path d="M2 6h8M7 3l3 3-3 3" /></svg>
-                              <span class="file" aria-hidden="true">{changedPart(fileName(mod.path).replace(/\.disabled$/, ''), next.fileName)}</span>
+                              <span class="file" aria-hidden="true">{changedPart(plainName, next.fileName)}</span>
                               {#if next.releaseType !== 'release'}<span class="chip pending">{typeLabels[next.releaseType]}</span>{/if}
                             </span>
                           {/if}
-                          {#if !lockedHere && waitingOnModrinth(status)}
-                            {@const waiting = waitingOnModrinth(status)!}
+                          {#if waiting}
                             <span class="held" title="{waiting.fileName} is on CurseForge, but Modrinth doesn't have it yet, so we hold the update until it does">
-                              {changedPart(fileName(mod.path).replace(/\.disabled$/, ''), waiting.fileName)} isn't on Modrinth yet<span class="visually-hidden">, so we hold the update until it is</span>
+                              {changedPart(plainName, waiting.fileName)} isn't on Modrinth yet<span class="visually-hidden">, so we hold the update until it is</span>
                             </span>
                           {/if}
                         </div>
@@ -1098,34 +1324,30 @@
                   <td class="update">
                     {#if next || change}
                       <!-- One button carries every state, so it keeps keyboard focus while you work down the list. -->
-                      <Tip tip={change ? null : whyNoUpdate}>
-                        {#snippet children(why)}
-                          {@const shown = change && queuedButton(change, mod.name)}
-                          <button
-                            class:busy={shown?.busy}
-                            class:cancels={shown?.cancels}
-                            class:pressed={pressed === mod.path}
-                            class:pointed={shown?.cancels && modUpdates.pointing === change?.serial}
-                            aria-disabled={shown ? !shown.cancels : !!whyNoUpdate}
-                            aria-describedby={why}
-                            aria-label={shown?.ariaLabel ?? `Update ${mod.name}`}
-                            title={shown?.title}
-                            onpointerenter={() => point(change, true)}
-                            onpointerleave={() => point(change, false)}
-                            onfocus={(e) => pressed !== mod.path && e.currentTarget.matches(':focus-visible') && point(change, true)}
-                            onblur={() => {
-                              point(change, false)
-                              if (pressed === mod.path) pressed = null
-                            }}
-                            onclick={() => {
-                              if (change) return cancelChange(mod.path, mod.name)
-                              if (whyNoUpdate || !next) return
-                              pressed = mod.path
-                              update([{ file: next.file, replaces: mod.path }])
-                            }}
-                          >{#if shown?.cancels}<span class="swap"><span>{shown.label}</span><span aria-hidden="true">Cancel</span></span>{:else}{shown?.label ?? 'Update'}{/if}</button>
-                        {/snippet}
-                      </Tip>
+                      {@const shown = change && queuedButton(change, mod.name)}
+                      <button
+                        class:busy={shown?.busy}
+                        class:cancels={shown?.cancels}
+                        class:pressed={pressed === mod.path}
+                        class:pointed={shown?.cancels && modUpdates.pointing === change?.serial}
+                        aria-disabled={shown ? !shown.cancels : !!whyNoUpdate}
+                        aria-describedby={!change && whyNoUpdate ? 'mods-why-no-update' : undefined}
+                        aria-label={shown?.ariaLabel ?? `Update ${mod.name}`}
+                        title={shown?.title ?? (!change ? (whyNoUpdate ?? undefined) : undefined)}
+                        onpointerenter={() => point(change, true)}
+                        onpointerleave={() => point(change, false)}
+                        onfocus={(e) => pressed !== mod.path && e.currentTarget.matches(':focus-visible') && point(change, true)}
+                        onblur={() => {
+                          point(change, false)
+                          if (pressed === mod.path) pressed = null
+                        }}
+                        onclick={() => {
+                          if (change) return cancelChange(mod.path, mod.name)
+                          if (whyNoUpdate || !next) return
+                          pressed = mod.path
+                          update([{ file: next.file, replaces: mod.path }])
+                        }}
+                      >{#if shown?.cancels}<span class="swap"><span>{shown.label}</span><span aria-hidden="true">Cancel</span></span>{:else}{shown?.label ?? 'Update'}{/if}</button>
                     {:else if lockedHere && held}
                       <!-- aria-disabled keeps the button hoverable, so its title can say why it's off. -->
                       <button aria-disabled="true" aria-label="Update {mod.name}, locked" title="Unlock {mod.name} to update it">Update</button>
@@ -1146,13 +1368,17 @@
                     </button>
                   </td>
                   <td class="trash">
-                    <Tip tip={whyNoChange}>
-                      {#snippet children(why)}
-                        <button class="ghost icon remove" onclick={() => !whyNoChange && remove([mod])} disabled={removing === mod.path} aria-disabled={!!whyNoChange} aria-describedby={why} aria-label="Remove {mod.name}" title={whyNoChange ? undefined : `Move to the ${trashName}`}>
-                          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5M7 7v4M9 7v4" /></svg>
-                        </button>
-                      {/snippet}
-                    </Tip>
+                    <button
+                      class="ghost icon remove"
+                      onclick={() => !whyNoChange && remove([mod])}
+                      disabled={removing === mod.path}
+                      aria-disabled={!!whyNoChange}
+                      aria-describedby={whyNoChangeId}
+                      aria-label="Remove {mod.name}"
+                      title={whyNoChange ?? `Move to the ${trashName}`}
+                    >
+                      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4.5h10M6.5 4.5V3h3v1.5M4.5 4.5l.6 8.5h5.8l.6-8.5M7 7v4M9 7v4" /></svg>
+                    </button>
                   </td>
                 </tr>
                 {#if expanded === mod.path}
@@ -1160,7 +1386,7 @@
                   {@const loadedDetails = entryDetails && !('error' in entryDetails) ? entryDetails : null}
                   {@const detailsError = entryDetails && 'error' in entryDetails ? entryDetails.error : null}
                   {@const galleryCount = loadedDetails?.gallery.length ?? 0}
-                  <tr class="details" id="details-{domId(`${mod.key ?? mod.path}-${mod.file}`)}">
+                  <tr class="details" id="details-{domId(`${mod.key ?? mod.path}-${mod.file}`)}" aria-rowindex={virtualized ? absIndex + 3 : undefined}>
                     <td colspan="7">
                       <div class="detail">
                         <div class="detail-head">
@@ -1200,7 +1426,7 @@
                                     {#if file.file === mod.file}
                                       <span class="muted current">Installed</span>
                                     {:else}
-                                      {@const why = whyNoUpdate ?? (changeFor(mod.path) ? 'Wait for this change to finish' : null)}
+                                      {@const why = whyNoUpdate ?? (changeByKey.get(mod.path) ? 'Wait for this change to finish' : null)}
                                       <Tip tip={why}>
                                         {#snippet children(described)}
                                           <button tabindex={reads ? 0 : -1} aria-disabled={!!why} aria-describedby={described} onclick={() => !why && update([{ file: file.file, replaces: mod.path }])} aria-label="{isNewer(file, mod.file, versions ?? []) ? 'Update to' : 'Roll back to'} {file.fileName}">{isNewer(file, mod.file, versions ?? []) ? 'Update' : 'Roll back'}</button>
@@ -1278,6 +1504,9 @@
                   </td>
                 </tr>
               {/each}
+              {#if windowSlice.bottomPad > 0}
+                <tr class="spacer" aria-hidden="true"><td colspan="7" style:height="{windowSlice.bottomPad}px"></td></tr>
+              {/if}
             {/if}
           </tbody>
         </table>
@@ -1501,7 +1730,6 @@
   }
 
   .select {
-    width: 1%;
     padding-inline: 12px 4px;
   }
 
@@ -1580,6 +1808,12 @@
   table {
     width: 100%;
     border-collapse: collapse;
+    table-layout: fixed;
+  }
+
+  .spacer td {
+    padding: 0;
+    border: 0;
   }
 
   th {
@@ -1597,14 +1831,33 @@
     height: 1px;
   }
 
-  th.trash {
-    padding: 4px 8px;
+  th.select {
+    width: 36px;
   }
 
-  th.enabled,
+  th.enabled {
+    width: 48px;
+  }
+
+  th.author {
+    width: 19ch;
+  }
+
+  th.update {
+    width: 88px;
+  }
+
+  table.has-update-col th.update {
+    width: 124px;
+  }
+
   th.locked,
   th.trash {
-    width: 1%;
+    width: 44px;
+  }
+
+  th.trash {
+    padding: 4px 8px;
   }
 
   /* The whole header cell sorts, out to the column edges, not just its label. */
@@ -1703,6 +1956,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    min-width: 0;
   }
 
   .identity img,
@@ -1740,6 +1994,7 @@
     font-weight: 700;
     color: var(--text);
     text-align: left;
+    overflow-wrap: anywhere;
     background: transparent;
     border: 0;
   }
@@ -1822,6 +2077,7 @@
 
   .author {
     min-width: 9ch;
+    overflow-wrap: anywhere;
   }
 
   .byline {
@@ -1846,12 +2102,37 @@
 
   /* Half of a split at the minimum window still has to fit every control column. */
   @container (max-width: 440px) {
+    table {
+      min-width: 420px;
+    }
+
+    th.enabled {
+      width: 40px;
+    }
+
+    th.update {
+      width: 56px;
+    }
+
+    table.has-update-col th.update {
+      width: 104px;
+    }
+
+    th.locked,
+    th.trash {
+      width: 36px;
+    }
+
     td {
       padding-inline: 4px;
     }
 
     .update {
       white-space: normal;
+    }
+
+    td.update button {
+      padding-inline: 6px;
     }
   }
 
@@ -1905,6 +2186,10 @@
   /* Wide enough for the busy label, so queueing an update doesn't shift the columns. A narrow pane,
      such as a zoomed-in minimum window or half a split, has no room to spare for it. */
   @container pane (min-width: 532px) {
+    table.has-update-col th.update {
+      width: 152px;
+    }
+
     td.update button {
       min-width: 8.5em;
     }

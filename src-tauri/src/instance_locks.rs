@@ -1,16 +1,18 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::value::RawValue;
-use serde_json::Value;
 
 use crate::pack::{ModKey, Pack};
 use crate::setup::same_dir;
 
 const INSTANCE_JSON: &str = "minecraftinstance.json";
 
+#[derive(Clone)]
 pub enum CurseForgeApp {
     Running,
     Closed { database: PathBuf },
@@ -31,10 +33,10 @@ impl CurseForgeApp {
 // running agent is the case that loses locks.
 #[cfg(windows)]
 fn agent_running() -> bool {
-    let mut command = std::process::Command::new("tasklist");
-    command.args(["/FI", "IMAGENAME eq Curse.Agent.Host.exe", "/NH"]);
-    crate::process::hide_window_std(&mut command);
-    command.output().map_or(true, |output| String::from_utf8_lossy(&output.stdout).contains("Curse.Agent.Host"))
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+    let mut system = System::new();
+    system.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    system.processes().values().any(|process| process.name().eq_ignore_ascii_case("Curse.Agent.Host.exe"))
 }
 
 #[cfg(not(windows))]
@@ -42,20 +44,51 @@ fn agent_running() -> bool {
     std::process::Command::new("pgrep").args(["-f", "Curse.Agent.Host"]).output().map_or(true, |output| output.status.code() != Some(1))
 }
 
+#[derive(Deserialize)]
+struct InstanceLocks {
+    #[serde(rename = "installedAddons")]
+    installed_addons: Option<Vec<InstalledAddonLock>>,
+}
+
+#[derive(Deserialize)]
+struct InstalledAddonLock {
+    #[serde(rename = "addonID")]
+    addon_id: Option<u64>,
+    #[serde(rename = "isLocked", default)]
+    is_locked: bool,
+}
+
 fn locked_addons(instance: &str) -> Option<BTreeSet<u64>> {
-    let instance: Value = serde_json::from_str(instance.trim_start_matches('\u{feff}')).ok()?;
-    Some(
-        instance["installedAddons"]
-            .as_array()?
-            .iter()
-            .filter(|addon| addon["isLocked"] == true)
-            .filter_map(|addon| addon["addonID"].as_u64())
-            .collect(),
-    )
+    let instance: InstanceLocks = serde_json::from_str(instance.trim_start_matches('\u{feff}')).ok()?;
+    Some(instance.installed_addons?.into_iter().filter(|addon| addon.is_locked).filter_map(|addon| addon.addon_id).collect())
+}
+
+type FileStamp = (u64, Option<SystemTime>);
+
+struct CachedLocks {
+    stamp: FileStamp,
+    locks: Option<BTreeSet<u64>>,
+}
+
+static INSTANCE_LOCKS_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedLocks>>> = OnceLock::new();
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
 }
 
 pub fn curseforge_locks(dir: &Path) -> Option<BTreeSet<u64>> {
-    locked_addons(&std::fs::read_to_string(dir.join(INSTANCE_JSON)).ok()?)
+    let path = dir.join(INSTANCE_JSON);
+    let stamp = file_stamp(&path)?;
+    let cache = INSTANCE_LOCKS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(entry) = cache.lock().unwrap().get(&path)
+        && entry.stamp == stamp
+    {
+        return entry.locks.clone();
+    }
+    let locks = locked_addons(&std::fs::read_to_string(&path).ok()?);
+    cache.lock().unwrap().insert(path, CachedLocks { stamp, locks: locks.clone() });
+    locks
 }
 
 // The CurseForge app owns this file, and parsing and rewriting it would reorder its keys, so we
@@ -105,12 +138,19 @@ fn database_with_locks(database: &str, dir: &Path, wanted: &BTreeSet<u64>) -> Op
     Some(format!("{}{patched}{}", &database[..start], &database[start + instance.len()..]))
 }
 
+#[cfg(test)]
+fn sync(pack: &mut Pack, last_seen_path: &Path, app: &CurseForgeApp) -> Result<()> {
+    sync_with(pack, last_seen_path, || app.clone())
+}
+
 /// Merges lock changes made in the CurseForge app since the last sync into packraven.toml, then
 /// writes the pack's locks back to the CurseForge app if it's closed. `last_seen` holds the
 /// CurseForge locks from the previous sync on this machine, so an unlock in either app sticks.
-pub fn sync(pack: &mut Pack, last_seen_path: &Path, app: &CurseForgeApp) -> Result<()> {
+pub fn sync_with(pack: &mut Pack, last_seen_path: &Path, detect_app: impl FnOnce() -> CurseForgeApp) -> Result<()> {
     let Some(curseforge) = curseforge_locks(&pack.dir) else { return Ok(()) };
-    let last_seen: BTreeSet<u64> = std::fs::read_to_string(last_seen_path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    let last_seen_text = std::fs::read_to_string(last_seen_path).ok();
+    let last_seen_existed = last_seen_text.is_some();
+    let last_seen: BTreeSet<u64> = last_seen_text.and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
     let mut ours: BTreeSet<u64> = pack.config.updates.locked.iter().filter_map(ModKey::curseforge_id).collect();
     let before = ours.clone();
     ours.extend(curseforge.difference(&last_seen));
@@ -124,20 +164,25 @@ pub fn sync(pack: &mut Pack, last_seen_path: &Path, app: &CurseForgeApp) -> Resu
         locked.sort();
         pack.save_config()?;
     }
-    // A running CurseForge rewrites both files from memory, which would undo our write and then
-    // look like an unlock on the next sync. We write any pending locks once it's closed.
-    if let CurseForgeApp::Closed { database } = app {
-        write_curseforge_locks(&pack.dir, database, &ours)?;
+    // Only check whether CurseForge is running and write back when our locks actually differ from
+    // what minecraftinstance.json already records.
+    let mut wrote_instance = false;
+    if ours != curseforge
+        && let CurseForgeApp::Closed { database } = detect_app()
+    {
+        wrote_instance = write_curseforge_locks(&pack.dir, &database, &ours)?;
     }
-    let seen = curseforge_locks(&pack.dir).unwrap_or_default();
-    if let Some(parent) = last_seen_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    let seen = if wrote_instance { curseforge_locks(&pack.dir).unwrap_or_default() } else { curseforge };
+    if !last_seen_existed || seen != last_seen {
+        if let Some(parent) = last_seen_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(last_seen_path, serde_json::to_string(&seen)?)?;
     }
-    std::fs::write(last_seen_path, serde_json::to_string(&seen)?)?;
     Ok(())
 }
 
-fn write_curseforge_locks(dir: &Path, database: &Path, wanted: &BTreeSet<u64>) -> Result<()> {
+fn write_curseforge_locks(dir: &Path, database: &Path, wanted: &BTreeSet<u64>) -> Result<bool> {
     if let Ok(text) = std::fs::read_to_string(database)
         && let Some(updated) = database_with_locks(&text, dir, wanted)
     {
@@ -148,13 +193,18 @@ fn write_curseforge_locks(dir: &Path, database: &Path, wanted: &BTreeSet<u64>) -
     let path = dir.join(INSTANCE_JSON);
     if let Some(updated) = with_locks(&std::fs::read_to_string(&path)?, wanted) {
         std::fs::write(&path, updated).context("writing minecraftinstance.json")?;
+        if let Some(cache) = INSTANCE_LOCKS_CACHE.get() {
+            cache.lock().unwrap().remove(&path);
+        }
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     const INSTANCE: &str = r#"{"installedModpack":{"addonID":7,"isLocked":false},"installedAddons":[{"addonID":12,"installedFile":{"id":1,"dependencies":[{"addonId":7}]},"isEnabled":true,"isLocked":false},{"addonID":7,"isLocked":true}]}"#;
 
@@ -213,6 +263,15 @@ mod tests {
         sync(&mut pack, &seen, &closed).unwrap();
         assert!(pack.config.updates.locked.is_empty(), "an unlock in the CurseForge app sticks");
         assert!(std::fs::read_to_string(dir.join(INSTANCE_JSON)).unwrap().starts_with('\u{feff}'));
+
+        let mut detected = false;
+        sync_with(&mut pack, &seen, || {
+            detected = true;
+            closed.clone()
+        })
+        .unwrap();
+        assert!(!detected, "a no-op sync skips process detection and database I/O");
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

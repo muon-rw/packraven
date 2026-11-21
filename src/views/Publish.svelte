@@ -1080,7 +1080,7 @@
             </button>
             {#if side === 'server'}
               <span class="small">
-                {config?.server.bundle_mods ? 'Its mods are in the zip.' : "Its mods are downloaded on the server's first start."}
+                {config?.server.bundle_mods ? 'Server mods are bundled in the zip.' : "Mods are downloaded on the server's first start."}
                 <button type="button" class="link" onclick={() => ((serverView.tab = 'startup'), onserver())}>Change<span class="visually-hidden"> how the server pack gets its mods</span></button>
               </span>
               <span class="muted small">

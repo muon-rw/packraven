@@ -61,6 +61,7 @@ pub struct InstalledMod {
 pub struct InstalledMods {
     mods: Vec<InstalledMod>,
     locked: Vec<String>,
+    channel: ReleaseType,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -190,6 +191,10 @@ pub async fn installed(pack: &Pack, cache: &mut MetadataCache) -> InstalledMods 
     let keys: Vec<_> = pack.lock.files.iter().filter_map(LockEntry::key).collect();
     // Offline, we still list every file, under its file name.
     let _ = cache.ensure_names(&keys).await;
+    installed_from_cache(pack, cache)
+}
+
+pub fn installed_from_cache(pack: &Pack, cache: &MetadataCache) -> InstalledMods {
     let mut mods: Vec<InstalledMod> = pack
         .lock
         .files
@@ -218,7 +223,11 @@ pub async fn installed(pack: &Pack, cache: &mut MetadataCache) -> InstalledMods 
         })
         .collect();
     mods.sort_by_key(|m| m.name.to_lowercase());
-    InstalledMods { mods, locked: pack.config.updates.locked.iter().map(ToString::to_string).collect() }
+    InstalledMods {
+        mods,
+        locked: pack.config.updates.locked.iter().map(ToString::to_string).collect(),
+        channel: pack.config.updates.channel,
+    }
 }
 
 fn file_name(path: &str) -> &str {

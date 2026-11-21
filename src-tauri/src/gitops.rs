@@ -1,8 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 use tokio::process::Command;
 
 use crate::git::{self, Identity};
@@ -54,9 +58,169 @@ pub struct Diff {
     pub truncated: bool,
 }
 
+pub(crate) type IndexStamp = (u64, Option<SystemTime>, Vec<u8>);
+
+struct TrackedIgnoredCache {
+    index_stamp: IndexStamp,
+    tracked_dirs: Vec<String>,
+    rules_hash: [u8; 20],
+    files: Vec<String>,
+}
+
+struct ExcludesFiles {
+    config_hash: [u8; 20],
+    paths: Vec<PathBuf>,
+}
+
+static TRACKED_IGNORED_CACHE: OnceLock<Mutex<HashMap<PathBuf, TrackedIgnoredCache>>> = OnceLock::new();
+static EXCLUDES_FILES: OnceLock<Mutex<HashMap<PathBuf, ExcludesFiles>>> = OnceLock::new();
+
+fn tracked_ignored_cache() -> &'static Mutex<HashMap<PathBuf, TrackedIgnoredCache>> {
+    TRACKED_IGNORED_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+// Git rewrites .git/index through a lock file and ends it with a checksum (all zeros under
+// index.skipHash), so its length, mtime and last 32 bytes together change on every write.
+pub(crate) fn index_stamp(git_dir: &Path) -> Option<IndexStamp> {
+    let mut file = std::fs::File::open(git_dir.join("index")).ok()?;
+    let meta = file.metadata().ok()?;
+    let len = meta.len();
+    let tail_len = len.min(32) as usize;
+    file.seek(SeekFrom::End(-(tail_len as i64))).ok()?;
+    let mut tail = vec![0u8; tail_len];
+    file.read_exact(&mut tail).ok()?;
+    Some((len, meta.modified().ok(), tail))
+}
+
+fn xdg_git_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).or_else(|| dirs::home_dir().map(|home| home.join(".config"))).map(|config| config.join("git"))
+}
+
+// We only ask git for core.excludesFile again when a config file that could set it changes.
+fn excludes_files(dir: &Path) -> Vec<PathBuf> {
+    let mut hasher = Sha1::new();
+    let mut configs = vec![dir.join(".git/config")];
+    configs.extend(dirs::home_dir().map(|home| home.join(".gitconfig")));
+    configs.extend(xdg_git_dir().map(|git| git.join("config")));
+    for path in &configs {
+        hash_ignore_file(&mut hasher, &path.to_string_lossy(), path);
+    }
+    let config_hash: [u8; 20] = hasher.finalize().into();
+    let cache = EXCLUDES_FILES.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(entry) = cache.lock().unwrap().get(dir)
+        && entry.config_hash == config_hash
+    {
+        return entry.paths.clone();
+    }
+    let mut paths = Vec::new();
+    if let Ok(out) = git::run(dir, &["config", "--path", "--get", "core.excludesfile"]) {
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            paths.push(PathBuf::from(trimmed));
+        }
+    }
+    paths.extend(xdg_git_dir().map(|git| git.join("ignore")));
+    cache.lock().unwrap().insert(dir.to_path_buf(), ExcludesFiles { config_hash, paths: paths.clone() });
+    paths
+}
+
+pub(crate) fn hash_ignore_file(hasher: &mut Sha1, label: &str, path: &Path) {
+    hasher.update(label.as_bytes());
+    hasher.update([0]);
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            hasher.update([1]);
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(&bytes);
+        }
+        Err(_) => hasher.update([0]),
+    }
+}
+
+/// Hashes the ignore rules that apply across the whole repository: info/exclude, the repository
+/// config, and the global excludes file.
+pub(crate) fn hash_repo_ignore_rules(hasher: &mut Sha1, dir: &Path) {
+    let git_dir = dir.join(".git");
+    hash_ignore_file(hasher, "info/exclude", &git_dir.join("info/exclude"));
+    hash_ignore_file(hasher, "config", &git_dir.join("config"));
+    for path in excludes_files(dir) {
+        hash_ignore_file(hasher, &path.to_string_lossy(), &path);
+    }
+}
+
+fn ignore_rules_hash(dir: &Path, tracked_dirs: &[String]) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hash_repo_ignore_rules(&mut hasher, dir);
+    for parent in tracked_dirs {
+        let rel = if parent.is_empty() { ".gitignore".to_string() } else { format!("{parent}/.gitignore") };
+        hash_ignore_file(&mut hasher, &rel, &dir.join(&rel));
+    }
+    hasher.finalize().into()
+}
+
+// A tracked file can only become ignored through a .gitignore in one of its folders, whether git
+// tracks, ignores or doesn't know that .gitignore, so we watch every folder holding a tracked file.
+fn tracked_dirs(dir: &Path) -> Result<Vec<String>> {
+    let mut dirs = BTreeSet::from([String::new()]);
+    for file in listed(dir, &["ls-files", "-z"])? {
+        let mut end = file.len();
+        while let Some(slash) = file[..end].rfind('/') {
+            if !dirs.insert(file[..slash].to_string()) {
+                break;
+            }
+            end = slash;
+        }
+    }
+    Ok(dirs.into_iter().collect())
+}
+
+fn compute_tracked_ignored(dir: &Path) -> Result<Vec<String>> {
+    Ok(tracked_ignored(dir, &[])?.into_iter().filter(|p| !modsync::is_binary(p)).collect())
+}
+
+fn cached_tracked_ignored(dir: &Path, stamp: &IndexStamp) -> Option<Vec<String>> {
+    let tracked_dirs = {
+        let guard = tracked_ignored_cache().lock().unwrap();
+        guard.get(dir).filter(|entry| &entry.index_stamp == stamp)?.tracked_dirs.clone()
+    };
+    let hash = ignore_rules_hash(dir, &tracked_dirs);
+    let guard = tracked_ignored_cache().lock().unwrap();
+    guard.get(dir).filter(|entry| &entry.index_stamp == stamp && entry.rules_hash == hash).map(|entry| entry.files.clone())
+}
+
+fn refresh_tracked_ignored(dir: &Path, stamp: Option<IndexStamp>) -> Result<Vec<String>> {
+    let Some(stamp) = stamp else { return compute_tracked_ignored(dir) };
+    let (files, tracked_dirs) = std::thread::scope(|scope| {
+        let tracked_dirs = scope.spawn(|| tracked_dirs(dir));
+        (compute_tracked_ignored(dir), tracked_dirs.join().unwrap())
+    });
+    let files = files?;
+    // If the index changed while git listed files, the listing may already be stale.
+    if let Ok(tracked_dirs) = tracked_dirs
+        && index_stamp(&dir.join(".git")).as_ref() == Some(&stamp)
+    {
+        let rules_hash = ignore_rules_hash(dir, &tracked_dirs);
+        tracked_ignored_cache().lock().unwrap().insert(dir.to_path_buf(), TrackedIgnoredCache { index_stamp: stamp, tracked_dirs, rules_hash, files: files.clone() });
+    }
+    Ok(files)
+}
+
 pub fn status(dir: &Path) -> Result<Status> {
-    let out = git::run(dir, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"])?;
-    let mut status = Status { has_remote: !git::run(dir, &["remote"])?.trim().is_empty(), ..Default::default() };
+    let git_dir = dir.join(".git");
+    let stamp = if git_dir.is_dir() { index_stamp(&git_dir) } else { None };
+
+    let (out, remote, tracked_ignored) = std::thread::scope(|scope| {
+        let status_run = scope.spawn(|| git::run(dir, &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"]));
+        let remote_run = scope.spawn(|| git::run(dir, &["remote"]));
+        let tracked_ignored = match stamp.as_ref().and_then(|stamp| cached_tracked_ignored(dir, stamp)) {
+            Some(files) => Ok(files),
+            None => refresh_tracked_ignored(dir, stamp.clone()),
+        };
+        (status_run.join().unwrap(), remote_run.join().unwrap(), tracked_ignored)
+    });
+
+    let out = out?;
+    let mut status = Status { has_remote: !remote?.trim().is_empty(), ..Default::default() };
     let mut records = out.split('\0').filter(|r| !r.is_empty());
     while let Some(record) = records.next() {
         if let Some(header) = record.strip_prefix("# ") {
@@ -100,7 +264,8 @@ pub fn status(dir: &Path) -> Result<Status> {
             _ => {}
         }
     }
-    status.tracked_ignored = tracked_ignored(dir, &[])?.into_iter().filter(|p| !modsync::is_binary(p)).collect();
+
+    status.tracked_ignored = tracked_ignored?;
     Ok(status)
 }
 
@@ -831,6 +996,21 @@ mods/*.jar
         assert!(status(&dir).unwrap().tracked_ignored.is_empty());
         std::fs::write(dir.join(".gitignore"), "/config/jei/\n").unwrap();
         assert_eq!(keep_tracking(&dir, &["config/jei/a.ini".into()]).unwrap(), ["config/jei/a.ini"]);
+
+        // An untracked nested .gitignore that covers an already-tracked file must invalidate the cache.
+        std::fs::write(dir.join(".gitignore"), "").unwrap();
+        assert!(status(&dir).unwrap().tracked_ignored.is_empty());
+        std::fs::write(dir.join("config/jei/.gitignore"), "*.ini\n").unwrap();
+        assert_eq!(status(&dir).unwrap().tracked_ignored, ["config/jei/a.ini"]);
+        std::fs::write(dir.join("config/jei/.gitignore"), "").unwrap();
+        assert!(status(&dir).unwrap().tracked_ignored.is_empty());
+
+        // Git still reads a nested .gitignore that is itself ignored, though status never lists it.
+        std::fs::write(dir.join(".gitignore"), ".gitignore\n!/.gitignore\n").unwrap();
+        assert!(status(&dir).unwrap().tracked_ignored.is_empty());
+        std::fs::write(dir.join("config/jei/.gitignore"), "*.ini\n").unwrap();
+        assert_eq!(status(&dir).unwrap().tracked_ignored, ["config/jei/a.ini"]);
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

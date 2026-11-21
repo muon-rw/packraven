@@ -21,7 +21,12 @@ pub struct GitOverview {
 #[tauri::command(async)]
 pub fn git_overview(state: State<'_, AppState>) -> CmdResult<GitOverview> {
     let dir = state.settings().instance_dir;
-    Ok(GitOverview { status: gitops::status(&dir).map_err(err)?, commits: gitops::recent_commits(&dir, 30) })
+    let (status, commits) = std::thread::scope(|scope| {
+        let commits = scope.spawn(|| gitops::recent_commits(&dir, 30));
+        let status = gitops::status(&dir);
+        (status, commits.join().unwrap_or_default())
+    });
+    Ok(GitOverview { status: status.map_err(err)?, commits })
 }
 
 #[tauri::command(async)]

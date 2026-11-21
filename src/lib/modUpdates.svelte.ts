@@ -1,5 +1,5 @@
 import { untrack } from 'svelte'
-import { api, type AddonKind, type ModCheck, type ModFile, type Platform, type ReleaseType, type SearchSort } from './api'
+import { api, type AddonKind, type InstalledMod, type ModCheck, type ModFile, type Platform, type ReleaseType, type SearchSort } from './api'
 import { job, onJobItem } from './jobs.svelte'
 
 const stability: Record<ReleaseType, number> = { release: 1, beta: 2, alpha: 3 }
@@ -7,6 +7,7 @@ const stability: Record<ReleaseType, number> = { release: 1, beta: 2, alpha: 3 }
 // We keep the last check for the session, so leaving the Mods view doesn't mean asking CurseForge again.
 export const modUpdates = $state({
   pack: null as string | null,
+  mods: null as InstalledMod[] | null,
   channel: 'release' as ReleaseType,
   // We replace the set on each change, since Svelte doesn't track changes inside a Set.
   locked: new Set<string>(),

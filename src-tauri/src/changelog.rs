@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
 use std::io::Read;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,43 @@ use crate::curseforge;
 use crate::git;
 use crate::pack::{CurseforgeFile, LockEntry, Lockfile, ModKey, Pack, CHANGELOG, LOCKFILE};
 use crate::sides::{MetadataCache, ProjectName};
+
+const MAX_CACHED_FILE_NAMES: usize = 10_000;
+
+static FILE_DISPLAY_NAMES: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
+
+async fn cached_file_names(ids: &[u64]) -> Result<HashMap<u64, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let cache = FILE_DISPLAY_NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut found = HashMap::with_capacity(ids.len());
+    let mut missing = Vec::new();
+    {
+        let guard = cache.lock().unwrap();
+        for &id in ids {
+            if let Some(name) = guard.get(&id) {
+                found.insert(id, name.clone());
+            } else {
+                missing.push(id);
+            }
+        }
+    }
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        missing.dedup();
+        let fetched = curseforge::files(&missing).await?;
+        let mut guard = cache.lock().unwrap();
+        if guard.len() + fetched.len() > MAX_CACHED_FILE_NAMES {
+            guard.clear();
+        }
+        for (id, file) in fetched {
+            guard.insert(id, file.display_name.clone());
+            found.insert(id, file.display_name);
+        }
+    }
+    Ok(found)
+}
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -104,33 +142,32 @@ fn by_project(lock: &Lockfile) -> BTreeMap<ModKey, &LockEntry> {
     lock.files.iter().filter_map(|e| Some((e.key()?, e))).collect()
 }
 
-pub async fn mod_diff(pack: &Pack, current: &Lockfile, cache: &mut MetadataCache, baseline_path: &Path) -> Result<ModDiff> {
-    let baseline = load_baseline(baseline_path);
-    let (since, previous) = match (baseline, git::last_release_tag(&pack.dir)) {
-        (Some(baseline), _) => (baseline.label, baseline.lock),
-        (None, Some(tag)) => {
-            let lock = git::show(&pack.dir, &tag, LOCKFILE).map(|t| Lockfile::parse(&t)).transpose()?.unwrap_or_default();
-            (tag, lock)
-        }
-        (None, None) => return Ok(ModDiff::default()),
-    };
-    let is_baseline = baseline_path.exists();
-    let old = by_project(&previous);
+pub struct PreviousLock {
+    pub since: String,
+    pub baseline: bool,
+    pub lock: Lockfile,
+}
+
+pub fn previous_lock(dir: &Path, baseline_path: &Path) -> Result<Option<PreviousLock>> {
+    if let Some(baseline) = load_baseline(baseline_path) {
+        return Ok(Some(PreviousLock { since: baseline.label, baseline: true, lock: baseline.lock }));
+    }
+    let Some(tag) = git::last_release_tag(dir) else { return Ok(None) };
+    let lock = git::show(dir, &tag, LOCKFILE).map(|t| Lockfile::parse(&t)).transpose()?.unwrap_or_default();
+    Ok(Some(PreviousLock { since: tag, baseline: false, lock }))
+}
+
+async fn diff_with_cache(pack: &Pack, current: &Lockfile, previous: PreviousLock, cache: &MetadataCache) -> Result<ModDiff> {
+    let old = by_project(&previous.lock);
     let new = by_project(current);
     let listed = by_project(&pack.lock);
-    let keys: Vec<ModKey> = old.keys().chain(new.keys()).cloned().collect();
-    cache.ensure_names(&keys).await?;
     let changed_files: Vec<u64> = new
         .iter()
         .filter_map(|(key, e)| old.get(key).filter(|o| !o.same_file(e)).map(|o| [o, *e]))
         .flatten()
         .filter_map(|e| e.curseforge.as_ref().map(|f| f.file_id))
         .collect();
-    let file_names: HashMap<u64, String> = if changed_files.is_empty() {
-        HashMap::new()
-    } else {
-        curseforge::files(&changed_files).await?.into_iter().map(|(id, f)| (id, f.display_name)).collect()
-    };
+    let file_names = cached_file_names(&changed_files).await?;
     let display = |entry: &LockEntry| {
         entry.curseforge.as_ref().and_then(|f| file_names.get(&f.file_id)).cloned().unwrap_or_else(|| ProjectName::of_file(&entry.path).name)
     };
@@ -138,7 +175,7 @@ pub async fn mod_diff(pack: &Pack, current: &Lockfile, cache: &mut MetadataCache
         let name = cache.name(key);
         ModChange { name: name.name, url: name.url, from, to, in_mod_list }
     };
-    let mut diff = ModDiff { since: Some(since), baseline: is_baseline, ..Default::default() };
+    let mut diff = ModDiff { since: Some(previous.since), baseline: previous.baseline, ..Default::default() };
     for (key, entry) in &new {
         let in_mod_list = listed.get(key).is_some_and(|l| l.same_file(entry));
         match old.get(key) {
@@ -154,6 +191,27 @@ pub async fn mod_diff(pack: &Pack, current: &Lockfile, cache: &mut MetadataCache
         list.sort_by_key(|c| c.name.to_lowercase());
     }
     Ok(diff)
+}
+
+pub async fn mod_diff(pack: &Pack, current: &Lockfile, cache: &mut MetadataCache, baseline_path: &Path) -> Result<ModDiff> {
+    let Some(previous) = previous_lock(&pack.dir, baseline_path)? else { return Ok(ModDiff::default()) };
+    let keys: Vec<ModKey> = by_project(&previous.lock).into_keys().chain(by_project(current).into_keys()).collect();
+    cache.ensure_names(&keys).await?;
+    diff_with_cache(pack, current, previous, cache).await
+}
+
+pub async fn mod_diff_cached(pack: &Pack, current: &Lockfile, previous: PreviousLock, cache_path: &Path) -> Result<ModDiff> {
+    let keys: Vec<ModKey> = by_project(&previous.lock).into_keys().chain(by_project(current).into_keys()).collect();
+    let shared = MetadataCache::load_shared(cache_path);
+    if shared.has_all_names(&keys) {
+        return diff_with_cache(pack, current, previous, &shared).await;
+    }
+    let mut cache = (*shared).clone();
+    cache.ensure_names(&keys).await?;
+    if cache.is_dirty() {
+        cache.save(cache_path)?;
+    }
+    diff_with_cache(pack, current, previous, &cache).await
 }
 
 const PART_START: &[char] = &['-', '_', '+', ' '];

@@ -541,7 +541,20 @@ impl TryFrom<serde_json::Value> for Lockfile {
 
 impl Lockfile {
     pub fn parse(text: &str) -> Result<Self> {
-        Self::try_from(serde_json::from_str::<serde_json::Value>(text).context("parsing mods.lock.json")?)
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct FormatHeader {
+            format_version: Option<serde_json::Value>,
+        }
+        let header: FormatHeader = serde_json::from_str(text).context("parsing mods.lock.json")?;
+        match header.format_version.as_ref().map_or(Some(1), serde_json::Value::as_u64) {
+            Some(1) => Ok(serde_json::from_str::<LockfileV1>(text).context("parsing mods.lock.json")?.into()),
+            Some(LOCK_FORMAT) => {
+                let stored: StoredLockfile = serde_json::from_str(text).context("parsing mods.lock.json")?;
+                Ok(Self { minecraft: stored.minecraft, loader: stored.loader, files: stored.files })
+            }
+            _ => bail!(NEWER_LOCK_FORMAT),
+        }
     }
 
     pub fn minecraft(&self) -> Result<&str> {

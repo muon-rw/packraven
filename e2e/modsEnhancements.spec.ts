@@ -109,3 +109,95 @@ test('CurseForge and Modrinth browse support gallery, links, ctrl-click, and con
   await mrReading.getByRole('button', { name: /^Gallery/ }).click()
   await expect(mrReading.locator('.gallery .shot')).toHaveCount(3)
 })
+
+test('returning to Mods renders cached rows immediately and virtualizes large packs', async ({ page }) => {
+  await page.goto('/?view=mods&scenario=ready&manymods')
+  const region = page.getByRole('region', { name: 'Installed mods' })
+  await expect(region.locator('tbody > tr.row').first()).toBeVisible()
+
+  // With 450+ mods, only a windowed slice of rows is mounted in the DOM.
+  const mountedCount = await region.locator('tbody > tr.row').count()
+  expect(mountedCount).toBeGreaterThan(10)
+  expect(mountedCount).toBeLessThan(120)
+
+  // Scrolling down brings later rows into the rendered window.
+  await region.evaluate((el) => {
+    el.scrollTop = el.scrollHeight
+  })
+  await expect(region.locator('tbody > tr.row').last()).toContainText('Synthetic Mod 450')
+
+  // Switching away and back renders the list immediately without skeleton rows.
+  const nav = page.getByRole('navigation', { name: 'Pack' })
+  await nav.getByRole('button', { name: /^Git/ }).click()
+  await expect(page.getByRole('heading', { level: 2, name: 'Git' })).toBeVisible()
+  await nav.getByRole('button', { name: /^Mods/ }).click()
+  await expect(region.locator('tbody > tr.skeleton')).toHaveCount(0)
+  await expect(region.locator('tbody > tr.row').first()).toBeVisible()
+
+  // Filtering a large list resets scroll and finds matches anywhere in the pack.
+  await page.getByRole('searchbox', { name: 'Find a mod or author' }).fill('Synthetic Mod 450')
+  await expect(region.locator('tbody > tr.row')).toHaveCount(1)
+  await expect(region.locator('tbody > tr.row').first()).toContainText('Synthetic Mod 450')
+})
+
+test('returning to Server renders cached rows immediately and virtualizes large mod lists', async ({ page }) => {
+  await page.goto('/?view=server&scenario=ready&manymods')
+  const region = page.getByRole('region', { name: 'Mods' })
+  await expect(region.locator('tbody > tr[data-path]').first()).toBeVisible()
+
+  await page.getByRole('group', { name: 'Show' }).getByRole('button', { name: 'All mods' }).click()
+  const mountedCount = await region.locator('tbody > tr[data-path]').count()
+  expect(mountedCount).toBeGreaterThan(10)
+  expect(mountedCount).toBeLessThan(120)
+
+  // Switching away and back renders Server immediately without skeleton rows.
+  const nav = page.getByRole('navigation', { name: 'Pack' })
+  await nav.getByRole('button', { name: /^Mods/ }).click()
+  await expect(page.getByRole('heading', { level: 2, name: 'Mods' })).toBeVisible()
+  await nav.getByRole('button', { name: /^Server/ }).click()
+  await expect(region.locator('tbody > tr.skeleton')).toHaveCount(0)
+  await expect(region.locator('tbody > tr[data-path]').first()).toBeVisible()
+})
+
+test('returning to Git, Changes, and Files renders cached views immediately', async ({ page }) => {
+  await openApp(page, 'git', 'dirty')
+  const nav = page.getByRole('navigation', { name: 'Pack' })
+
+  // Select a changed file so its diff is loaded and cached.
+  const firstChange = page.locator('.changes .row').first()
+  await expect(firstChange).toBeVisible()
+  await firstChange.click()
+  await expect(page.locator('.diff')).toBeVisible()
+
+  // Visit Changes, confirm mod changes appear, and type unsaved notes.
+  await nav.getByRole('button', { name: /^Changes/ }).click()
+  await expect(page.getByRole('heading', { level: 2, name: 'Changes' })).toBeVisible()
+  await expect(page.locator('.change-group').first()).toBeVisible()
+  const notes = page.locator('#release-notes')
+  await notes.fill('Draft note kept across navigation')
+
+  // Visit Files and expand a folder.
+  await nav.getByRole('button', { name: /^Files/ }).click()
+  const tree = page.getByRole('tree')
+  await expect(tree.getByRole('treeitem').first()).toBeVisible()
+  const folder = tree.getByRole('treeitem', { expanded: false }).first()
+  const folderName = (await folder.textContent())?.trim() ?? ''
+  await folder.click()
+  await expect(tree.getByRole('treeitem', { expanded: true }).first()).toBeVisible()
+
+  // Return to Git: list and commits stay populated without loading state, and reselecting the file shows cached diff.
+  await nav.getByRole('button', { name: /^Git/ }).click()
+  await expect(page.locator('.changes .row').first()).toBeVisible()
+  await page.locator('.changes .row').first().click()
+  await expect(page.locator('.diff')).toBeVisible()
+
+  // Return to Changes: cached mod diff and unsaved notes remain visible immediately.
+  await nav.getByRole('button', { name: /^Changes/ }).click()
+  await expect(page.locator('.change-group').first()).toBeVisible()
+  await expect(page.locator('#release-notes')).toHaveValue('Draft note kept across navigation')
+
+  // Return to Files: previously expanded folder stays expanded immediately.
+  await nav.getByRole('button', { name: /^Files/ }).click()
+  await expect(tree.getByRole('treeitem', { expanded: true }).first()).toBeVisible()
+  if (folderName) await expect(tree.getByRole('treeitem', { expanded: true }).first()).toContainText(folderName)
+})

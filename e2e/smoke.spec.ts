@@ -545,7 +545,7 @@ test('server packs download their mods unless you include them in the zip', asyn
   await expect(readme).toContainText('then installs NeoForge and Minecraft.')
 
   await page.getByRole('navigation', { name: 'Pack' }).getByRole('button', { name: /^Publish/ }).click()
-  await expect(page.locator('.ships')).toContainText('Its mods are in the zip')
+  await expect(page.locator('.ships')).toContainText('Server mods are bundled in the zip.')
   await page.getByRole('button', { name: 'Change how the server pack gets its mods' }).click()
   await expect(page.getByRole('radio', { name: /^Include them in the zip/ })).toBeChecked()
 })

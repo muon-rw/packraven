@@ -1,12 +1,42 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+use sha1::{Digest, Sha1};
+
+use crate::gitops::{self, hash_ignore_file, IndexStamp};
 
 const HIDDEN: [&str; 1] = [".git"];
+
+// git check-ignore leaves tracked files out of its answer, so a cached answer depends on the index
+// as well as the ignore rules.
+struct CachedIgnored {
+    index_stamp: Option<IndexStamp>,
+    rules_hash: [u8; 20],
+    queries: Vec<String>,
+    ignored: HashSet<String>,
+}
+
+const MAX_CACHED_DIRS: usize = 512;
+
+static IGNORED_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedIgnored>>> = OnceLock::new();
+
+fn dir_ignore_rules_hash(root: &Path, relative: &str) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    gitops::hash_repo_ignore_rules(&mut hasher, root);
+    hash_ignore_file(&mut hasher, ".gitignore", &root.join(".gitignore"));
+    let mut prefix = PathBuf::new();
+    for part in relative.split('/').filter(|p| !p.is_empty()) {
+        prefix.push(part);
+        let rel = format!("{}/.gitignore", prefix.to_string_lossy());
+        hash_ignore_file(&mut hasher, &rel, &root.join(&prefix).join(".gitignore"));
+    }
+    hasher.finalize().into()
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,12 +115,27 @@ pub fn list(root: &Path, relative: &str) -> Result<Vec<Entry>> {
             Some(Entry { path: format!("{prefix}{name}"), archive: !is_dir && crate::archive::is_archive(&name), archived: false, name, is_dir, size: metadata.len(), ignored: false })
         })
         .collect();
+    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     let queries: Vec<String> = entries.iter().map(|e| if e.is_dir { format!("{}/", e.path) } else { e.path.clone() }).collect();
-    let ignored = ignored(root, &queries);
+    let index_stamp = gitops::index_stamp(&root.join(".git"));
+    let rules_hash = dir_ignore_rules_hash(root, relative);
+    let cache = IGNORED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let ignored = {
+        let guard = cache.lock().unwrap();
+        guard.get(&dir).filter(|entry| entry.index_stamp == index_stamp && entry.rules_hash == rules_hash && entry.queries == queries).map(|entry| entry.ignored.clone())
+    }
+    .unwrap_or_else(|| {
+        let computed = ignored(root, &queries);
+        let mut guard = cache.lock().unwrap();
+        if guard.len() >= MAX_CACHED_DIRS {
+            guard.clear();
+        }
+        guard.insert(dir.clone(), CachedIgnored { index_stamp, rules_hash, queries, ignored: computed.clone() });
+        computed
+    });
     for entry in &mut entries {
         entry.ignored = ignored.contains(&entry.path);
     }
-    entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
     Ok(entries)
 }
 
@@ -614,6 +659,24 @@ mod tests {
         let entries = receiver.recv_timeout(std::time::Duration::from_secs(30)).expect("listing stalled");
         assert_eq!(entries.len(), 3000);
         assert!(entries.iter().all(|e| e.ignored));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tracking_an_ignored_file_clears_its_ignored_flag() {
+        let root = std::env::temp_dir().join("packraven-ignored-tracking-test");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| assert!(crate::git::command().current_dir(&root).args(args).output().unwrap().status.success());
+        git(&["init"]);
+        std::fs::write(root.join(".gitignore"), "*.ini\n").unwrap();
+        std::fs::write(root.join("a.ini"), "").unwrap();
+        let ignored = |root: &Path| list(root, "").unwrap().into_iter().find(|e| e.name == "a.ini").unwrap().ignored;
+        assert!(ignored(&root));
+        git(&["add", "-f", "a.ini"]);
+        assert!(!ignored(&root));
+        git(&["rm", "--cached", "-q", "a.ini"]);
+        assert!(ignored(&root));
         let _ = std::fs::remove_dir_all(&root);
     }
 

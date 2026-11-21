@@ -19,7 +19,7 @@ fn err(error: anyhow::Error) -> String {
     format!("{error:#}")
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn list_dir(state: State<'_, AppState>, path: String) -> CmdResult<Vec<Entry>> {
     files::list(&state.settings().instance_dir, &path).map_err(err)
 }

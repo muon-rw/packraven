@@ -313,7 +313,7 @@ const modDiff = {
   removed: scenario === 'empty' ? [] : [modChange('Better Clouds', null, null)],
 }
 
-const notes = scenario === 'empty' ? '' : '## Highlights\n\n- New dragon fights in the End\n- Rebalanced early armor tiers\n'
+let notes = scenario === 'empty' ? '' : '## Highlights\n\n- New dragon fights in the End\n- Rebalanced early armor tiers\n'
 
 // Mirrors changelog::render in the backend.
 function renderChangelog() {
@@ -349,6 +349,21 @@ const serverSides: { path: string; key: string | null; name: string; url: string
           requiredBy: ['Mutant Skeleton Armor Tweaks', 'Quests & Teams Fixes', 'Simply Bows', 'Simply Swords'],
         },
         { path: 'mods/simplytooltips-neoforge-1.21.1-0.1.5.jar', key: 'cf:1035547', name: 'Simply Tooltips', url: null, side: 'client', reason: "Marked client-only, but Simply Bows and Simply Swords require it, so the server won't start", override: 'client', requiredBy: ['Simply Bows', 'Simply Swords'] },
+        ...(mockOptions.has('manymods')
+          ? Array.from({ length: 400 }, (_, i) => {
+              const n = String(i + 1).padStart(3, '0')
+              return {
+                path: `mods/synthetic-mod-${n}-neoforge-1.21.1-1.0.0.jar`,
+                key: `cf:${9000000 + i}`,
+                name: `Synthetic Mod ${n}`,
+                url: null,
+                side: i % 5 === 0 ? 'client' : 'both',
+                reason: i % 5 === 0 ? 'Modrinth: server unsupported' : 'Modrinth: runs on both',
+                override: 'auto',
+                requiredBy: [],
+              }
+            })
+          : []),
       ]
 
 // A logo drawn inline, so the view never waits on CurseForge's image CDN.
@@ -391,6 +406,23 @@ let installedMods: MockMod[] =
         { path: 'mods/betterclouds-neoforge-1.3.2.jar.disabled', projectId: 438180, fileId: 8400000, name: 'Better Clouds', url: cfUrl('better-clouds'), logo: logo('B', '#5a7a9a'), releaseType: 'release', requires: [], newer: [newer(8800500, 'betterclouds-neoforge-1.3.4.jar')] },
         { path: 'resourcepacks/FreshAnimations_v1.9.4.zip', projectId: 453763, fileId: 8300000, name: 'Fresh Animations', url: cfUrl('fresh-animations'), logo: logo('F', '#9a6a2a'), releaseType: 'release', requires: [], newer: [] },
         { path: 'shaderpacks/ComplementaryReimagined_r5.5.1.zip', projectId: 627557, fileId: 8200000, name: 'Complementary Shaders - Reimagined', url: cfUrl('complementary-reimagined'), logo: logo('C', '#2a4a7a'), releaseType: 'release', requires: [], newer: [newer(8950000, 'ComplementaryReimagined_r5.6.zip')] },
+        ...(mockOptions.has('manymods')
+          ? Array.from({ length: 450 }, (_, i) => {
+              const n = String(i + 1).padStart(3, '0')
+              const projectId = 9000000 + i
+              return {
+                path: `mods/synthetic-mod-${n}-neoforge-1.21.1-1.0.${i % 10}.jar`,
+                projectId,
+                fileId: 9100000 + i,
+                name: `Synthetic Mod ${n}`,
+                url: cfUrl(`synthetic-mod-${n}`),
+                logo: logo('M', '#4d6b2f'),
+                releaseType: 'release',
+                requires: [],
+                newer: [],
+              }
+            })
+          : []),
       ]
 
 // The empty scenario is a fresh pack without Better Compatibility Checker, so it has no version yet.
@@ -1553,6 +1585,9 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     return { releases: newestFirst.slice(offset, offset + limit), total: newestFirst.length }
   },
   get_notes: () => notes,
+  save_notes: ({ text }) => {
+    notes = String(text ?? '')
+  },
   changelog_preview: () => ({ diff: modDiff, markdown: renderChangelog() }),
   publish_preflight: () => {
     const stem = `${pack.name.replace(/[^\w -]/g, '').trim().replace(/ /g, '-')}-{version}`
@@ -1786,6 +1821,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       authors: authorsOf[projectId] ?? [],
     })),
     locked: config.updates.locked,
+    channel: config.updates.channel,
   }),
   set_mods_enabled: (a) =>
     (a.paths as string[]).map((path) => {

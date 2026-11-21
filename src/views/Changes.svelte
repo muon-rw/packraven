@@ -1,9 +1,10 @@
 <script lang="ts">
   import { hostsOf, notOnHostsSummary } from '../lib/modsync'
   import Notice from '../components/Notice.svelte'
-  import { onMount } from 'svelte'
+  import { onMount, untrack } from 'svelte'
   import { open } from '@tauri-apps/plugin-dialog'
-  import { api, errorText, type ModDiff, type Overview } from '../lib/api'
+  import { api, errorText, type Overview } from '../lib/api'
+  import { changesCache } from '../lib/changesCache.svelte'
   import { shortcut } from '../lib/platform'
   import { appSettingsView, nav, packSettingsView } from '../lib/nav.svelte'
   import RenderedChangelog from '../components/RenderedChangelog.svelte'
@@ -11,19 +12,46 @@
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import { paneFocus } from '../lib/panes.svelte'
 
-  let { overview, onchange }: { overview: Overview | null; onchange: () => void } = $props()
+  let { pack, overview, onchange }: { pack: string | null; overview: Overview | null; onchange: () => void } = $props()
 
-  let notes = $state('')
-  let savedNotes = $state('')
-  let diff = $state<ModDiff | null>(null)
+  untrack(() => {
+    if (changesCache.pack === pack) return
+    changesCache.pack = pack
+    changesCache.notes = ''
+    changesCache.savedNotes = ''
+    changesCache.diff = null
+    changesCache.keys = null
+  })
+
+  let notes = $state(changesCache.notes)
+  let savedNotes = $state(changesCache.savedNotes)
+  let diff = $derived(changesCache.diff)
   let diffError: string | null = $state(null)
   let loadingDiff = $state(false)
   let notesError: string | null = $state(null)
-  let keys = $state<{ upload: boolean; modrinth: boolean } | null>(null)
+  let keys = $derived(changesCache.keys)
 
-  onMount(async () => {
-    api.credentialsStatus().then((c) => (keys = { upload: c.upload.present, modrinth: c.modrinth.present }), () => {})
-    notes = savedNotes = await api.getNotes().catch(() => '')
+  $effect(() => {
+    if (changesCache.pack === pack) changesCache.notes = notes
+  })
+
+  onMount(() => {
+    api.credentialsStatus().then(
+      (c) => {
+        if (changesCache.pack === pack) changesCache.keys = { upload: c.upload.present, modrinth: c.modrinth.present }
+      },
+      () => {},
+    )
+    api
+      .getNotes()
+      .catch(() => '')
+      .then((fresh) => {
+        if (changesCache.pack !== pack) return
+        // Keep unsaved typing if you already edited notes before this background read finished.
+        if (notes === savedNotes) notes = fresh
+        savedNotes = fresh
+        changesCache.savedNotes = fresh
+      })
     loadDiff()
   })
 
@@ -82,12 +110,14 @@
   async function loadDiff() {
     loadingDiff = true
     try {
-      diff = (await api.changelogPreview()).diff
+      const fresh = (await api.changelogPreview()).diff
+      if (changesCache.pack !== pack) return
+      if (!changesCache.diff || JSON.stringify(changesCache.diff) !== JSON.stringify(fresh)) changesCache.diff = fresh
       diffError = null
     } catch (error) {
-      diffError = errorText(error)
+      if (changesCache.pack === pack) diffError = errorText(error)
     } finally {
-      loadingDiff = false
+      if (changesCache.pack === pack) loadingDiff = false
     }
   }
 
@@ -137,6 +167,7 @@
     try {
       await api.saveNotes(text)
       savedNotes = text
+      if (changesCache.pack === pack) changesCache.savedNotes = text
       notesError = null
     } catch (error) {
       notesError = `Couldn't save the notes: ${errorText(error)}`

@@ -1,14 +1,17 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
-use serde_json::Value;
+use serde::Deserialize;
 
 use crate::modsync;
 use crate::pack::{CurseforgeFile, Loader};
 
 const CURSEFORGE_INSTANCE: &str = "minecraftinstance.json";
 
+#[derive(Clone)]
 pub struct Instance {
     pub name: Option<String>,
     pub minecraft: Option<String>,
@@ -26,45 +29,126 @@ pub fn is_metadata_file(relative: &str) -> bool {
     relative == CURSEFORGE_INSTANCE
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawInstance {
+    name: Option<String>,
+    game_version: Option<String>,
+    base_mod_loader: Option<RawModLoader>,
+    #[serde(default)]
+    installed_addons: Vec<RawAddon>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawModLoader {
+    name: Option<String>,
+    version_json: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawProfile {
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawAddon {
+    #[serde(rename = "addonID")]
+    addon_id: Option<u64>,
+    file_name_on_disk: Option<String>,
+    installed_file: Option<RawInstalledFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawInstalledFile {
+    id: Option<u64>,
+    file_name_on_disk: Option<String>,
+    file_name: Option<String>,
+    download_url: Option<String>,
+    #[serde(default)]
+    hashes: Vec<RawHash>,
+}
+
+#[derive(Deserialize)]
+struct RawHash {
+    #[serde(rename = "type")]
+    kind: Option<u64>,
+    value: Option<String>,
+}
+
+type FileStamp = (u64, Option<SystemTime>);
+
+struct CachedInstance {
+    stamp: FileStamp,
+    instance: Instance,
+}
+
+static INSTANCE_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedInstance>>> = OnceLock::new();
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
 impl Instance {
     pub fn read(dir: &Path) -> Result<Self> {
-        let instance: Value = std::fs::read_to_string(dir.join(CURSEFORGE_INSTANCE))
+        let path = dir.join(CURSEFORGE_INSTANCE);
+        let stamp = file_stamp(&path).with_context(|| format!("{} is not a CurseForge instance (no {CURSEFORGE_INSTANCE})", dir.display()))?;
+        let cache = INSTANCE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(entry) = cache.lock().unwrap().get(&path)
+            && entry.stamp == stamp
+        {
+            return Ok(entry.instance.clone());
+        }
+        let raw: RawInstance = std::fs::read_to_string(&path)
             .ok()
             .and_then(|t| serde_json::from_str(t.trim_start_matches('\u{feff}')).ok())
             .with_context(|| format!("{} is not a CurseForge instance (no {CURSEFORGE_INSTANCE})", dir.display()))?;
-        let addons = instance.get("installedAddons").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
         let mut installed_names = HashSet::new();
         let mut sources_by_sha1 = HashMap::new();
-        for addon in addons {
-            for name in [addon.get("fileNameOnDisk"), addon.pointer("/installedFile/fileNameOnDisk"), addon.pointer("/installedFile/fileName")].into_iter().flatten().filter_map(Value::as_str) {
+        for addon in &raw.installed_addons {
+            let file = addon.installed_file.as_ref();
+            for name in [
+                addon.file_name_on_disk.as_deref(),
+                file.and_then(|f| f.file_name_on_disk.as_deref()),
+                file.and_then(|f| f.file_name.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 installed_names.insert(name.to_string());
                 installed_names.insert(format!("{name}.disabled"));
             }
-            let installed = &addon["installedFile"];
-            let sha1 = installed["hashes"].as_array().into_iter().flatten().find(|h| h["type"] == 1).and_then(|h| h["value"].as_str());
-            let (Some(sha1), Some(project_id), Some(file_id)) = (sha1, addon["addonID"].as_u64(), installed["id"].as_u64()) else { continue };
-            let url = match installed["downloadUrl"].as_str().filter(|u| !u.is_empty()) {
+            let Some(file) = file else { continue };
+            let sha1 = file.hashes.iter().find(|h| h.kind == Some(1)).and_then(|h| h.value.as_deref());
+            let (Some(sha1), Some(project_id), Some(file_id)) = (sha1, addon.addon_id, file.id) else { continue };
+            let url = match file.download_url.as_deref().filter(|u| !u.is_empty()) {
                 Some(url) => url.to_string(),
-                None => modsync::cdn_url(file_id, installed["fileName"].as_str().unwrap_or_default()),
+                None => modsync::cdn_url(file_id, file.file_name.as_deref().unwrap_or_default()),
             };
             sources_by_sha1.insert(sha1.to_string(), CurseforgeFile { project_id, file_id, url });
         }
-        let loader_name = instance.pointer("/baseModLoader/name").and_then(Value::as_str);
+        let loader_name = raw.base_mod_loader.as_ref().and_then(|l| l.name.as_deref());
         // CurseForge names Fabric loaders fabric-<version>-<minecraft> but installs their profile as
         // fabric-loader-<version>-<minecraft>, so we take the id from the profile CurseForge installed.
-        let profile_id = instance
-            .pointer("/baseModLoader/versionJson")
-            .and_then(Value::as_str)
-            .and_then(|json| serde_json::from_str::<Value>(json).ok())
-            .and_then(|profile| profile.get("id").and_then(Value::as_str).map(String::from));
-        Ok(Self {
-            name: instance.get("name").and_then(Value::as_str).map(String::from),
-            minecraft: instance.get("gameVersion").and_then(Value::as_str).map(String::from),
+        let profile_id = raw
+            .base_mod_loader
+            .as_ref()
+            .and_then(|l| l.version_json.as_deref())
+            .and_then(|json| serde_json::from_str::<RawProfile>(json).ok())
+            .and_then(|profile| profile.id);
+        let parsed = Self {
+            name: raw.name,
+            minecraft: raw.game_version,
             loader: loader_name.and_then(Loader::from_curseforge),
             version_id: profile_id.or(loader_name.map(String::from)),
-            addon_count: addons.len(),
+            addon_count: raw.installed_addons.len(),
             installed_names,
             sources_by_sha1,
-        })
+        };
+        cache.lock().unwrap().insert(path, CachedInstance { stamp, instance: parsed.clone() });
+        Ok(parsed)
     }
 }

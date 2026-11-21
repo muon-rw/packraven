@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -9,7 +11,9 @@ use crate::mod_manifest::{self, ModManifest};
 use crate::pack::{LockEntry, ModKey, Pack};
 use crate::{curseforge, modrinth};
 
-#[derive(Serialize, Deserialize, Default)]
+const MISSING_NAME_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataCache {
     sides: HashMap<String, SideMetadata>,
@@ -22,6 +26,43 @@ pub struct MetadataCache {
     // cache save it when we've read new jars.
     #[serde(skip)]
     read_new_manifests: bool,
+    #[serde(skip)]
+    dirty: bool,
+}
+
+type FileStamp = (u64, Option<SystemTime>);
+
+struct CachedMetadata {
+    stamp: Option<FileStamp>,
+    cache: Arc<MetadataCache>,
+}
+
+static METADATA_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedMetadata>>> = OnceLock::new();
+static MISSING_NAMES: OnceLock<Mutex<HashMap<ModKey, Instant>>> = OnceLock::new();
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()))
+}
+
+fn recently_missing(key: &ModKey) -> bool {
+    let map = MISSING_NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    map.lock().unwrap().get(key).is_some_and(|at| at.elapsed() < MISSING_NAME_TTL)
+}
+
+fn mark_missing<'a>(keys: impl IntoIterator<Item = &'a ModKey>) {
+    let now = Instant::now();
+    let map = MISSING_NAMES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    for key in keys {
+        guard.insert(key.clone(), now);
+    }
+}
+
+fn clear_missing(key: &ModKey) {
+    if let Some(map) = MISSING_NAMES.get() {
+        map.lock().unwrap().remove(key);
+    }
 }
 
 // Bump this when mod_manifest reads something an older read didn't, so we read every jar again.
@@ -121,8 +162,29 @@ impl ModSide {
 }
 
 impl MetadataCache {
+    pub fn load_shared(path: &Path) -> Arc<Self> {
+        let stamp = file_stamp(path);
+        let store = METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(entry) = store.lock().unwrap().get(path)
+            && entry.stamp == stamp
+        {
+            return Arc::clone(&entry.cache);
+        }
+        let parsed: Self = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let shared = Arc::new(parsed);
+        store.lock().unwrap().insert(path.to_path_buf(), CachedMetadata { stamp, cache: Arc::clone(&shared) });
+        shared
+    }
+
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+        let mut copy = (*Self::load_shared(path)).clone();
+        copy.read_new_manifests = false;
+        copy.dirty = false;
+        copy
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// Returns whether we read jars the cache didn't know yet, so it's worth saving.
@@ -135,11 +197,36 @@ impl MetadataCache {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, serde_json::to_string(self)?)?;
+        let mut stored = self.clone();
+        stored.read_new_manifests = false;
+        stored.dirty = false;
+        let stamp = file_stamp(path);
+        let store = METADATA_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        store.lock().unwrap().insert(path.to_path_buf(), CachedMetadata { stamp, cache: Arc::new(stored) });
         Ok(())
     }
 
+    fn needs_name(&self, key: &ModKey) -> bool {
+        if recently_missing(key) {
+            return false;
+        }
+        self.names.get(key).is_none_or(|n| n.authors.is_none() || n.license.is_none() || n.logo.as_deref() == Some(""))
+    }
+
+    pub fn has_all_names(&self, keys: &[ModKey]) -> bool {
+        keys.iter().all(|key| !self.needs_name(key))
+    }
+
+    pub fn has_all_classification(&self, pack: &Pack) -> bool {
+        pack.lock.files.iter().filter(|e| is_server_candidate(e)).all(|entry| {
+            self.sides.contains_key(&entry.sha1)
+                && self.manifests.get(&entry.sha1).is_some_and(|read| read.format == MANIFEST_FORMAT)
+                && entry.key().is_none_or(|key| !self.needs_name(&key))
+        })
+    }
+
     pub async fn ensure_names(&mut self, keys: &[ModKey]) -> Result<()> {
-        let missing: Vec<&ModKey> = keys.iter().filter(|key| self.names.get(key).is_none_or(|n| n.authors.is_none() || n.license.is_none() || n.logo.as_deref() == Some(""))).collect();
+        let missing: Vec<&ModKey> = keys.iter().filter(|key| self.needs_name(key)).collect();
         let from_curseforge: Vec<u64> = missing.iter().filter_map(|key| key.curseforge_id()).collect();
         let from_modrinth: Vec<String> = missing
             .iter()
@@ -149,19 +236,34 @@ impl MetadataCache {
             })
             .collect();
         if !from_curseforge.is_empty() {
-            for (id, m) in curseforge::mods(&from_curseforge).await? {
+            let found = curseforge::mods(&from_curseforge).await?;
+            let unfound: Vec<ModKey> = from_curseforge.iter().filter(|id| !found.contains_key(id)).map(|id| ModKey::Curseforge(*id)).collect();
+            if !unfound.is_empty() {
+                mark_missing(unfound.iter());
+            }
+            for (id, m) in found {
+                let key = ModKey::Curseforge(id);
+                clear_missing(&key);
                 let authors = Some(m.authors.into_iter().map(|a| a.name).collect());
                 let license = Some(m.license_type.unwrap_or_default());
-                self.names.insert(ModKey::Curseforge(id), ProjectName { name: m.name, slug: Some(m.slug), url: m.links.website_url, authors, logo: m.logo.as_ref().and_then(curseforge::CfLogo::url), license });
+                self.names.insert(key, ProjectName { name: m.name, slug: Some(m.slug), url: m.links.website_url, authors, logo: m.logo.as_ref().and_then(curseforge::CfLogo::url), license });
+                self.dirty = true;
             }
         }
         if !from_modrinth.is_empty() {
             let projects = modrinth::projects(&from_modrinth).await?;
+            let unfound: Vec<ModKey> = from_modrinth.iter().filter(|id| !projects.contains_key(id.as_str())).map(|id| ModKey::Modrinth(id.clone())).collect();
+            if !unfound.is_empty() {
+                mark_missing(unfound.iter());
+            }
             let mut authors = modrinth::authors(&projects.values().collect::<Vec<_>>()).await?;
             for (id, project) in projects {
+                let key = ModKey::Modrinth(id.clone());
+                clear_missing(&key);
                 let license = Some(project.license.as_ref().map(modrinth::ProjectLicense::display).unwrap_or_default());
                 let name = ProjectName { url: Some(project.url()), slug: Some(project.slug), authors: Some(authors.remove(&id).unwrap_or_default()), logo: project.icon_url, license, name: project.title };
-                self.names.insert(ModKey::Modrinth(id), name);
+                self.names.insert(key, name);
+                self.dirty = true;
             }
         }
         Ok(())
@@ -177,11 +279,13 @@ impl MetadataCache {
 
     pub fn remember_skew(&mut self, key: String, skew: Option<Skew>) {
         self.skews.insert(key, CheckedSkew { checked_at: unix_now(), format: SKEW_FORMAT, skew });
+        self.dirty = true;
     }
 
     #[cfg(test)]
     pub fn remember(&mut self, key: ModKey, name: ProjectName) {
         self.names.insert(key, name);
+        self.dirty = true;
     }
 
     pub fn known_name(&self, key: &ModKey) -> Option<&ProjectName> {
@@ -205,6 +309,7 @@ impl MetadataCache {
         let Ok(manifest) = mod_manifest::read(&pack_dir.join(&entry.path)) else { return ModManifest::default() };
         self.manifests.insert(entry.sha1.clone(), ReadManifest { format: MANIFEST_FORMAT, manifest: manifest.clone() });
         self.read_new_manifests = true;
+        self.dirty = true;
         manifest
     }
 
@@ -233,6 +338,7 @@ impl MetadataCache {
                     curseforge_tags: entry.curseforge.as_ref().and_then(|f| from_curseforge.get(&f.file_id)).map(|f| f.game_versions.clone()).unwrap_or_default(),
                 },
             );
+            self.dirty = true;
         }
         Ok(())
     }
@@ -253,10 +359,24 @@ pub async fn classify(pack: &Pack, cache: &mut MetadataCache) -> Result<Vec<ModS
 pub fn classify_known(pack: &Pack, cache: &mut MetadataCache) -> Vec<ModSide> {
     let entries: Vec<&LockEntry> = pack.lock.files.iter().filter(|e| is_server_candidate(e)).collect();
     let manifests: Vec<ModManifest> = entries.iter().map(|entry| cache.manifest(&pack.dir, entry)).collect();
+    classify_with_manifests(pack, cache, &entries, &manifests)
+}
+
+/// Classifies purely from entries already present in `cache`, without reading jars from disk.
+pub fn classify_from_cache(pack: &Pack, cache: &MetadataCache) -> Vec<ModSide> {
+    let entries: Vec<&LockEntry> = pack.lock.files.iter().filter(|e| is_server_candidate(e)).collect();
+    let manifests: Vec<ModManifest> = entries
+        .iter()
+        .map(|entry| cache.manifests.get(&entry.sha1).filter(|read| read.format == MANIFEST_FORMAT).map(|read| read.manifest.clone()).unwrap_or_default())
+        .collect();
+    classify_with_manifests(pack, cache, &entries, &manifests)
+}
+
+fn classify_with_manifests(pack: &Pack, cache: &MetadataCache, entries: &[&LockEntry], manifests: &[ModManifest]) -> Vec<ModSide> {
     let config = &pack.config.server;
     let mut result: Vec<ModSide> = entries
         .iter()
-        .zip(&manifests)
+        .zip(manifests)
         .map(|(&entry, manifest)| {
             let metadata = cache.sides.get(&entry.sha1).cloned().unwrap_or_default();
             let (detected, reason) = match detect(&metadata) {
@@ -276,7 +396,7 @@ pub fn classify_known(pack: &Pack, cache: &mut MetadataCache) -> Vec<ModSide> {
             ModSide { path: entry.path.clone(), key: key.map(|k| k.to_string()), name: name.name, url: name.url, side, reason, r#override, required_by: Vec::new() }
         })
         .collect();
-    keep_required_dependencies(&mut result, &manifests);
+    keep_required_dependencies(&mut result, manifests);
     result.sort_by_key(|m| m.name.to_lowercase());
     result
 }
@@ -414,5 +534,31 @@ mod tests {
         let names = ["A", "B", "C", "D", "E"].map(String::from);
         assert_eq!(required_by_text(&names[..3]), "Required by A, B and C, which are needed on the server");
         assert_eq!(required_by_text(&names), "Required by A, B and 3 other server mods");
+    }
+
+    #[test]
+    fn shared_cache_reuses_saved_entries_and_tracks_dirty() {
+        let dir = std::env::temp_dir().join(format!("packraven-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("metadata-cache.json");
+        let mut cache = MetadataCache::default();
+        assert!(!cache.is_dirty());
+        let key = ModKey::Curseforge(12345);
+        cache.remember(
+            key.clone(),
+            ProjectName { name: "Example".into(), slug: Some("example".into()), url: None, authors: Some(vec!["Author".into()]), logo: None, license: Some("MIT".into()) },
+        );
+        assert!(cache.is_dirty());
+        cache.save(&path).unwrap();
+
+        let shared = MetadataCache::load_shared(&path);
+        assert!(shared.has_all_names(std::slice::from_ref(&key)));
+        assert_eq!(shared.known_name(&key).unwrap().name, "Example");
+        let second = MetadataCache::load_shared(&path);
+        assert!(Arc::ptr_eq(&shared, &second));
+
+        let owned = MetadataCache::load(&path);
+        assert!(!owned.is_dirty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

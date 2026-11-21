@@ -1,9 +1,10 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte'
+  import { onMount, tick, untrack } from 'svelte'
   import { SvelteSet } from 'svelte/reactivity'
   import { revealItemInDir } from '@tauri-apps/plugin-opener'
   import { ask } from '@tauri-apps/plugin-dialog'
-  import { api, errorText, type FileChange, type GitCommit, type GitDiff, type GitStatus, type LineAction, type ModConflict, type Prefer, type UntrackPreview } from '../lib/api'
+  import { api, errorText, type FileChange, type GitDiff, type LineAction, type ModConflict, type Prefer, type UntrackPreview } from '../lib/api'
+  import { gitCache, gitDiffCache } from '../lib/gitCache.svelte'
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import { nav, showInFiles } from '../lib/nav.svelte'
   import { confirmDiscard, discardChanges, ignoreItems, stopTracking, untrackItems, untrackLabel, untrackedNotice, type Feedback } from '../lib/gitActions'
@@ -27,7 +28,7 @@
   import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
 
-  let { onchange }: { onchange: () => void } = $props()
+  let { pack, onchange }: { pack: string | null; onchange: () => void } = $props()
 
   type Group = 'staged' | 'unstaged'
   type Layout = 'list' | 'tree'
@@ -35,8 +36,16 @@
 
   const LAYOUT_KEY = 'packraven.gitLayout'
 
-  let status = $state<GitStatus | null>(null)
-  let commits = $state<GitCommit[]>([])
+  untrack(() => {
+    if (gitCache.pack === pack) return
+    gitCache.pack = pack
+    gitCache.status = null
+    gitCache.commits = []
+    gitDiffCache.clear()
+  })
+
+  let status = $derived(gitCache.status)
+  let commits = $derived(gitCache.commits)
   // Selection keys are the group and path, with a trailing slash for folder rows in the tree.
   const keys = new SvelteSet<string>()
   const picker = new RangeSelection(keys)
@@ -78,28 +87,32 @@
   }
 
   // The poll clears only its own error, so a failed stage or commit stays on screen until your next action.
-  let loading: Promise<void> | null = null
+  // Each reload gets a sequence number so a slower poll never overwrites a fresher post-action status.
+  let loadSeq = 0
+  let appliedLoadSeq = 0
+  let activeLoads = 0
 
-  function load() {
-    loading ??= (async () => {
-      try {
-        const result = await api.gitOverview()
-        status = result.status
-        commits = result.commits
-        loadError = null
-        for (const key of [...keys]) if (!changesFor(key).length) keys.delete(key)
-      } catch (e) {
-        loadError = errorText(e)
-      } finally {
-        loading = null
-      }
-    })()
-    return loading
+  async function load() {
+    const seq = ++loadSeq
+    activeLoads++
+    try {
+      const result = await api.gitOverview()
+      if (seq < appliedLoadSeq || gitCache.pack !== pack) return
+      appliedLoadSeq = seq
+      gitCache.status = result.status
+      gitCache.commits = result.commits
+      loadError = null
+      for (const key of [...keys]) if (!changesFor(key).length) keys.delete(key)
+    } catch (e) {
+      if (seq >= appliedLoadSeq && gitCache.pack === pack) loadError = errorText(e)
+    } finally {
+      activeLoads--
+    }
   }
 
   // Each tick we also re-read the open diff, so edits on disk show up without you reselecting the file.
   function poll() {
-    if (document.hidden || loading) return
+    if (document.hidden || activeLoads > 0) return
     load().then(() => selected && loadDiff(selected, false))
   }
 
@@ -172,18 +185,41 @@
 
   // We clear the old diff on a new selection, so the header never sits over another file's changes.
   // A poll that finds the same diff leaves it alone, so the lines you picked stay picked.
+  let diffSeq = 0
+  let appliedDiffSeq = 0
+  // A diff from the cache may be stale, so we only apply picked lines once git confirms it.
+  let diffConfirmed = $state(false)
+
+  function diffCacheKey(current: Selection) {
+    return `${current.staged ? 's' : 'u'}:${current.path}`
+  }
+
+  function applyDiff(current: Selection, next: GitDiff, seq: number) {
+    if (seq < appliedDiffSeq || selected !== current) return
+    appliedDiffSeq = seq
+    if (gitCache.pack === pack) gitDiffCache.set(diffCacheKey(current), next)
+    if (next.text !== diff?.text || next.binary !== diff.binary || next.truncated !== diff.truncated) diff = next
+    diffConfirmed = true
+  }
+
   function loadDiff(current: Selection, fresh: boolean) {
+    const seq = ++diffSeq
     if (fresh) {
-      diff = null
-      diffLoading = true
+      diffConfirmed = false
+      const cached = gitCache.pack === pack ? gitDiffCache.get(diffCacheKey(current)) : undefined
+      if (cached) {
+        diff = cached
+        diffLoading = false
+      } else {
+        diff = null
+        diffLoading = true
+      }
     }
-    api
+    return api
       .gitDiff(current.path, current.staged, current.untracked)
-      .then((d) => {
-        if (selected === current && (d.text !== diff?.text || d.binary !== diff.binary || d.truncated !== diff.truncated)) diff = d
-      })
-      .catch((e) => selected === current && (error = errorText(e)))
-      .finally(() => selected === current && (diffLoading = false))
+      .then((d) => applyDiff(current, d, seq))
+      .catch((e) => seq >= appliedDiffSeq && selected === current && (error = errorText(e)))
+      .finally(() => seq >= appliedDiffSeq && selected === current && (diffLoading = false))
   }
 
   $effect(() => {
@@ -444,6 +480,7 @@
     const current = selected
     const shown = diff
     if (!current || !shown) return false
+    if (!diffConfirmed) throw 'packraven is still checking this diff against the file. Try again in a moment.'
     if (action === 'discard') {
       const count = lines.length
       const confirmed = await ask(
@@ -457,9 +494,20 @@
     } catch (e) {
       throw errorText(e)
     } finally {
-      await load()
+      const seq = ++diffSeq
+      const nextDiff = api.gitDiff(current.path, current.staged, current.untracked).then(
+        (d) => ({ ok: true as const, d }),
+        (e) => ({ ok: false as const, e }),
+      )
+      // Show remaining diff changes as soon as git diff finishes instead of waiting on status;
+      // an empty diff waits for status so a fully reverted file closes without flashing "No content changes".
+      nextDiff.then((res) => {
+        if (res.ok && res.d.text.trim()) applyDiff(current, res.d, seq)
+      })
+      const [res] = await Promise.all([nextDiff, load()])
+      if (res.ok) applyDiff(current, res.d, seq)
+      else if (seq >= appliedDiffSeq && selected === current) error = errorText(res.e)
       onchange()
-      if (selected === current) loadDiff(current, false)
     }
     return true
   }

@@ -3,20 +3,25 @@
   import ServerProperties from '../components/ServerProperties.svelte'
   import ServerStartup from '../components/ServerStartup.svelte'
   import ServerLaunch from '../components/ServerLaunch.svelte'
-  import { onMount, tick } from 'svelte'
+  import { onMount, tick, untrack } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type ModSide, type Overview, type Override, type PackConfig } from '../lib/api'
+  import { listen } from '@tauri-apps/api/event'
+  import { api, errorText, type ModSide, type Overview, type Override } from '../lib/api'
   import { serverPack } from '../lib/jobs.svelte'
   import { trackSave } from '../lib/launch.svelte'
   import { serverView } from '../lib/nav.svelte'
+  import { serverCache, type ServerSettings as Settings } from '../lib/serverCache.svelte'
   import { commandKey, shortcut } from '../lib/platform'
   import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
 
-  let { overview, onfiles }: { overview: Overview | null; onfiles: (path: string) => void } = $props()
+  let { pack, overview, onfiles }: { pack: string | null; overview: Overview | null; onfiles: (path: string) => void } = $props()
 
   type Tab = typeof serverView.tab
-  type Settings = Pick<PackConfig['server'], 'memory' | 'jvm_args' | 'args' | 'graalvm' | 'properties' | 'bundle_mods'>
+
+  const VIRTUAL_THRESHOLD = 60
+  const DEFAULT_ROW_HEIGHT = 64
+  const OVERSCAN = 15
 
   const tabs: [Tab, string][] = [
     ['mods', 'Mods'],
@@ -24,58 +29,96 @@
     ['startup', 'Startup'],
   ]
 
-  let mods: ModSide[] = $state([])
+  // App remounts this view when you switch packs, so we only compare the pack once.
+  untrack(() => {
+    if (serverCache.pack === pack) return
+    serverCache.pack = pack
+    serverCache.mods = null
+    serverCache.settings = null
+    serverCache.testPort = 25565
+    serverCache.icon = null
+    serverCache.launch = null
+  })
+
+  let mods = $derived(serverCache.mods ?? [])
   let loadError: string | null = $state(null)
-  let loading = $state(true)
+  let loading = $state(serverCache.mods === null)
   let search = $state('')
   // Names the other mods an override flipped, so a reload doesn't change rows behind your back.
   let changeNote = $state('')
   // The row you just changed stays in view until you pick another filter, so it doesn't vanish under your cursor.
   let pinned = $state<string | null>(null)
 
+  function sameModSides(a: ModSide[] | null, b: ModSide[]): boolean {
+    if (!a || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i]
+      const y = b[i]
+      if (x.path !== y.path || x.key !== y.key || x.name !== y.name || x.url !== y.url || x.side !== y.side || x.reason !== y.reason || x.override !== y.override || x.requiredBy.length !== y.requiredBy.length) return false
+      for (let j = 0; j < x.requiredBy.length; j++) if (x.requiredBy[j] !== y.requiredBy[j]) return false
+    }
+    return true
+  }
+
   // Quick override changes each start a reload, so we only take the latest one's result.
   let loads = 0
   async function load() {
     const id = ++loads
-    loading = true
+    if (serverCache.mods === null) loading = true
     try {
       const fresh = await api.serverSides()
-      if (id !== loads) return
-      mods = fresh
+      if (id !== loads || serverCache.pack !== pack) return
+      if (!sameModSides(serverCache.mods, fresh)) serverCache.mods = fresh
       loadError = null
     } catch (error) {
-      if (id === loads) loadError = `Couldn't read mod sides: ${errorText(error)}`
+      if (id === loads && serverCache.pack === pack) loadError = `Couldn't read mod sides: ${errorText(error)}`
     } finally {
-      if (id === loads) loading = false
+      if (id === loads && serverCache.pack === pack) loading = false
     }
   }
 
-  let settings = $state<Settings | null>(null)
+  let settings = $derived(serverCache.settings)
   let settingsError = $state<string | null>(null)
-  let testPort = $state(25565)
-  let icon = $state<string | null>(null)
-  let launch = $state<{ windows: string; unix: string } | null>(null)
   let saveState = $state<'idle' | 'saving' | 'saved' | 'failed'>('idle')
   let savedCount = $state(0)
   let saveError = $state('')
+  let settingsEditSeq = 0
+  let iconEditSeq = 0
 
   async function loadSettings() {
-    try {
-      const config = await api.getPackConfig()
-      const { memory, jvm_args, args, graalvm, properties, bundle_mods } = config.server
-      settings = { memory, jvm_args, args, graalvm, properties, bundle_mods }
-      testPort = config.test.port
+    const editSeq = settingsEditSeq
+    const iconSeq = iconEditSeq
+    const [configResult, iconResult, launchResult] = await Promise.all([
+      api.getPackConfig().then(
+        (config) => ({ ok: true as const, config }),
+        (error) => ({ ok: false as const, error }),
+      ),
+      api.getServerIcon().catch(() => null),
+      api.serverLaunch().catch(() => null),
+    ])
+    if (serverCache.pack !== pack) return
+    if (configResult.ok) {
+      if (settingsEditSeq === editSeq) {
+        const { memory, jvm_args, args, graalvm, properties, bundle_mods } = configResult.config.server
+        const next: Settings = { memory, jvm_args, args, graalvm, properties, bundle_mods }
+        if (!serverCache.settings || JSON.stringify(serverCache.settings) !== JSON.stringify(next)) serverCache.settings = next
+      }
+      serverCache.testPort = configResult.config.test.port
       settingsError = null
-    } catch (error) {
-      settingsError = `Couldn't read packraven.toml: ${errorText(error)}`
+    } else {
+      settingsError = `Couldn't read packraven.toml: ${errorText(configResult.error)}`
     }
-    icon = await api.getServerIcon().catch(() => null)
-    launch = await api.serverLaunch().catch(() => null)
+    if (iconEditSeq === iconSeq && serverCache.icon !== iconResult) serverCache.icon = iconResult
+    if (serverCache.launch?.windows !== launchResult?.windows || serverCache.launch?.unix !== launchResult?.unix) serverCache.launch = launchResult
   }
 
   onMount(() => {
     load()
     loadSettings()
+    const unlisten = listen('mod-list-changed', () => load())
+    return () => {
+      unlisten.then((stop) => stop())
+    }
   })
 
   function markChanged() {
@@ -88,6 +131,7 @@
   let saving = Promise.resolve()
   function saveSettings(changes: Partial<Settings>) {
     if (!settings) return
+    settingsEditSeq++
     Object.assign(settings, changes)
     saveState = 'saving'
     saving = trackSave(saving.then(async () => {
@@ -136,7 +180,10 @@
   async function keepFromNotice(mod: ModSide) {
     await setOverride(mod, 'keep')
     await tick()
-    document.querySelector<HTMLSelectElement>(`select[data-path="${CSS.escape(mod.path)}"]`)?.focus()
+    await revealRow(mod.path)
+    const select = document.querySelector<HTMLSelectElement>(`select[data-path="${CSS.escape(mod.path)}"]`)
+    if (select) select.focus()
+    else tableRegion?.focus()
   }
 
   function list(names: string[]) {
@@ -161,13 +208,150 @@
   const breaksServer = (m: ModSide) => m.side === 'client' && m.requiredBy.length > 0
   let conflicts = $derived(mods.filter(breaksServer))
   let excludedCount = $derived(mods.filter((m) => m.side === 'client').length)
+  let searchQuery = $derived(search.trim().toLowerCase())
   // A crash log names the jar more often than the project, so search matches both.
-  let matching = $derived(mods.filter((m) => !search || [m.name, m.path].some((text) => text.toLowerCase().includes(search.toLowerCase()))))
+  let matching = $derived(searchQuery ? mods.filter((m) => m.name.toLowerCase().includes(searchQuery) || m.path.toLowerCase().includes(searchQuery)) : mods)
   let visible = $derived(
     matching
       .filter((m) => m.path === pinned || (serverView.filter === 'excluded' ? m.side === 'client' : serverView.filter === 'overridden' ? m.override !== 'auto' : true))
       .sort((a, b) => Number(breaksServer(b)) - Number(breaksServer(a))),
   )
+
+  let tableRegion = $state<HTMLElement>()
+  let tbodyEl = $state<HTMLTableSectionElement>()
+  let hasServerOnly = $derived(visible.some((m) => m.side === 'server'))
+  let viewTop = $state(0)
+  let viewBottom = $state(900)
+  const rowHeights = new Map<string, number>()
+
+  let virtualized = $derived(visible.length > VIRTUAL_THRESHOLD)
+
+  function rowSpan(mod: ModSide) {
+    return rowHeights.get(mod.path) ?? DEFAULT_ROW_HEIGHT
+  }
+
+  let windowSlice = $derived.by(() => {
+    if (!virtualized) return { start: 0, end: visible.length, topPad: 0, bottomPad: 0 }
+    const n = visible.length
+    let start = 0
+    let y = 0
+    const topEdge = Math.max(0, viewTop)
+    while (start < n) {
+      const h = rowSpan(visible[start])
+      if (y + h > topEdge) break
+      y += h
+      start++
+    }
+    const sliceStart = Math.max(0, start - OVERSCAN)
+    let topPad = 0
+    for (let i = 0; i < sliceStart; i++) topPad += rowSpan(visible[i])
+    let end = start
+    let bottomY = y
+    while (end < n && bottomY < viewBottom) {
+      bottomY += rowSpan(visible[end])
+      end++
+    }
+    const sliceEnd = Math.min(n, end + OVERSCAN)
+    let bottomPad = 0
+    for (let i = sliceEnd; i < n; i++) bottomPad += rowSpan(visible[i])
+    return { start: sliceStart, end: sliceEnd, topPad, bottomPad }
+  })
+
+  let rendered = $derived(virtualized ? visible.slice(windowSlice.start, windowSlice.end) : visible)
+
+  function activeScroller(): HTMLElement | null {
+    if (!tableRegion) return null
+    if (window.matchMedia('(max-height: 700px)').matches) return tableRegion.closest<HTMLElement>('.view')
+    const overflowY = getComputedStyle(tableRegion).overflowY
+    if (overflowY === 'auto' || overflowY === 'scroll') return tableRegion
+    return tableRegion.closest<HTMLElement>('.view')
+  }
+
+  function measureViewport() {
+    if (!tbodyEl) return
+    const scroller = activeScroller()
+    if (!scroller) return
+    const scrollerRect = scroller.getBoundingClientRect()
+    const tbodyTop = tbodyEl.getBoundingClientRect().top
+    const nextTop = Math.max(0, scrollerRect.top - tbodyTop)
+    const nextBottom = Math.max(nextTop + 400, scrollerRect.bottom - tbodyTop)
+    if (Math.abs(nextTop - viewTop) > 16 || Math.abs(nextBottom - viewBottom) > 16) {
+      viewTop = nextTop
+      viewBottom = nextBottom
+    }
+  }
+
+  async function revealRow(path: string) {
+    if (!virtualized || !tbodyEl) return
+    const index = visible.findIndex((m) => m.path === path)
+    if (index < 0 || (index >= windowSlice.start && index < windowSlice.end)) return
+    const scroller = activeScroller()
+    if (!scroller) return
+    let y = 0
+    for (let i = 0; i < index; i++) y += rowSpan(visible[i])
+    const tbodyOffset = tbodyEl.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop
+    scroller.scrollTop = Math.max(0, tbodyOffset + y - scroller.clientHeight / 3)
+    measureViewport()
+    await tick()
+  }
+
+  $effect(() => {
+    const region = tableRegion
+    if (!region) {
+      viewTop = 0
+      viewBottom = 900
+      return
+    }
+    const outer = region.closest<HTMLElement>('.view')
+    let lastWidth = region.clientWidth
+    let raf = 0
+    const schedule = () => {
+      if (raf) return
+      raf = requestAnimationFrame(() => {
+        raf = 0
+        measureViewport()
+      })
+    }
+    measureViewport()
+    region.addEventListener('scroll', schedule, { passive: true })
+    outer?.addEventListener('scroll', schedule, { passive: true })
+    const observer = new ResizeObserver(() => {
+      if (region.clientWidth !== lastWidth) {
+        lastWidth = region.clientWidth
+        rowHeights.clear()
+      }
+      schedule()
+    })
+    observer.observe(region)
+    if (outer) observer.observe(outer)
+    return () => {
+      if (raf) cancelAnimationFrame(raf)
+      region.removeEventListener('scroll', schedule)
+      outer?.removeEventListener('scroll', schedule)
+      observer.disconnect()
+    }
+  })
+
+  let prevFilterKey = ''
+  $effect(() => {
+    const key = `${serverView.filter}\0${searchQuery}`
+    if (prevFilterKey && prevFilterKey !== key) {
+      const scroller = activeScroller()
+      if (scroller) scroller.scrollTop = 0
+      viewTop = 0
+      viewBottom = Math.max(scroller?.clientHeight ?? 900, 600)
+    }
+    prevFilterKey = key
+  })
+
+  $effect(() => {
+    if (!virtualized || !tbodyEl) return
+    void rendered
+    for (const el of tbodyEl.querySelectorAll<HTMLTableRowElement>('tr[data-path]')) {
+      const path = el.dataset.path
+      if (path) rowHeights.set(path, el.offsetHeight)
+    }
+  })
 
   let searchField = $state<HTMLInputElement>()
 
@@ -243,11 +427,11 @@
         packName={overview?.name ?? 'This pack'}
         version={overview?.version ?? null}
         minecraft={overview?.minecraft ?? null}
-        bind:icon
+        bind:icon={serverCache.icon}
         hasProject={!!overview?.projectId}
-        {testPort}
+        testPort={serverCache.testPort}
         onchange={(properties) => saveSettings({ properties })}
-        oniconchange={markChanged}
+        oniconchange={() => { iconEditSeq++; markChanged() }}
       />
     {:else if settings}
       <ServerStartup
@@ -258,8 +442,8 @@
         bundleMods={settings.bundle_mods}
         {savedCount}
         minecraft={overview?.minecraft ?? null}
-        {launch}
-        {testPort}
+        launch={serverCache.launch}
+        testPort={serverCache.testPort}
         onchange={saveSettings}
         {onfiles}
       />
@@ -299,12 +483,12 @@
   {/snippet}
 
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
-  <div class="table" role="region" aria-label="Mods" tabindex="0">
-    <table aria-busy={loading && !mods.length}>
+  <div class="table" role="region" aria-label="Mods" tabindex="0" bind:this={tableRegion}>
+    <table class:has-server-only={hasServerOnly} aria-busy={loading && !mods.length} aria-rowcount={virtualized ? visible.length + 1 : undefined}>
       <thead>
-        <tr><th>Mod</th><th class="side">Server</th><th class="why">Why</th><th>Override</th></tr>
+        <tr aria-rowindex={virtualized ? 1 : undefined}><th>Mod</th><th class="side">Server</th><th class="why">Why</th><th class="override">Override</th></tr>
       </thead>
-      <tbody>
+      <tbody bind:this={tbodyEl}>
         {#if loading && !mods.length}
           {#each { length: 8 } as _, row (row)}
             <tr class="skeleton" aria-hidden="true">
@@ -315,8 +499,11 @@
             </tr>
           {/each}
         {:else}
-          {#each visible as mod (mod.path)}
-            <tr>
+          {#if windowSlice.topPad > 0}
+            <tr class="spacer" aria-hidden="true"><td colspan="4" style:height="{windowSlice.topPad}px"></td></tr>
+          {/if}
+          {#each rendered as mod, rowOffset (mod.path)}
+            <tr data-path={mod.path} aria-rowindex={virtualized ? windowSlice.start + rowOffset + 2 : undefined}>
               <td>
                 {#if mod.url}<a href={mod.url} onclick={(e) => { e.preventDefault(); openUrl(mod.url!) }}>{mod.name}</a>{:else}{mod.name}{/if}
                 <div class="file muted">{mod.path.slice(5)}</div>
@@ -357,6 +544,9 @@
               </td>
             </tr>
           {/each}
+          {#if windowSlice.bottomPad > 0}
+            <tr class="spacer" aria-hidden="true"><td colspan="4" style:height="{windowSlice.bottomPad}px"></td></tr>
+          {/if}
         {/if}
       </tbody>
     </table>
@@ -537,11 +727,18 @@
   table {
     width: 100%;
     border-collapse: collapse;
+    table-layout: fixed;
+  }
+
+  .spacer td {
+    padding: 0;
+    border: 0;
   }
 
   th {
     position: sticky;
     top: 0;
+    z-index: 1;
     text-align: left;
     font-size: var(--step--1);
     color: var(--muted);
@@ -550,10 +747,34 @@
     padding: 8px 12px;
   }
 
+  th.side {
+    width: 104px;
+  }
+
+  table.has-server-only th.side {
+    width: 168px;
+  }
+
+  th.why {
+    width: 25%;
+  }
+
+  th.override {
+    width: 156px;
+  }
+
+  td select {
+    max-width: 100%;
+  }
+
   td {
     padding: 8px 12px;
     border-top: 1px solid var(--line);
     vertical-align: top;
+  }
+
+  td:first-child {
+    overflow-wrap: anywhere;
   }
 
   td a {
@@ -571,7 +792,7 @@
   }
 
   /* A narrow table, such as half of a split, folds Server and Why under each mod so Override keeps its room. */
-  @container (max-width: 560px) {
+  @container (max-width: 640px) {
     .side,
     .why {
       display: none;
@@ -579,6 +800,46 @@
 
     .folded {
       display: block;
+    }
+  }
+
+  @container (max-width: 700px) {
+    table.has-server-only .side,
+    table.has-server-only .why {
+      display: none;
+    }
+
+    table.has-server-only .folded {
+      display: block;
+    }
+  }
+
+  @media (max-height: 700px) {
+    .server,
+    .panel {
+      flex: none;
+    }
+
+    .table {
+      flex: none;
+      min-height: 0;
+      overflow: visible;
+    }
+
+    .panel {
+      gap: 28px;
+    }
+
+    th {
+      box-shadow: 0 -28px 0 1px var(--paper);
+    }
+
+    th:first-child {
+      border-top-left-radius: var(--radius-panel);
+    }
+
+    th:last-child {
+      border-top-right-radius: var(--radius-panel);
     }
   }
 

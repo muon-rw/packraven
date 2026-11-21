@@ -8,9 +8,9 @@
   import { ask } from '@tauri-apps/plugin-dialog'
   import { listen } from '@tauri-apps/api/event'
   import { revealItemInDir } from '@tauri-apps/plugin-opener'
-  import { api, errorText, type GitStatus } from '../lib/api'
+  import { api, errorText } from '../lib/api'
   import { drag } from '../lib/drag.svelte'
-  import { workspace, activeTab, open, pin, save, close, reload, resetFor, bindView, fs, useDiskVersion, keepMine, canReopen, reopenClosed, showSource, openSimplified, type Tab } from '../lib/workspace.svelte'
+  import { workspace, activeTab, open, pin, save, close, reload, resetFor, bindView, fs, treeUi, useDiskVersion, keepMine, canReopen, reopenClosed, showSource, openSimplified, type Tab } from '../lib/workspace.svelte'
   import { commandKey, fileManager, isWindows, shortcut, trashName } from '../lib/platform'
   import { nav } from '../lib/nav.svelte'
   import FileTree from '../components/FileTree.svelte'
@@ -42,7 +42,7 @@
   let host: HTMLDivElement = $state()!
   let view: EditorView | null = null
   let tree: FileTree = $state()!
-  let status = $state<GitStatus | null>(null)
+  let status = $derived(treeUi.status)
   let openError = $state<string | null>(null)
   // A single click in the tree previews a file but leaves focus in the tree, as in VS Code, so
   // tree shortcuts like Ctrl+C keep working. Opening a file to keep moves focus to the editor.
@@ -72,9 +72,9 @@
     }
     loadingChanges = true
     try {
-      status = await api.gitStatus()
+      treeUi.status = await api.gitStatus()
     } catch {
-      status = null
+      treeUi.status = null
     } finally {
       loadingChanges = false
       if (changesQueued) {

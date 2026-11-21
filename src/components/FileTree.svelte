@@ -1,10 +1,10 @@
 <script lang="ts">
-  import { SvelteMap, SvelteSet } from 'svelte/reactivity'
+  import { SvelteSet } from 'svelte/reactivity'
   import { onMount, tick, untrack } from 'svelte'
   import { revealItemInDir } from '@tauri-apps/plugin-opener'
   import { getCurrentWebview, type DragDropEvent } from '@tauri-apps/api/webview'
   import { api, errorText, type DirEntry, type GitStatus, type PackKind, type Pasted } from '../lib/api'
-  import { fs, moved, onDiskChange } from '../lib/workspace.svelte'
+  import { fs, moved, onDiskChange, treeState, treeUi } from '../lib/workspace.svelte'
   import { drag } from '../lib/drag.svelte'
   import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
@@ -48,10 +48,13 @@
   const MAX_EXPAND_ALL = 200
   const JUMP_RESET = 900
 
-  const children = new SvelteMap<string, DirEntry[]>()
-  const expanded = new SvelteSet<string>()
+  const children = treeState.children
+  const expanded = treeState.expanded
   const loading = new SvelteSet<string>()
-  let focused = $state<string | null>(null)
+  let focused = $state<string | null>(treeUi.focused)
+  $effect(() => {
+    treeUi.focused = focused
+  })
   const picker = new RangeSelection(untrack(() => selection))
   let loadError = $state<string | null>(null)
   let message = $state<{ text: string; tone: 'fail' | 'note' } | null>(null)
@@ -75,11 +78,21 @@
   type Row = { entry: DirEntry; depth: number; parent: string }
   type DraftLine = { draft: true; depth: number }
 
+  function sameEntries(a: DirEntry[] | undefined, b: DirEntry[]): boolean {
+    if (!a || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i++) {
+      const x = a[i]
+      const y = b[i]
+      if (x.path !== y.path || x.name !== y.name || x.isDir !== y.isDir || x.size !== y.size || x.ignored !== y.ignored || x.archive !== y.archive || x.archived !== y.archived) return false
+    }
+    return true
+  }
+
   async function load(dir: string) {
     loading.add(dir)
     try {
       const entries = await api.listDir(dir)
-      children.set(dir, entries)
+      if (!sameEntries(children.get(dir), entries)) children.set(dir, entries)
       const present = new Set(entries.map((e) => e.path))
       for (const path of selection) if (parentOf(path) === dir && !present.has(path)) selection.delete(path)
       loadError = null
@@ -140,6 +153,10 @@
     const visible = rows.map((r) => r.entry.path).filter((p) => selection.has(p))
     return visible.filter((p) => !visible.some((other) => p.startsWith(`${other}/`)))
   }
+
+  onMount(() => {
+    if (children.has('')) refresh()
+  })
 
   $effect(() => {
     if (!children.has('')) load('')

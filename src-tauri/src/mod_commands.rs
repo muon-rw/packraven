@@ -28,9 +28,17 @@ fn client_running(state: &AppState) -> bool {
 pub async fn installed_mods(state: State<'_, AppState>) -> CmdResult<InstalledMods> {
     let mut pack = state.pack().map_err(err)?;
     sync_locks(&state, &mut pack).map_err(err)?;
-    let mut cache = MetadataCache::load(&state.cache_path());
+    let cache_path = state.cache_path();
+    let shared = MetadataCache::load_shared(&cache_path);
+    let keys: Vec<_> = pack.lock.files.iter().filter_map(crate::pack::LockEntry::key).collect();
+    if shared.has_all_names(&keys) {
+        return Ok(mod_updates::installed_from_cache(&pack, &shared));
+    }
+    let mut cache = (*shared).clone();
     let mods = mod_updates::installed(&pack, &mut cache).await;
-    cache.save(&state.cache_path()).map_err(err)?;
+    if cache.is_dirty() {
+        cache.save(&cache_path).map_err(err)?;
+    }
     Ok(mods)
 }
 
@@ -108,7 +116,7 @@ pub async fn preview_mods(state: State<'_, AppState>, requests: Vec<ModRequest>)
 }
 
 fn sync_locks(state: &AppState, pack: &mut Pack) -> anyhow::Result<()> {
-    crate::instance_locks::sync(pack, &state.curseforge_locks_path(), &crate::instance_locks::CurseForgeApp::detect())
+    crate::instance_locks::sync_with(pack, &state.curseforge_locks_path(), crate::instance_locks::CurseForgeApp::detect)
 }
 
 #[tauri::command(async)]
@@ -186,7 +194,7 @@ pub fn change_mods(app: AppHandle, state: State<'_, AppState>, requests: Vec<Mod
         return Err(CLIENT_HAS_MODS_OPEN.into());
     }
     let pack = state.pack().map_err(err)?;
-    let cache = MetadataCache::load(&state.cache_path());
+    let cache = MetadataCache::load_shared(&state.cache_path());
     let updated: Vec<String> = requests
         .iter()
         .filter_map(|r| r.replaces.as_deref())

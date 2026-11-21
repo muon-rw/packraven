@@ -1,7 +1,7 @@
 <script lang="ts">
   import { loaderName } from './lib/loader'
   import Notice from './components/Notice.svelte'
-  import { onMount, tick } from 'svelte'
+  import { onMount, tick, type Component } from 'svelte'
   import { listen } from '@tauri-apps/api/event'
   import { api, errorText, type Overview, type PackList, type Platform } from './lib/api'
   import { minecraft, refreshAccounts } from './lib/minecraft.svelte'
@@ -19,7 +19,17 @@
   import { BACK_PRIORITY, hasOpenModal, runBack, useBack } from './lib/back.svelte'
   import Releases from './views/Releases.svelte'
   import PackSettings from './views/PackSettings.svelte'
-  const loadFiles = () => import('./views/Files.svelte')
+  let FilesComponent = $state<Component<{ pack: string | null }> | null>(null)
+  let filesImport: Promise<void> | null = null
+  function ensureFiles() {
+    if (FilesComponent || filesImport) return
+    filesImport = import('./views/Files.svelte').then(({ default: Files }) => {
+      FilesComponent = Files
+    })
+  }
+  $effect(() => {
+    if (layout.panes.includes('files')) ensureFiles()
+  })
   import { dirtyCount, startWatching } from './lib/workspace.svelte'
   import { refreshSelfUpdate, selfUpdate, startSelfUpdates, updateWaiting } from './lib/selfUpdate.svelte'
   import DefenderNotice from './components/DefenderNotice.svelte'
@@ -77,8 +87,12 @@
   const REFRESH_GAP_MS = 5_000
   let refreshing = false
   let queued = false
+  let queuedImmediate = false
   let lastRefresh = 0
   let pending: ReturnType<typeof setTimeout> | null = null
+  // A refresh asked for mid-refresh resolves once the follow-up refresh finishes, since the one
+  // already running may have read the overview before the caller's change.
+  let followUp: { promise: Promise<void>; resolve: () => void; reject: (error: unknown) => void } | null = null
 
   // We skip while the window is hidden in the tray and catch up when it's shown again.
   function poll() {
@@ -95,18 +109,44 @@
     )
   }
 
-  async function refresh() {
+  function refresh() {
+    if (pending) {
+      clearTimeout(pending)
+      pending = null
+    }
+    if (refreshing) {
+      queued = true
+      queuedImmediate = true
+      if (!followUp) {
+        let resolve!: () => void
+        let reject!: (error: unknown) => void
+        const promise = new Promise<void>((res, rej) => {
+          resolve = res
+          reject = rej
+        })
+        followUp = { promise, resolve, reject }
+      }
+      return followUp.promise
+    }
     refreshing = true
     lastRefresh = Date.now()
-    try {
-      await Promise.all([load(), refreshSelfUpdate()])
-    } finally {
-      refreshing = false
-      if (queued) {
-        queued = false
-        poll()
+    return (async () => {
+      try {
+        await Promise.all([load(), refreshSelfUpdate()])
+      } finally {
+        refreshing = false
+        if (queuedImmediate) {
+          queued = false
+          queuedImmediate = false
+          const waiting = followUp
+          followUp = null
+          refresh().then(waiting?.resolve, waiting?.reject)
+        } else if (queued) {
+          queued = false
+          poll()
+        }
       }
-    }
+    })()
   }
 
   let resyncing = false
@@ -932,21 +972,21 @@
     {#if loadError && !OPEN_WITHOUT_PACK.includes(pane)}
       {@render loadNotice(index)}
     {:else if pane === 'changes'}
-      <Changes {overview} onchange={refresh} />
+      <Changes pack={packs?.active ?? null} {overview} onchange={refresh} />
     {:else if pane === 'mods'}
       <Mods pack={packs?.active ?? null} {publishesTo} game={overview ? `${overview.minecraft} ${loaderName(overview.loader).split(' ')[0]}` : 'this pack'} minecraft={overview?.minecraft ?? null} loader={overview?.loader ?? null} clientRunning={!!overview?.clientRunning} ontest={() => showFrom('test', index)} />
     {:else if pane === 'server'}
-      <Server {overview} onfiles={(path) => openFileBesideIfRoom(path, index)} />
+      <Server pack={packs?.active ?? null} {overview} onfiles={(path) => openFileBesideIfRoom(path, index)} />
     {:else if pane === 'test'}
       <TestRun {overview} onserver={() => showFrom('server', index)} onappsettings={() => showFromWithAnchor('settings', index)} onpacksettings={() => showFromWithAnchor('pack', index)} />
     {:else if pane === 'files'}
       {#if loadError}<div class="banner">{@render loadNotice(index)}</div>{/if}
-      {#await loadFiles() then { default: Files }}
-        <Files pack={packs?.active ?? null} />
-      {/await}
+      {#if FilesComponent}
+        <FilesComponent pack={packs?.active ?? null} />
+      {/if}
     {:else if pane === 'git'}
       {#if loadError}<div class="banner">{@render loadNotice(index)}</div>{/if}
-      <Git onchange={refresh} />
+      <Git pack={packs?.active ?? null} onchange={refresh} />
     {:else if pane === 'publish'}
       <Publish {overview} onchange={refresh} onchanges={() => showFrom('changes', index)} onsettings={() => showFromWithAnchor('pack', index)} onreleases={() => showFrom('releases', index)} onrun={() => openBesideIfRoom('test', index)} onappsettings={() => showFromWithAnchor('settings', index)} onserver={() => showFrom('server', index)} />
     {:else if pane === 'releases'}

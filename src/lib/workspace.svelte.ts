@@ -1,7 +1,8 @@
 import type { EditorState, TransactionSpec } from '@codemirror/state'
+import { SvelteMap, SvelteSet } from 'svelte/reactivity'
 import type { Problems } from './editor'
 import { listen } from '@tauri-apps/api/event'
-import { api, type FileContent } from './api'
+import { api, type DirEntry, type FileContent, type GitStatus } from './api'
 import { resetProbejs } from './probejs.svelte'
 import { resetKubejsContext } from './kubejsContext'
 import { isGzip, isLog, outerArchive } from './viewers'
@@ -30,6 +31,14 @@ export const workspace = $state({ tabs: [] as Tab[], active: null as string | nu
 
 export const fs = $state({ seq: 0, dirs: [] as string[] })
 
+// We keep the file tree's loaded folders and expanded state for the active pack, so switching
+// back to Files shows the tree right away while refreshing in the background.
+export const treeState = {
+  children: new SvelteMap<string, DirEntry[]>(),
+  expanded: new SvelteSet<string>(),
+}
+export const treeUi = $state({ focused: null as string | null, status: null as GitStatus | null })
+
 const MAX_CLOSED = 20
 const closed: string[] = []
 
@@ -50,6 +59,10 @@ export function resetFor(pack: string | null) {
   workspace.tabs = []
   workspace.active = null
   closed.length = 0
+  treeState.children.clear()
+  treeState.expanded.clear()
+  treeUi.focused = null
+  treeUi.status = null
   resetProbejs()
   resetKubejsContext()
 }

@@ -2,6 +2,10 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1]
+### Added
+- Performance improvements. Various pages (notably Mods, Files) now load more quickly, especially after the first time you open them.
+
 ## [0.6.0] - 2026-11-20
 ### Added
 - Native KubeJS and ProbeJS support:

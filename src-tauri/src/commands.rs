@@ -203,20 +203,19 @@ fn earlier_choice(pack: &Pack, platform: Platform, path: &str, any_version: Opti
     earlier(shipped, OverrideChoice::Ship).or_else(|| earlier(kept_off, OverrideChoice::LeaveOut))
 }
 
-// We build the overview after every file, git and job change, so we only read the caches when
+// We build the overview after every file, git and job change, so we only read the allowlist when
 // there's a file to describe.
-fn override_candidates(pack: &Pack, state: &AppState, platform: Platform) -> Vec<OverrideCandidate> {
+fn override_candidates(pack: &Pack, state: &AppState, cache: &MetadataCache, platform: Platform) -> Vec<OverrideCandidate> {
     if !pack.config.targets(platform) {
         return Vec::new();
     }
-    let cache = MetadataCache::load(&state.cache_path());
-    let paths = export::not_on(pack, &cache, platform).unwrap_or_default();
+    let paths = export::not_on(pack, cache, platform).unwrap_or_default();
     let allowlist = if platform == Platform::Curseforge && !paths.is_empty() { Allowlist::load(&state.allowlist_path()) } else { Allowlist::default() };
     paths
         .into_iter()
         .map(|path| {
             let entry = pack.lock.files.iter().find(|e| e.path == path);
-            let project = export::project_of(pack, &cache, &path);
+            let project = export::project_of(pack, cache, &path);
             let license = project.and_then(|p| p.license.clone()).filter(|l| !l.is_empty());
             let authors = project.and_then(|p| p.authors.clone()).unwrap_or_default();
             let skew = entry.filter(|e| platform == Platform::Modrinth && e.curseforge.is_some()).map(|e| cache.skew(&publish::skew_key(pack, e)));
@@ -297,8 +296,18 @@ pub fn overview(state: State<'_, AppState>) -> CmdResult<Overview> {
     let pack = state.pack().map_err(err)?;
     let mod_list = state.mod_list.lock().unwrap().clone();
     let mod_list = if crate::setup::same_dir(&mod_list.dir, &pack.dir) { mod_list } else { Default::default() };
-    let (ahead, behind) = git::ahead_behind(&pack.dir).unwrap_or((0, 0));
-    let last_tag = git::last_release_tag(&pack.dir);
+    let pack_data = state.pack_data();
+    let ((ahead, behind), last_tag, branch, changed) = std::thread::scope(|scope| {
+        let ab = scope.spawn(|| git::ahead_behind(&pack.dir).unwrap_or((0, 0)));
+        let tag = scope.spawn(|| git::last_release_tag(&pack.dir));
+        let branch = scope.spawn(|| git::branch(&pack.dir));
+        let changed = scope.spawn(|| git::changed_files(&pack.dir));
+        (ab.join().unwrap_or((0, 0)), tag.join().unwrap_or(None), branch.join().unwrap_or(None), changed.join().unwrap_or_default())
+    });
+    let cache = (pack.config.targets_curseforge() || pack.config.targets_modrinth()).then(|| MetadataCache::load_shared(&state.cache_path()));
+    let empty_cache = MetadataCache::default();
+    let cache = cache.as_deref().unwrap_or(&empty_cache);
+    let releases = publish::load_releases(&pack_data.join("releases.json"));
     Ok(Overview {
         name: pack.name(),
         version: pack.version(),
@@ -310,23 +319,23 @@ pub fn overview(state: State<'_, AppState>) -> CmdResult<Overview> {
         lock_count: pack.lock.files.len(),
         addons: addon_counts(&pack),
         unhosted: mod_list.unhosted,
-        not_on_curseforge: override_candidates(&pack, &state, Platform::Curseforge),
-        not_on_modrinth: override_candidates(&pack, &state, Platform::Modrinth),
+        not_on_curseforge: override_candidates(&pack, &state, cache, Platform::Curseforge),
+        not_on_modrinth: override_candidates(&pack, &state, cache, Platform::Modrinth),
         releases_missing_modrinth: if pack.config.targets_modrinth() {
-            publish::load_releases(&state.pack_data().join("releases.json")).iter().filter(|r| publish::awaiting_modrinth(&pack, &state.pack_data(), r).is_some()).count()
+            releases.iter().filter(|r| publish::awaiting_modrinth(&pack, &pack_data, r).is_some()).count()
         } else {
             0
         },
-        releases_missing_server_pack: publish::load_releases(&state.pack_data().join("releases.json")).iter().filter(|r| r.curseforge.as_ref().is_some_and(|c| c.awaits_server_pack())).count(),
+        releases_missing_server_pack: releases.iter().filter(|r| r.curseforge.as_ref().is_some_and(|c| c.awaits_server_pack())).count(),
         modrinth_error: mod_list.modrinth_error.filter(|_| pack.config.targets_modrinth()),
         mod_list_error: mod_list.error,
         watch_error: state.watch_error.lock().unwrap().clone(),
-        branch: git::branch(&pack.dir),
+        branch,
         ahead,
         behind,
         incoming: if behind > 0 { incoming_mods(&pack.dir) } else { None },
-        changed: git::changed_files(&pack.dir),
-        last_version: last_tag.as_deref().map(|tag| publish::version_of_tag(tag, &publish::load_releases(&state.pack_data().join("releases.json")))),
+        changed,
+        last_version: last_tag.as_deref().map(|tag| publish::version_of_tag(tag, &releases)),
         last_tag,
         dev_jars: export::local_dev_jars(&pack),
         project_id: pack.config.curseforge.project_id,
@@ -386,12 +395,19 @@ pub struct ChangelogPreview {
 #[tauri::command]
 pub async fn changelog_preview(state: State<'_, AppState>) -> CmdResult<ChangelogPreview> {
     let pack = state.pack().map_err(err)?;
+    let baseline_path = state.pack_data().join(changelog::BASELINE_FILE);
+    let prev_dir = pack.dir.clone();
+    let (folder, previous) = tokio::join!(
+        modsync::folder_lock(&pack.dir),
+        tauri::async_runtime::spawn_blocking(move || changelog::previous_lock(&prev_dir, &baseline_path)),
+    );
     // We diff the mods folder rather than the mod list, so the preview already shows changes you
     // haven't recorded yet. If the folder can't be read as a lock, we fall back to the list.
-    let folder = modsync::folder_lock(&pack.dir).await.unwrap_or_else(|_| pack.lock.clone());
-    let mut cache = MetadataCache::load(&state.cache_path());
-    let diff = changelog::mod_diff(&pack, &folder, &mut cache, &state.pack_data().join(changelog::BASELINE_FILE)).await.map_err(err)?;
-    cache.save(&state.cache_path()).map_err(err)?;
+    let folder = folder.unwrap_or_else(|_| pack.lock.clone());
+    let diff = match previous.map_err(|e| e.to_string())?.map_err(err)? {
+        Some(previous) => changelog::mod_diff_cached(&pack, &folder, previous, &state.cache_path()).await.map_err(err)?,
+        None => changelog::ModDiff::default(),
+    };
     let markdown = changelog::render(&changelog::read_notes(&pack), &diff);
     Ok(ChangelogPreview { diff, markdown })
 }
@@ -805,9 +821,15 @@ pub fn published_to(state: State<'_, AppState>, version: String) -> Option<Publi
 }
 
 async fn classify_cached(cache_path: &std::path::Path, pack: &Pack) -> Result<Vec<ModSide>> {
-    let mut cache = MetadataCache::load(cache_path);
+    let shared = MetadataCache::load_shared(cache_path);
+    if shared.has_all_classification(pack) {
+        return Ok(sides::classify_from_cache(pack, &shared));
+    }
+    let mut cache = (*shared).clone();
     let sides = sides::classify(pack, &mut cache).await?;
-    cache.save(cache_path)?;
+    if cache.is_dirty() {
+        cache.save(cache_path)?;
+    }
     Ok(sides)
 }
 

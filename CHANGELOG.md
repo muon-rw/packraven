@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.6.1]
+## [0.6.1] - 2026-11-21
 ### Added
 - Performance improvements. Various pages (notably Mods, Files) now load more quickly, especially after the first time you open them.
 
@@ -337,7 +337,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 - Mod updates skip jars Minecraft is currently holding open instead of stopping partway
 - Failed downloads will retry up to three times
 
-[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/muon-rw/packraven/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/muon-rw/packraven/compare/v0.5.4...v0.6.0
 [0.5.4]: https://github.com/muon-rw/packraven/compare/v0.5.3...v0.5.4
 [0.5.3]: https://github.com/muon-rw/packraven/compare/v0.5.2...v0.5.3

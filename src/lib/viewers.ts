@@ -53,8 +53,9 @@ export function isGzip(path: string) {
 }
 
 // Minecraft gzips each log when it starts a new one, so old logs end in .log.gz.
+// Older KubeJS versions write their logs as logs/kubejs/*.txt instead of .log.
 export function isLog(path: string) {
-  return /\.log(\.gz)?$/i.test(path)
+  return /\.log(\.gz)?$/i.test(path) || /^logs\/kubejs\/[^/]+\.txt$/i.test(path.replace(/\\/g, '/'))
 }
 
 export function viewerFor(path: string): Viewer | null {

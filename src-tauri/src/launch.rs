@@ -185,8 +185,38 @@ pub fn java_for_minecraft(minecraft: &str) -> (&'static str, u32) {
     }
 }
 
+fn raw_args<'a>(version: &'a Value, kind: &str, features: &HashMap<&str, bool>) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for arg in version.pointer(&format!("/arguments/{kind}")).and_then(Value::as_array).into_iter().flatten() {
+        match arg {
+            Value::String(s) => out.push(s.as_str()),
+            Value::Object(_) if allowed(arg.get("rules"), features) => match arg.get("value") {
+                Some(Value::String(s)) => out.push(s.as_str()),
+                Some(Value::Array(list)) => out.extend(list.iter().filter_map(Value::as_str)),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    out
+}
+
+// Forge and NeoForge list ${version_name}.jar in -DignoreList so BootstrapLauncher discards the
+// vanilla client jar that Mojang's launcher unconditionally puts on -cp. When CurseForge hasn't
+// launched a version yet, versions/<id>/<id>.jar doesn't exist; falling back to <parent_id>.jar
+// bypasses -DignoreList and collides with NeoForge's minecraft module.
+fn ignores_version_jar(version: &Value, id: &str, features: &HashMap<&str, bool>) -> bool {
+    let jar_name = format!("{id}.jar");
+    raw_args(version, "jvm", features).into_iter().any(|arg| {
+        let Some(list) = arg.strip_prefix("-DignoreList=") else { return false };
+        list.replace("${version_name}", id).split(',').any(|entry| !entry.is_empty() && jar_name.starts_with(entry))
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -199,6 +229,30 @@ mod tests {
         assert_eq!(java_for_minecraft("1.20.5").1, 21);
         assert_eq!(java_for_minecraft("1.21.1").1, 21);
         assert_eq!(java_for_minecraft("26.1.2").1, 25);
+    }
+
+    #[test]
+    fn detects_when_bootstrap_launcher_ignores_version_jar() {
+        let features = HashMap::new();
+        let neoforge_21 = json!({
+            "arguments": { "jvm": ["-DignoreList=client-extra,${version_name}.jar"] }
+        });
+        let forge_20 = json!({
+            "arguments": { "jvm": ["-DignoreList=bootstraplauncher,forge-,${version_name}.jar,forge-47.4.20"] }
+        });
+        let neoforge_26 = json!({
+            "arguments": { "jvm": ["-DlibraryDirectory=${library_directory}"] }
+        });
+        let other_ignore = json!({
+            "arguments": { "jvm": ["-DignoreList=asm,securejarhandler"] }
+        });
+        let fabric = json!({ "arguments": { "jvm": ["-DFabricMcEmu= net.minecraft.client.main.Main "] } });
+
+        assert!(ignores_version_jar(&neoforge_21, "neoforge-21.1.266", &features));
+        assert!(ignores_version_jar(&forge_20, "forge-47.4.20", &features));
+        assert!(!ignores_version_jar(&neoforge_26, "neoforge-26.1.2.12-beta", &features));
+        assert!(!ignores_version_jar(&other_ignore, "neoforge-21.1.266", &features));
+        assert!(!ignores_version_jar(&fabric, "fabric-loader-0.20.1-1.21.1", &features));
     }
 }
 
@@ -245,9 +299,11 @@ pub fn client(settings: &Settings, pack: &Pack, player: &Player, server: Option<
     }
     let separator = if cfg!(windows) { ";" } else { ":" };
     let mut classpath: Vec<String> = order.iter().map(|k| libraries[k].to_string_lossy().into_owned()).collect();
-    let version_jar = install.join("versions").join(&id).join(format!("{id}.jar"));
-    let jar = if version_jar.exists() { version_jar } else { install.join("versions").join(&parent_id).join(format!("{parent_id}.jar")) };
-    classpath.push(jar.to_string_lossy().into_owned());
+    if !ignores_version_jar(&child, &id, &features) {
+        let version_jar = install.join("versions").join(&id).join(format!("{id}.jar"));
+        let jar = if version_jar.exists() { version_jar } else { install.join("versions").join(&parent_id).join(format!("{parent_id}.jar")) };
+        classpath.push(jar.to_string_lossy().into_owned());
+    }
 
     let assets_index = parent.get("assets").and_then(Value::as_str).unwrap_or_default().to_string();
     let values: HashMap<&str, String> = [
@@ -282,17 +338,7 @@ pub fn client(settings: &Settings, pack: &Pack, player: &Player, server: Option<
     };
     let collect = |kind: &str, out: &mut Vec<String>| {
         for version in [&parent, &child] {
-            for arg in version.pointer(&format!("/arguments/{kind}")).and_then(Value::as_array).into_iter().flatten() {
-                match arg {
-                    Value::String(s) => out.push(substitute(s)),
-                    Value::Object(_) if allowed(arg.get("rules"), &features) => match arg.get("value") {
-                        Some(Value::String(s)) => out.push(substitute(s)),
-                        Some(Value::Array(list)) => out.extend(list.iter().filter_map(Value::as_str).map(substitute)),
-                        _ => {}
-                    },
-                    _ => {}
-                }
-            }
+            out.extend(raw_args(version, kind, &features).into_iter().map(substitute));
         }
     };
 

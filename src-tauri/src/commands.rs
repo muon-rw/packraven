@@ -37,6 +37,7 @@ pub struct AppState {
     pub mod_list: Mutex<crate::mod_list::ModListState>,
     pub minecraft: Arc<crate::minecraft_auth::Sessions>,
     pub minecraft_sign_in: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    pub probejs: Arc<crate::probejs::ProbeCache>,
 }
 
 impl AppState {
@@ -129,6 +130,8 @@ pub struct Overview {
     name: String,
     version: Option<String>,
     bcc_installed: bool,
+    kubejs_installed: bool,
+    kubejs_logs: Vec<String>,
     minecraft: Option<String>,
     loader: Option<String>,
     lock_count: usize,
@@ -266,6 +269,28 @@ fn incoming_mods(dir: &std::path::Path) -> Option<ModCounts> {
     Some(modsync::mod_counts(&modsync::lock_at(dir, "HEAD").ok()?, &modsync::lock_at(dir, "@{upstream}").ok()?))
 }
 
+fn kubejs_logs(root: &std::path::Path) -> Vec<String> {
+    let dir = root.join("logs/kubejs");
+    let mut logs: Vec<String> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            let lower = name.to_lowercase();
+            lower.ends_with(".log") || lower.ends_with(".txt")
+        })
+        .map(|name| format!("logs/kubejs/{name}"))
+        .collect();
+    let order = |path: &str| {
+        let lower = path.to_lowercase();
+        if lower.contains("/startup.") { 0 } else if lower.contains("/server.") { 1 } else if lower.contains("/client.") { 2 } else { 3 }
+    };
+    logs.sort_by(|a, b| order(a).cmp(&order(b)).then_with(|| a.to_lowercase().cmp(&b.to_lowercase())));
+    logs
+}
+
 // We call this after file, git and job changes, and it runs git, so we keep it off the main thread.
 #[tauri::command(async)]
 pub fn overview(state: State<'_, AppState>) -> CmdResult<Overview> {
@@ -278,6 +303,8 @@ pub fn overview(state: State<'_, AppState>) -> CmdResult<Overview> {
         name: pack.name(),
         version: pack.version(),
         bcc_installed: pack.has_bcc(),
+        kubejs_installed: pack.has_kubejs(),
+        kubejs_logs: kubejs_logs(&pack.dir),
         minecraft: pack.lock.minecraft.clone(),
         loader: pack.lock.loader.as_ref().map(ToString::to_string),
         lock_count: pack.lock.files.len(),
@@ -977,6 +1004,25 @@ pub fn start_client(app: AppHandle, state: State<'_, AppState>, join: bool, slot
 pub async fn server_command(state: State<'_, AppState>, line: String) -> CmdResult<()> {
     let server = state.test.server.lock().unwrap().clone().ok_or("the server is not running")?;
     server.send(&line).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn reload_kubejs_server(app: AppHandle, state: State<'_, AppState>) -> CmdResult<testrun::KubejsSyncReport> {
+    let server = state.test.server.lock().unwrap().clone().ok_or("the server is not running")?;
+    let pack = state.pack().map_err(err)?;
+    let test_dir = state.pack_data().join("test-server");
+    let client_started = state.test.client.lock().unwrap().as_ref().map(|client| client.started);
+    let report = tauri::async_runtime::spawn_blocking(move || testrun::sync_kubejs_to_server(&pack, &test_dir, client_started))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(err)?;
+    server.send(testrun::KUBEJS_RELOAD_COMMAND).await.map_err(err)?;
+    let summary = format!(
+        "Synced KubeJS server files ({} updated, {} removed) and sent /{}",
+        report.updated, report.removed, testrun::KUBEJS_RELOAD_COMMAND
+    );
+    crate::jobs::Log::new(&app, "server").info(summary);
+    Ok(report)
 }
 
 #[tauri::command]

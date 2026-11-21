@@ -10,6 +10,7 @@ minecraftinstance.json
 *.bak.*
 *.dat
 backups
+simplebackups/
 cache/
 command_history.txt
 crash-reports
@@ -28,6 +29,13 @@ usernamecache.json
 
 # Per-machine mod state
 .mixin.out
+.probe/
+.rhino_cache/
+rhino.local.properties
+ds_private_storage.json
+observable_announce
+patchouli_data.json
+ponders_watched.json
 .bobby/
 .fabric/
 ami-icon-cache
@@ -42,6 +50,7 @@ stackdeobf_mappings/
 win_event*.txt
 xaero/
 XaeroWaypoints_*/
+config/euphoria_patcher/.data.json
 config/jade/jade.json
 config/jade/sort-order.json
 config/jei/jei-client.ini
@@ -50,8 +59,14 @@ config/jei/client/**/jei-client.ini
 config/jei/client/**/ingredient-list-mod-sort-order.ini
 config/sodium-fingerprint.json
 config/xenon-fingerprint.json
+kubejs/package.json
+kubejs/jsconfig.json
 kubejs/*/jsconfig.json
 kubejs/config/probe-settings.json
+kubejs/probe/
+kubejs/local/
+kubejs/exported/
+shaderpacks/* + EuphoriaPatches_*/
 
 # Binaries: the packraven hooks sync these from CurseForge via mods.lock.json
 mods/*.jar

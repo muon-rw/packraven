@@ -44,6 +44,7 @@ mod os_drag;
 mod pack;
 mod pack_commands;
 mod presence;
+mod probejs;
 mod process;
 mod publish;
 mod remote;
@@ -146,6 +147,7 @@ pub fn run() {
                 mod_list: Mutex::default(),
                 minecraft: Arc::default(),
                 minecraft_sign_in: Mutex::default(),
+                probejs: Arc::default(),
             });
             presence::start();
             app.state::<AppState>().rewatch(app.handle());
@@ -244,6 +246,7 @@ pub fn run() {
             commands::start_test,
             commands::start_client,
             commands::server_command,
+            commands::reload_kubejs_server,
             commands::kill_process,
             commands::publish,
             commands::releases,
@@ -305,6 +308,10 @@ pub fn run() {
             file_commands::read_bytes,
             file_commands::read_nbt,
             file_commands::read_log,
+            file_commands::probejs_status,
+            file_commands::kubejs_context,
+            file_commands::probejs_complete,
+            file_commands::probejs_hover,
             file_commands::decompile_class,
             file_commands::extract_archive,
             file_commands::compress_paths,

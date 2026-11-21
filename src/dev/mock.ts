@@ -656,7 +656,7 @@ function listDir(path: string) {
   return listed.map((e) => ({ ...e, archive: !e.isDir && /\.(jar|zip)$/i.test(e.name), archived: false }))
 }
 
-const packLoaderIds = { paxi: [418881, 515708, 1015157], openloader: [354339], globalpacks: [317134] }
+const packLoaderIds = { paxi: [418881, 515708, 1015157], openloader: [354339], globalpacks: [317134], kubejs: [238086] }
 
 // The fixtures list the pack folders in resourcepacks without their contents, so we count every
 // folder there as a pack, and pretend options.txt turns on only Raven's Resources.
@@ -670,14 +670,38 @@ function packFolder(path: string, canCreate = true) {
 }
 
 function packLoaders(kind: 'data' | 'resource') {
-  const installed = (ids: number[]) => installedMods.some((m) => ids.includes(m.projectId))
+  const installed = (id: keyof typeof packLoaderIds) =>
+    (id === 'kubejs' && !!fx.dirs['kubejs']) || installedMods.some((m) => packLoaderIds[id].includes(m.projectId))
   const folders = {
     paxi: kind === 'data' ? ['config/paxi/datapacks'] : ['config/paxi/resourcepacks'],
     openloader: kind === 'data' ? ['config/openloader/data'] : ['config/openloader/resources'],
     globalpacks: kind === 'data' ? ['global_packs/required_data', 'global_packs/optional_data'] : ['global_packs/required_resources'],
   }
   const names = { paxi: 'Paxi', openloader: 'Open Loader', globalpacks: 'Global Packs' }
-  return (Object.keys(names) as (keyof typeof names)[]).map((id) => ({ id, name: names[id], installed: installed(packLoaderIds[id]), projectIds: packLoaderIds[id], folders: folders[id].map((f) => packFolder(f)) }))
+  const standard = (Object.keys(names) as (keyof typeof names)[]).map((id) => ({
+    id,
+    name: names[id],
+    installed: installed(id),
+    projectIds: packLoaderIds[id],
+    folders: folders[id].map((f) => packFolder(f)),
+  }))
+  return [
+    ...standard,
+    {
+      id: 'kubejs' as const,
+      name: 'KubeJS',
+      installed: installed('kubejs'),
+      projectIds: packLoaderIds.kubejs,
+      folders: [
+        {
+          path: kind === 'data' ? 'kubejs/data' : 'kubejs/assets',
+          exists: !!fx.dirs['kubejs'],
+          canCreate: false,
+          packs: [{ path: 'kubejs', name: 'KubeJS', zipped: false }],
+        },
+      ],
+    },
+  ]
 }
 
 function ensureDir(path: string, created: string[]) {
@@ -694,7 +718,8 @@ function ensureDir(path: string, created: string[]) {
 function copyIntoPack(sources: string[], pack: string, create: boolean) {
   const created: string[] = []
   const exists = (path: string) => listDir(path.slice(0, path.lastIndexOf('/'))).some((e) => e.path === path)
-  if (!exists(`${pack}/pack.mcmeta`)) {
+  const isKubejs = pack.replace(/^\/+|\/+$/g, '') === 'kubejs'
+  if (!isKubejs && !exists(`${pack}/pack.mcmeta`)) {
     if (!create) throw `${pack} isn't a pack: it has no pack.mcmeta`
     ensureDir(pack, created)
     addEntry(`${pack}/pack.mcmeta`, false)
@@ -982,6 +1007,38 @@ const sampleLog = [
   '\t\t[NoCube\'s] Realm RPG: Treasure Balloons 1.0.0 (realmrpg_balloons)',
   '[12:00:05] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: Done (3.2s)!',
 ]
+const sampleKubejsLog = [
+  '[12:00:01] [Server thread/INFO] [KubeJS Server/]: Loaded server scripts in 18 ms',
+  '[12:00:02] [Server thread/ERROR] [KubeJS Server/]: ! Line 2: ReferenceError: "badVar" is not defined (server_scripts:recipes.js#2)',
+  '[12:00:03] [INFO] recipes.js#5: Removed 3 recipes',
+]
+
+const mockProbejsFiles = [
+  {
+    path: 'kubejs/server_scripts/jsconfig.json',
+    text: JSON.stringify({ compilerOptions: { allowJs: true, checkJs: false }, include: ['../probe/generated/**/*.d.ts', '**/*.js'] }),
+  },
+  {
+    path: 'kubejs/probe/generated/events.d.ts',
+    text: [
+      "type SpecialItemId = 'minecraft:diamond' | 'minecraft:stick' | 'minecraft:iron_ingot' | 'minecraft:oak_planks';",
+      'interface RecipeFilter { output?: SpecialItemId; input?: SpecialItemId; mod?: string; id?: string; }',
+      'interface RecipeEventJS {',
+      '  /** Removes all recipes matching the filter. */',
+      '  remove(filter: RecipeFilter): void;',
+      '  /** Registers a shaped crafting table recipe. */',
+      '  shaped(output: SpecialItemId, pattern: string[], key: Record<string, SpecialItemId>): void;',
+      '  /** Registers a shapeless crafting table recipe. */',
+      '  shapeless(output: SpecialItemId, ingredients: SpecialItemId[]): void;',
+      '}',
+      'declare const ServerEvents: {',
+      '  /** Fired when recipes are loaded or reloaded on the server. */',
+      '  recipes(handler: (event: RecipeEventJS) => void): void;',
+      '};',
+    ].join('\n'),
+  },
+]
+
 let logReads = 0
 
 const sampleNbt = {
@@ -1159,6 +1216,8 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       name: activePack === otherPack.dir ? otherPack.name : pack.name,
       version: bcc.version,
       bccInstalled: bcc.installed,
+      kubejsInstalled: scenario !== 'empty',
+      kubejsLogs: scenario !== 'empty' ? ['logs/kubejs/startup.log', 'logs/kubejs/server.log'] : [],
       minecraft: fx.minecraft,
       loader: fx.loader,
       lockCount: fx.lockCount,
@@ -1211,6 +1270,13 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     emit('job-log', { job: 'server', stream: 'info', text: `> ${line}` })
     if (line === 'stop') setTimeout(stopMockServer, 300)
   },
+  reload_kubejs_server: () => {
+    if (!serverRunning) throw 'the server is not running'
+    emit('job-log', { job: 'server', stream: 'info', text: 'Synced KubeJS server files (1 updated, 0 removed) and sent /reload' })
+    emit('job-log', { job: 'server', stream: 'out', text: '[12:00:08] [Server thread/INFO] [KubeJS Server/]: Reloaded with no KubeJS errors!' })
+    return { updated: 1, removed: 0, unchanged: 0, startupChanged: false, clientChanged: false }
+  },
+  kubejs_context: () => ({ eventSides: {} }),
   kill_process: ({ which }) => {
     if (which === 'server') stopMockServer()
     else {
@@ -1318,12 +1384,70 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
         ? { text: '[\n' + '  {"type": "minecraft:crafting_shaped"},\n'.repeat(20000) + '  {}\n]\n', size: 72e6, unreadable: null, crlf: false, bom: false, archived: false, compressed: false, large: true }
         : { text: null, size: 72e6, unreadable: 'This file is 72.0 MB, over the 50.0 MB you set to ask about. You can open it in a simplified editor without checking or folding.', crlf: false, bom: false, archived: false, compressed: false, large: true }
       : readFile(String(a.path)),
+  write_file: (a) => {
+    const path = String(a.path)
+    const text = String(a.text ?? '')
+    fx.files[path] = { text, size: text.length, unreadable: null, crlf: Boolean(a.crlf), bom: Boolean(a.bom), archived: false, compressed: false, large: false }
+  },
   read_bytes: (a) => dataUrlBytes(mockImage(String(a.path))),
   read_nbt: () => sampleNbt,
   read_log: (a) => {
-    if (!a.offset) return { text: `${sampleLog.join('\n')}\n`, offset: 1, reset: true, truncated: false, followable: !String(a.path).endsWith('.gz') }
+    const path = String(a.path)
+    if (!a.offset) {
+      const lines = path.startsWith('logs/kubejs/') ? sampleKubejsLog : sampleLog
+      return { text: `${lines.join('\n')}\n`, offset: 1, reset: true, truncated: false, followable: !path.endsWith('.gz') }
+    }
     logReads++
     return { text: `[12:00:${String(5 + logReads).padStart(2, '0')}] [Server thread/INFO] [net.minecraft.server.MinecraftServer/]: Tick ${logReads}\n`, offset: 1 + logReads, reset: false, truncated: false, followable: true }
+  },
+  probejs_status: () => ({
+    available: true,
+    fileCount: mockProbejsFiles.length,
+    totalBytes: mockProbejsFiles.reduce((sum, f) => sum + f.text.length, 0),
+    typeCount: 12,
+    stringEntries: 6,
+    loadMs: 8,
+    failedFiles: [],
+  }),
+  probejs_complete: (a) => {
+    const text = String(a.text ?? '')
+    const offset = Number(a.offset ?? 0)
+    const before = text.slice(0, offset)
+    const strMatch = /['"]([^'"]*)$/.exec(before)
+    if (strMatch) {
+      const typed = strMatch[1]
+      const from = offset - typed.length
+      const items = ['minecraft:diamond', 'minecraft:diamond_sword', 'minecraft:iron_ingot', 'minecraft:stone', '#forge:ingots/iron']
+        .filter((id) => id.toLowerCase().includes(typed.toLowerCase()))
+        .map((label) => ({ label, kind: 'text', detail: 'item', signature: null, docs: null, insertText: null }))
+      return { from, to: offset, items, inString: true }
+    }
+    const dotMatch = /([A-Za-z0-9_$]+)\.([A-Za-z0-9_$]*)$/.exec(before)
+    if (dotMatch) {
+      const [, receiver, partial] = dotMatch
+      const from = offset - partial.length
+      const members =
+        receiver === 'ServerEvents'
+          ? [
+              { label: 'recipes', kind: 'method', detail: null, signature: 'ServerEvents.recipes(handler: (event: Internal.RecipesEventJS) => void): void', docs: 'Register or modify crafting recipes.', insertText: null },
+              { label: 'tags', kind: 'method', detail: null, signature: 'ServerEvents.tags(type: string, handler: (event: TagEvent) => void): void', docs: 'Edit item, block, or fluid tags.', insertText: null },
+            ]
+          : [
+              { label: 'shapeless', kind: 'method', detail: 'RecipeJS', signature: 'shapeless(output: Special.Item, inputs: InputItem_[]): RecipeJS', docs: null, insertText: null },
+              { label: 'remove', kind: 'method', detail: 'void', signature: 'remove(filter: { output?: Special.Item }): void', docs: null, insertText: null },
+            ]
+      return { from, to: offset, items: members.filter((m) => m.label.toLowerCase().includes(partial.toLowerCase())), inString: false }
+    }
+    return { from: offset, to: offset, items: [], inString: false }
+  },
+  probejs_hover: (a) => {
+    const text = String(a.text ?? '')
+    const offset = Number(a.offset ?? 0)
+    const idx = text.indexOf('recipes')
+    if (idx >= 0 && offset >= idx && offset <= idx + 7) {
+      return { from: idx, to: idx + 7, signature: 'ServerEvents.recipes(handler: (event: Internal.RecipesEventJS) => void): void', docs: 'Register or modify crafting recipes.' }
+    }
+    return null
   },
   media_path: (a) => `${pack.dir}/${a.path}`,
   pack_loaders: (a) => new Promise((resolve) => setTimeout(() => resolve(packLoaders(a.kind as 'data' | 'resource')), 150)),

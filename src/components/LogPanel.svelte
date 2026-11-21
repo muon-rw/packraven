@@ -3,6 +3,8 @@
   import { errorText } from '../lib/api'
   import type { Head, Level, LogModel } from '../lib/logs'
   import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { findScriptLinks, splitScriptLinks } from '../lib/logLinks'
+  import { showInFiles } from '../lib/nav.svelte'
   import { paneFocus } from '../lib/panes.svelte'
   import { isMac, shortcut } from '../lib/platform'
   import ContextMenu from './ContextMenu.svelte'
@@ -19,6 +21,7 @@
     loading = false,
     label,
     empty = 'Nothing logged yet.',
+    scriptFolder = null,
   }: {
     model: LogModel
     version: number
@@ -28,6 +31,7 @@
     loading?: boolean
     label: string
     empty?: string
+    scriptFolder?: string | null
   } = $props()
 
   // Rows have a fixed height, so we can render only the ones on screen. A modded debug.log
@@ -494,10 +498,20 @@
     const entry = model.lineEntry[line]
     const logger = model.entries[entry].head?.logger
     const lines = model.entryEnd(entry) - model.entries[entry].start
+    const script = findScriptLinks(model.lines[line], scriptFolder)[0]
     menu = {
       x,
       y,
       items: [
+        ...(script
+          ? [
+              {
+                label: `Open ${script.path.slice(script.path.lastIndexOf('/') + 1)}${script.line ? `:${script.line}` : ''} in Files`,
+                run: () => showInFiles(script.path, script.line ?? undefined),
+              },
+              'separator' as const,
+            ]
+          : []),
         ...(needle ? [{ label: 'Show in full log', shortcut: 'Enter', run: () => showInFullLog(line) }, 'separator' as const] : []),
         { label: 'Copy line', shortcut: shortcut('Ctrl+C'), run: () => copy(model.lines[line]) },
         ...(lines > 1 ? [{ label: `Copy entry (${lines} lines)`, run: () => copy(entryText(entry)) }] : []),
@@ -530,6 +544,18 @@
 
 {#snippet marked(text: string)}
   {#each parts(text) as part, i (i)}{#if part.hit}<mark>{part.text}</mark>{:else}{part.text}{/if}{/each}
+{/snippet}
+
+{#snippet linkedMessage(text: string)}
+  {#each splitScriptLinks(text, scriptFolder) as seg, i (i)}{#if seg.link}<button
+        type="button"
+        class="script-link"
+        title="Open {seg.link.path}{seg.link.line ? ` at line ${seg.link.line}` : ''} in Files"
+        onclick={(e) => {
+          e.stopPropagation()
+          showInFiles(seg.link!.path, seg.link!.line ?? undefined)
+        }}>{@render marked(seg.text)}</button
+      >{:else}{@render marked(seg.text)}{/if}{/each}
 {/snippet}
 
 <div class="panel" class:framed bind:this={panelEl}>
@@ -628,10 +654,10 @@
               <span class="thread" title={entry.head.thread}>{@render marked(entry.head.thread)}</span>
               {#if entry.head.logger}<span class="logger" title={[entry.head.logger, entry.head.marker].filter(Boolean).join(' / ')}>{@render marked(shortLogger(entry.head.logger))}</span>{/if}
               {#if found}<span class="found-in" class:shown-wide={found.shownWide} title={found.column === 'logger' ? [entry.head.logger, entry.head.marker].filter(Boolean).join(' / ') : entry.head.thread}>in {found.column}</span>{/if}
-              <span class="message">{@render marked(entry.head.message)}</span>
+              <span class="message">{@render linkedMessage(entry.head.message)}</span>
               {#if extra && folded(entryIndex)}<span class="hidden-lines">{extra} more {extra === 1 ? 'line' : 'lines'}</span>{/if}
             {:else}
-              <span class="message">{@render marked(model.lines[line])}</span>
+              <span class="message">{@render linkedMessage(model.lines[line])}</span>
             {/if}
           </div>
         {/each}
@@ -967,6 +993,37 @@
 
   .message {
     flex: none;
+  }
+
+  .script-link {
+    display: inline;
+    padding: 0;
+    margin: 0;
+    border: 0;
+    border-radius: 2px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: inherit;
+    text-decoration: underline dotted;
+    text-underline-offset: 2px;
+    cursor: pointer;
+  }
+
+  .script-link:hover,
+  .script-link:focus-visible {
+    text-decoration: underline solid;
+    color: var(--forest);
+  }
+
+  .row.error .script-link:hover,
+  .row.error .script-link:focus-visible {
+    color: var(--fail);
+  }
+
+  .row.warn .script-link:hover,
+  .row.warn .script-link:focus-visible {
+    color: var(--warn);
   }
 
   .found-in {

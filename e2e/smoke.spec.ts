@@ -533,13 +533,13 @@ test('server properties and startup save as you change them', async ({ page }) =
 test('server packs download their mods unless you include them in the zip', async ({ page }) => {
   await openApp(page, 'server', 'dirty')
   await page.getByRole('tab', { name: 'Startup' }).click()
-  const mods = page.getByRole('radiogroup', { name: 'Mod files' })
+  const mods = page.getByRole('radiogroup', { name: 'Server Mod Files' })
   const readme = page.getByRole('figure', { name: /PLEASE READ/ })
-  await expect(mods.getByRole('radio', { name: /^Downloaded on first start/ })).toBeChecked()
+  await expect(mods.getByRole('radio', { name: /^Download on first start/ })).toBeChecked()
   await expect(readme).toContainText('WHERE ARE THE MODS?')
   await expect(readme).toContainText('then downloads our mods and installs NeoForge and Minecraft.')
 
-  await mods.getByRole('radio', { name: /^Included in the zip/ }).check()
+  await mods.getByRole('radio', { name: /^Include them in the zip/ }).check()
   await expect(page.getByRole('status').filter({ hasText: 'Saved' })).toBeVisible()
   await expect(readme).not.toContainText('WHERE ARE THE MODS?')
   await expect(readme).toContainText('then installs NeoForge and Minecraft.')
@@ -547,7 +547,7 @@ test('server packs download their mods unless you include them in the zip', asyn
   await page.getByRole('navigation', { name: 'Pack' }).getByRole('button', { name: /^Publish/ }).click()
   await expect(page.locator('.ships')).toContainText('Its mods are in the zip')
   await page.getByRole('button', { name: 'Change how the server pack gets its mods' }).click()
-  await expect(page.getByRole('radio', { name: /^Included in the zip/ })).toBeChecked()
+  await expect(page.getByRole('radio', { name: /^Include them in the zip/ })).toBeChecked()
 })
 
 test("installing a mod marks the dependencies it brings as installing", async ({ page }) => {
@@ -629,6 +629,7 @@ test('extra launch arguments check what Java will receive', async ({ page }) => 
   await expect(page.getByRole('textbox', { name: 'Server arguments' })).toHaveValue('--world\nDebug World')
 
   await page.getByRole('button', { name: 'App settings', exact: true }).click()
+  await page.getByRole('tab', { name: 'General' }).click()
   await page.getByLabel('Name', { exact: true }).fill('Raven Dev')
   await expect(page.getByRole('status').filter({ hasText: /^Saved$/ })).toBeVisible()
 })
@@ -1440,4 +1441,114 @@ test('Publish stays steady on background file-watcher refreshes', async ({ page 
 
   const flickers = await page.evaluate(() => (window as unknown as Record<string, string[]>).__publishFlickers)
   expect(flickers).toEqual([])
+})
+
+test('KubeJS scripts get Rhino linting and ProbeJS completions, and Escape closes completions', async ({ page }) => {
+  await openApp(page, 'files', 'dirty')
+  await page.evaluate(() => {
+    const internals = (globalThis as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: object) => Promise<unknown> } }).__TAURI_INTERNALS__
+    return internals.invoke('create_file', { path: 'kubejs/server_scripts/recipes.js' })
+  })
+  await page.getByRole('searchbox', { name: 'Search file and folder names' }).fill('recipes.js')
+  await page.keyboard.press('Enter')
+  const editor = page.locator('.cm-content')
+  await editor.click()
+
+  // Rhino rejects ES module syntax, and ClientEvents doesn't belong in server_scripts.
+  await page.keyboard.insertText("// priorty: 10\nexport const answer = 42\nClientEvents.loggedIn(e => {\n  console.log('hi')\n})\n")
+  await expect(page.locator('.cm-lint-marker-error')).toHaveCount(1)
+  await expect(page.locator('.cm-lint-marker-warning')).toHaveCount(2)
+
+  // Opening the problems panel attaches a vertical resize handle, and Alt+Left closes the panel.
+  await page.getByRole('button', { name: '1 error, 2 warnings' }).click()
+  const resizeHandle = page.getByRole('separator', { name: 'Resize the problems panel' })
+  await expect(resizeHandle).toBeVisible()
+  const lintList = page.locator('.cm-panel.cm-panel-lint ul')
+  const beforeHeight = (await lintList.boundingBox())!.height
+  await resizeHandle.focus()
+  await page.keyboard.press('Shift+ArrowUp')
+  const afterHeight = (await lintList.boundingBox())!.height
+  expect(afterHeight).toBeGreaterThan(beforeHeight)
+  await page.keyboard.press('Alt+ArrowLeft')
+  await expect(page.locator('.cm-panel.cm-panel-lint')).toBeHidden()
+  await expect(editor).toBeVisible()
+
+  // ProbeJS typings load in the worker and offer completions on ServerEvents.
+  await expect(page.getByRole('button', { name: 'ProbeJS', exact: true })).toBeVisible({ timeout: 10_000 })
+  await page.keyboard.press('Control+A')
+  await page.keyboard.press('Backspace')
+  await page.keyboard.type('ServerEvents.')
+  const list = page.locator('.cm-tooltip-autocomplete')
+  await expect(list).toBeVisible({ timeout: 10_000 })
+  await expect(list).toContainText('recipes')
+
+  // Pressing Escape closes the completion menu without leaving Files.
+  await page.keyboard.press('Escape')
+  await expect(list).toBeHidden()
+  await expect(editor).toBeVisible()
+
+  // Pressing Tab accepts the active completion instead of inserting a tab indent.
+  await page.keyboard.type('rec')
+  await expect(list).toBeVisible({ timeout: 10_000 })
+  await page.keyboard.press('Tab')
+  await expect(list).toBeHidden()
+  await expect(editor).toContainText('ServerEvents.recipes')
+
+  // String-literal completions resolve ProbeJS item ID unions too.
+  await page.keyboard.press('Control+A')
+  await page.keyboard.press('Backspace')
+  await page.keyboard.insertText("ServerEvents.recipes(e => { e.remove({ output: '' }) })")
+  // Move cursor inside the empty string literal before '' -> '|'
+  for (let i = 0; i < 7; i++) await page.keyboard.press('ArrowLeft')
+  await page.keyboard.type('minecraft:d')
+  await expect(list).toBeVisible({ timeout: 10_000 })
+  await expect(list).toContainText('minecraft:diamond')
+  // Alt+Left (layered back) also closes the completion menu before leaving Files.
+  await page.keyboard.press('Alt+ArrowLeft')
+  await expect(list).toBeHidden()
+  await expect(editor).toBeVisible()
+})
+
+test('when KubeJS is present, mod jar data files can be overridden directly into kubejs/data', async ({ page }) => {
+  await openApp(page, 'files', 'dirty')
+  await page.evaluate(() => {
+    const internals = (globalThis as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: object) => Promise<unknown> } }).__TAURI_INTERNALS__
+    return internals.invoke('create_dir', { path: 'kubejs/server_scripts' })
+  })
+  const tree = page.getByRole('tree', { name: 'Pack files' })
+  const jar = 'mods/example-mod.jar'
+  for (const path of ['mods', jar, `${jar}/data`, `${jar}/data/example`, `${jar}/data/example/recipe`, `${jar}/data/example/recipe/fire_charge.json`]) {
+    await tree.locator(`[data-path="${path}"]`).click()
+  }
+  await page.getByRole('button', { name: 'Override in a data pack…' }).click()
+  const dialog = page.getByRole('dialog', { name: 'Override in a data pack' })
+  await expect(dialog.getByText('kubejs/data')).toBeVisible()
+  await dialog.getByRole('button', { name: 'Copy and open' }).click()
+  await expect(page.locator('.toolbar .path')).toHaveText('kubejs/data/example/recipe/fire_charge.json')
+})
+
+test('Run reloads KubeJS on the test server and log script links jump to the script line in Files', async ({ page }) => {
+  await openApp(page, 'test', 'dirty')
+  await page.evaluate(() => {
+    const internals = (globalThis as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string, args: object) => Promise<unknown> } }).__TAURI_INTERNALS__
+    return internals.invoke('create_file', { path: 'kubejs/server_scripts/recipes.js' }).then(() =>
+      internals.invoke('write_file', { path: 'kubejs/server_scripts/recipes.js', text: 'ServerEvents.recipes(e => {\n  badVar()\n})\n', crlf: false, bom: false }),
+    )
+  })
+  await page.getByRole('button', { name: 'Start server' }).click()
+  const reloadBtn = page.getByRole('button', { name: 'Reload KubeJS' })
+  await expect(reloadBtn).toHaveAttribute('aria-disabled', 'false', { timeout: 10_000 })
+  await reloadBtn.click()
+  await expect(page.getByRole('log', { name: 'Server log' })).toContainText('Synced KubeJS server files')
+
+  // Open KubeJS server.log from Run, then click the script error link to jump to line 2.
+  await page.getByRole('button', { name: 'server.log' }).click()
+  await expect(page.locator('.toolbar .path')).toHaveText('logs/kubejs/server.log')
+  const scriptLink = page.getByRole('button', { name: 'server_scripts:recipes.js#2' })
+  await expect(scriptLink).toBeVisible()
+  // KubeJS's own logs name scripts relative to the log's folder, so a bare reference links too.
+  await expect(page.getByRole('button', { name: 'recipes.js#5' })).toHaveAttribute('title', 'Open kubejs/server_scripts/recipes.js at line 5 in Files')
+  await scriptLink.click()
+  await expect(page.locator('.toolbar .path')).toHaveText('kubejs/server_scripts/recipes.js')
+  await expect(page.locator('.cm-activeLine')).toContainText('badVar()')
 })

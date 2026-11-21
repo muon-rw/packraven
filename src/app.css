@@ -399,10 +399,13 @@ label > select {
   color: var(--muted);
 }
 
+/* Without the negative margin, a live region at the end of the page makes it 1px taller than the
+   window, and CodeMirror's scroll-into-view then scrolls the page, which closes any open menu. */
 .visually-hidden {
   position: absolute;
   width: 1px;
   height: 1px;
+  margin: -1px;
   overflow: hidden;
   clip-path: inset(50%);
   white-space: nowrap;

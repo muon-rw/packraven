@@ -230,6 +230,8 @@ export interface Overview {
   name: string
   version: string | null
   bccInstalled: boolean
+  kubejsInstalled: boolean
+  kubejsLogs: string[]
   minecraft: string | null
   loader: string | null
   lockCount: number
@@ -681,11 +683,56 @@ export interface PackFolder {
 }
 
 export interface PackLoader {
-  id: 'paxi' | 'openloader' | 'globalpacks'
+  id: 'paxi' | 'openloader' | 'globalpacks' | 'kubejs'
   name: string
   installed: boolean
   projectIds: number[]
   folders: PackFolder[]
+}
+
+export interface KubejsSyncReport {
+  updated: number
+  removed: number
+  unchanged: number
+  startupChanged: boolean
+  clientChanged: boolean
+}
+
+export interface KubejsContext {
+  eventSides: Record<string, ('server' | 'client' | 'startup')[]>
+}
+
+export interface ProbejsStatusInfo {
+  available: boolean
+  fileCount: number
+  totalBytes: number
+  typeCount: number
+  stringEntries: number
+  loadMs: number
+  failedFiles: string[]
+}
+
+export interface ProbejsCompletionItem {
+  label: string
+  kind: string
+  detail?: string | null
+  signature?: string | null
+  docs?: string | null
+  insertText?: string | null
+}
+
+export interface ProbejsCompletionResult {
+  from: number
+  to: number
+  items: ProbejsCompletionItem[]
+  inString: boolean
+}
+
+export interface ProbejsHover {
+  from: number
+  to: number
+  signature: string
+  docs: string
 }
 
 export interface CopiedIntoPack {
@@ -820,6 +867,9 @@ export const api = {
   packLoaders: (kind: PackKind) => invoke<PackLoader[]>('pack_loaders', { kind }),
   packFolder: (path: string) => invoke<PackFolder>('pack_folder', { path }),
   copyIntoPack: (sources: string[], pack: string, create: boolean) => invoke<CopiedIntoPack>('copy_into_pack', { sources, pack, create }),
+  probejsStatus: (force = false) => invoke<ProbejsStatusInfo>('probejs_status', { force }),
+  probejsComplete: (text: string, offset: number) => invoke<ProbejsCompletionResult>('probejs_complete', { text, offset }),
+  probejsHover: (text: string, offset: number) => invoke<ProbejsHover | null>('probejs_hover', { text, offset }),
   indexFiles: () => invoke<{ paths: string[]; truncated: boolean }>('index_files'),
   searchText: (query: TextQuery) => invoke<TextResults | null>('search_text', { query }),
   replaceText: (query: TextQuery, targets: { path: string; matches: [number, number][] }[]) => invoke<Replaced>('replace_text', { query, targets }),
@@ -920,6 +970,8 @@ export const api = {
   startTest: (recopyAll: boolean, connect: boolean, secondClient: boolean) => invoke<MemoryWarning | null>('start_test', { recopyAll, connect, secondClient }),
   startClient: (join: boolean, slot: ClientSlot) => invoke<MemoryWarning | null>('start_client', { join, slot }),
   serverCommand: (line: string) => invoke<void>('server_command', { line }),
+  reloadKubejsServer: () => invoke<KubejsSyncReport>('reload_kubejs_server'),
+  kubejsContext: () => invoke<KubejsContext>('kubejs_context'),
   killProcess: (which: 'server' | 'client' | 'second-client') => invoke<void>('kill_process', { which }),
   publish: (options: { version: string; message: string; push: boolean; client: UploadNames; server: UploadNames; updateChecker: UpdateType | null; announcementImages: string[] }) => invoke<void>('publish', { options }),
   releases: (offset?: number, limit?: number) => invoke<ReleasesPage>('releases', { offset: offset ?? null, limit: limit ?? null }),

@@ -125,6 +125,56 @@ pub async fn read_log(state: State<'_, AppState>, path: String, offset: u64) -> 
 }
 
 #[tauri::command]
+pub async fn probejs_status(state: State<'_, AppState>, force: bool) -> CmdResult<crate::probejs::ProbeStatus> {
+    let root = state.settings().instance_dir;
+    let cache = std::sync::Arc::clone(&state.probejs);
+    tauri::async_runtime::spawn_blocking(move || cache.ensure(&root, force).0).await.map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KubejsContext {
+    event_sides: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+#[tauri::command]
+pub async fn kubejs_context(state: State<'_, AppState>) -> CmdResult<KubejsContext> {
+    let root = state.settings().instance_dir;
+    let cache = std::sync::Arc::clone(&state.probejs);
+    let event_sides = tauri::async_runtime::spawn_blocking(move || cache.ensure(&root, false).1.map(|index| index.event_sides().clone()).unwrap_or_default())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(KubejsContext { event_sides })
+}
+
+#[tauri::command]
+pub async fn probejs_complete(state: State<'_, AppState>, text: String, offset: usize) -> CmdResult<crate::probejs::CompletionResult> {
+    let root = state.settings().instance_dir;
+    let cache = std::sync::Arc::clone(&state.probejs);
+    tauri::async_runtime::spawn_blocking(move || {
+        match cache.get(&root).or_else(|| cache.ensure(&root, false).1) {
+            Some(idx) => idx.complete(&text, offset),
+            None => crate::probejs::CompletionResult { from: offset, to: offset, items: Vec::new(), in_string: false },
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn probejs_hover(state: State<'_, AppState>, text: String, offset: usize) -> CmdResult<Option<crate::probejs::HoverInfo>> {
+    let root = state.settings().instance_dir;
+    let cache = std::sync::Arc::clone(&state.probejs);
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(idx) = cache.get(&root) else { return Ok(None) };
+        Ok(idx.hover(&text, offset))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(err)
+}
+
+#[tauri::command]
 pub async fn read_nbt(state: State<'_, AppState>, path: String) -> CmdResult<crate::nbt::Document> {
     let root = state.settings().instance_dir;
     tauri::async_runtime::spawn_blocking(move || crate::nbt::parse(&files::bytes(&root, &path, MAX_NBT_BYTES)?)).await.map_err(|e| e.to_string())?.map_err(err)
@@ -178,7 +228,7 @@ pub fn pack_folder(state: State<'_, AppState>, path: String) -> CmdResult<PackFo
 pub async fn copy_into_pack(state: State<'_, AppState>, sources: Vec<String>, pack: String, create: bool) -> CmdResult<Copied> {
     let settings = state.settings();
     let root = settings.instance_dir.clone();
-    let meta = if create {
+    let meta = if create && !global_packs::is_kubejs_pack(&pack) {
         let first = sources.first().ok_or("Pick something in a mod's jar to copy into a pack.")?;
         let kind = global_packs::inside_path(first).and_then(PackKind::of).ok_or("Only files under data/ or assets/ in a mod's jar belong in a pack.")?;
         let lock = state.pack().map_err(err)?.lock;

@@ -2,6 +2,8 @@ import type { EditorState, TransactionSpec } from '@codemirror/state'
 import type { Problems } from './editor'
 import { listen } from '@tauri-apps/api/event'
 import { api, type FileContent } from './api'
+import { resetProbejs } from './probejs.svelte'
+import { resetKubejsContext } from './kubejsContext'
 import { isGzip, isLog, outerArchive } from './viewers'
 
 export interface Tab {
@@ -48,6 +50,8 @@ export function resetFor(pack: string | null) {
   workspace.tabs = []
   workspace.active = null
   closed.length = 0
+  resetProbejs()
+  resetKubejsContext()
 }
 
 function tab(path: string) {

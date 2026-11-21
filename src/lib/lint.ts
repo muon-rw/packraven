@@ -5,6 +5,8 @@ import { createScanner, parseTree, printParseErrorCode, type Node, type ParseErr
 import JSON5 from 'json5'
 import { parse as parseToml, TomlError } from 'smol-toml'
 import { parseAllDocuments } from 'yaml'
+import { checkKubejsAst, isKubejsScript } from './kubejs'
+import { currentKubejsContext, loadKubejsContext } from './kubejsContext'
 
 type Check = (doc: Text) => Diagnostic[]
 
@@ -73,7 +75,8 @@ function checkFor(path: string): Check | Promise<Check> | null {
       return checkProperties
     case 'js':
     case 'mjs':
-      return javascript().then((js) => (doc) => checkJs(doc, js))
+      // KubeJS checks use the pack's ProbeJS typings, so the first check waits for them.
+      return Promise.all([javascript(), isKubejsScript(path) ? loadKubejsContext() : null]).then(([js]) => (doc) => checkJs(doc, js, path))
     default:
       return null
   }
@@ -242,15 +245,18 @@ function errorAt(doc: Text, line: number, column: number, message: string): Diag
   return { ...clamp(doc, from, from + Math.max(word, 1)), severity: 'error', message: capitalize(message) }
 }
 
-function checkJs(doc: Text, js: Awaited<ReturnType<typeof javascript>>): Diagnostic[] {
+function checkJs(doc: Text, js: Awaited<ReturnType<typeof javascript>>, path: string): Diagnostic[] {
+  const text = doc.toString()
+  let ast: Record<string, unknown>
   try {
-    js.parseJs(doc.toString())
-    return []
+    ast = js.parseJs(text)
   } catch (e) {
     const error = js.syntaxErrorOf(e)
     if (!error) throw e
     return [errorAt(doc, error.line, error.column, error.message)]
   }
+  if (!isKubejsScript(path)) return []
+  return checkKubejsAst(doc, ast, path, currentKubejsContext())
 }
 
 function checkYaml(doc: Text): Diagnostic[] {

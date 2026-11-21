@@ -8,8 +8,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
-const IGNORED_ROOTS: [&str; 11] = [".git", "saves", "logs", "crash-reports", "screenshots", "local", "backups", "cache", "debug", ".mixin.out", "downloads"];
-const IGNORED_PREFIXES: [&str; 2] = ["journeymap/data/", "config/spark/"];
+const IGNORED_ROOTS: [&str; 14] = [".git", "saves", "logs", "crash-reports", "screenshots", "local", "backups", "simplebackups", "cache", "debug", ".mixin.out", "downloads", ".probe", ".rhino_cache"];
+const IGNORED_PREFIXES: [&str; 5] = ["journeymap/data/", "config/spark/", "kubejs/probe/", "kubejs/local/", "kubejs/exported/"];
 // Commits, checkouts, fetches and tags from outside packraven only touch .git, and these are the
 // files they rewrite. We leave out .git/index, which every staging and status call can rewrite.
 const GIT_REF_FILES: [&str; 3] = [".git/HEAD", ".git/packed-refs", ".git/FETCH_HEAD"];
@@ -110,6 +110,11 @@ mod tests {
     fn skips_noisy_folders() {
         assert!(relevant("config/fml.toml"));
         assert!(relevant("kubejs/server_scripts/main.js"));
+        assert!(!relevant(".probe/generated/items.d.ts"));
+        assert!(!relevant(".rhino_cache/script.bin"));
+        assert!(!relevant("kubejs/probe/generated/items.d.ts"));
+        assert!(!relevant("kubejs/local/cache.json"));
+        assert!(!relevant("kubejs/exported/recipes.json"));
         assert!(!relevant("saves/New World/level.dat"));
         assert!(!relevant(".git/index"));
         assert!(!relevant("logs/latest.log"));

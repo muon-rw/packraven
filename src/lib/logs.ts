@@ -23,6 +23,8 @@ export interface Entry {
 // and NeoForge) or "(logger)" (Fabric), then the message. A line that doesn't match, like a
 // stack trace frame or a row of the mod list, continues the entry above it.
 const HEADER = /^\[([^\]]+)\] \[(.+?)\/(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|SEVERE)\](?: \[([^\]]*)\])?(?: \(([^)]*)\))?:? ?(.*)$/
+// KubeJS writes its own logs, like logs/kubejs/server.log, as "[time] [LEVEL] message", with no thread.
+const KUBEJS_HEADER = /^\[(\d{1,2}:\d{2}:\d{2})\] \[(TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|SEVERE)\] ?(.*)$/
 
 const LEVELS: Record<string, Level> = {
   TRACE: 'debug',
@@ -37,7 +39,10 @@ const LEVELS: Record<string, Level> = {
 
 function parseHead(line: string): Head | null {
   const match = HEADER.exec(line)
-  if (!match) return null
+  if (!match) {
+    const kubejs = KUBEJS_HEADER.exec(line)
+    return kubejs ? { time: kubejs[1], thread: '', level: kubejs[2], logger: '', marker: '', message: kubejs[3] } : null
+  }
   const [, time, thread, level, bracketLogger, fabricLogger, message] = match
   // debug.log stamps the date too, which repeats on every line, so we keep the time.
   const clock = time.includes(' ') ? time.slice(time.lastIndexOf(' ') + 1) : time

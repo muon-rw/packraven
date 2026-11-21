@@ -3,7 +3,8 @@
   import { SvelteSet } from 'svelte/reactivity'
   import { EditorView } from '@codemirror/view'
   import type { Text } from '@codemirror/state'
-  import { openLintPanel } from '@codemirror/lint'
+  import { closeCompletion, completionStatus } from '@codemirror/autocomplete'
+  import { closeLintPanel, openLintPanel } from '@codemirror/lint'
   import { ask } from '@tauri-apps/plugin-dialog'
   import { listen } from '@tauri-apps/api/event'
   import { revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -24,6 +25,8 @@
   import MarkdownPreview from '../components/MarkdownPreview.svelte'
   import { SvelteMap } from 'svelte/reactivity'
   import { canFormat, isGzip, outerArchive, packTarget, viewerFor } from '../lib/viewers'
+  import { isKubejsScript } from '../lib/kubejs'
+  import { probejs, refreshProbejs } from '../lib/probejs.svelte'
   import type { FormatOutcome } from '../lib/format'
   import ContextMenu from '../components/ContextMenu.svelte'
   import type { MenuItem } from '../lib/menu'
@@ -31,7 +34,7 @@
   import PackOverrideDialog, { type OverrideItem } from '../components/PackOverrideDialog.svelte'
   import Splitter from '../components/Splitter.svelte'
   import { StoredSplit, clamp } from '../lib/storedSplit.svelte'
-  import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
+  import { BACK_PRIORITY, hasOpenModal, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
 
   let { pack }: { pack: string | null } = $props()
@@ -105,14 +108,23 @@
     if (fs.seq) loadChanges()
   })
 
-  // The Git view's "Open in Files" sends you here with a file to open and show in the tree.
+  // The Git view's "Open in Files" and log script links send you here with a file (and optional line).
   $effect(() => {
     const path = nav.filePath
     if (!path || !tree) return
+    const line = nav.fileLine
     nav.filePath = null
+    nav.fileLine = null
     untrack(() => {
       query = ''
-      tree.show(path).then(() => openFile(path, true))
+      tree.show(path).then(async () => {
+        await openFile(path, true)
+        if (!line || workspace.active !== path || !view) return
+        const doc = view.state.doc
+        const target = doc.line(Math.min(Math.max(line, 1), doc.lines))
+        view.dispatch({ selection: { anchor: target.from }, effects: EditorView.scrollIntoView(target.from, { y: 'center' }) })
+        view.focus()
+      })
     })
   })
 
@@ -165,20 +177,25 @@
     // setState on each keystroke rebuilds the view and throws off its scroll position.
     const state = untrack(() => workspace.tabs.find((t) => t.path === path)?.state)
     if (!host) return
-    if (!state) {
-      bindView(null, null)
-      view?.destroy()
-      view = null
-      return
-    }
-    if (view) view.setState(state)
-    else {
-      view = new EditorView({ state, parent: host })
-      view.scrollDOM.addEventListener('scroll', onEditorScroll)
-    }
-    const editor = view
-    bindView(path, (spec) => editor.dispatch(spec))
-    if (focusEditor) view.focus()
+    const parent = host
+    // Building the view runs each extension's setup, which reads stores like the ProbeJS status.
+    // Tracking those would rebuild the editor whenever one of them changes.
+    untrack(() => {
+      if (!state) {
+        bindView(null, null)
+        view?.destroy()
+        view = null
+        return
+      }
+      if (view) view.setState(state)
+      else {
+        view = new EditorView({ state, parent })
+        view.scrollDOM.addEventListener('scroll', onEditorScroll)
+      }
+      const editor = view
+      bindView(path, (spec) => editor.dispatch(spec))
+      if (focusEditor) view.focus()
+    })
   })
 
   $effect(() => {
@@ -357,9 +374,26 @@
 
   const inFocusedPane = paneFocus()
 
+  useBack(BACK_PRIORITY.overlay, () => {
+    if (!inFocusedPane() || !view || hasOpenModal() || completionStatus(view.state) === null) return false
+    closeCompletion(view)
+    view.focus()
+    return true
+  })
+
+  // The problems panel docks under the editor rather than floating over it, so a modal dialog
+  // above it takes Escape first.
   useBack(BACK_PRIORITY.detail, () => {
-    if (!inFocusedPane() || !formatNote) return false
-    formatNote = null
+    if (!inFocusedPane() || !view) return false
+    const focusWasInEditor = view.dom.contains(document.activeElement)
+    if (!closeLintPanel(view)) return false
+    if (focusWasInEditor) view.focus()
+    return true
+  })
+
+  useBack(BACK_PRIORITY.detail, () => {
+    if (!inFocusedPane() || !toolbarNote) return false
+    toolbarNote = null
     return true
   })
 
@@ -611,8 +645,8 @@
     }
   }
 
-  let formatNote = $state<{ path: string; text: string; warn: boolean; doc: Text } | null>(null)
-  let formatTimer = 0
+  let toolbarNote = $state<{ path: string; text: string; warn: boolean; doc: Text } | null>(null)
+  let toolbarNoteTimer = 0
   let formatting = false
   // Formatting blocks the window until it's done, which takes about a second for a YAML file
   // this long, so past it we show that we're working first.
@@ -621,7 +655,7 @@
   // A note about the file goes stale once you edit it or switch tabs. Until then, a problem
   // stays up so you have time to read which line to fix.
   $effect(() => {
-    if (formatNote && (current?.path !== formatNote.path || (current.state && current.state.doc !== formatNote.doc))) formatNote = null
+    if (toolbarNote && (current?.path !== toolbarNote.path || (current.state && current.state.doc !== toolbarNote.doc))) toolbarNote = null
   })
 
   // The formatters are part of the lazily loaded editor bundle, so we load them only when you ask.
@@ -638,8 +672,8 @@
       const { formatView } = await import('../lib/format')
       if (!view || workspace.active !== path) return
       if (view.state.doc.length > SLOW_FORMAT_CHARS) {
-        clearTimeout(formatTimer)
-        formatNote = { path, text: 'Formatting…', warn: false, doc: view.state.doc }
+        clearTimeout(toolbarNoteTimer)
+        toolbarNote = { path, text: 'Formatting…', warn: false, doc: view.state.doc }
         await new Promise((painted) => requestAnimationFrame(() => requestAnimationFrame(painted)))
         if (!view || workspace.active !== path) return
       }
@@ -651,16 +685,20 @@
     }
   }
 
+  function showToolbarNote(path: string, text: string, { warn, lingers }: { warn: boolean; lingers: boolean }) {
+    if (!view) return
+    toolbarNote = { path, text, warn, doc: view.state.doc }
+    announce(text)
+    clearTimeout(toolbarNoteTimer)
+    if (!lingers) toolbarNoteTimer = setTimeout(() => (toolbarNote = null), 3000)
+  }
+
   function showFormatOutcome(path: string, outcome: FormatOutcome) {
     if (!view) return
     const warn = outcome.kind === 'invalid' || outcome.kind === 'unsafe'
-    const text = formatMessage(outcome)
-    formatNote = { path, text, warn, doc: view.state.doc }
-    announce(text)
+    showToolbarNote(path, formatMessage(outcome), { warn, lingers: warn })
     // After a click, the button keeps focus, and undo only works in the editor.
     view.focus()
-    clearTimeout(formatTimer)
-    if (!warn) formatTimer = setTimeout(() => (formatNote = null), 3000)
   }
 
   // The linter is part of the lazily loaded editor bundle, so we load it only when you ask.
@@ -778,6 +816,64 @@
     if (wanted) api.defaultApp(wanted).then((app) => extension === wanted && (defaultApp = app), () => {})
   })
 
+  function formatProbejsSize(bytes: number) {
+    return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`
+  }
+
+  function formatProbejsTime(ms: number) {
+    return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`
+  }
+
+  function failedProbejsFiles() {
+    const shown = probejs.failedFiles.slice(0, 3).join(', ')
+    const more = probejs.failedFiles.length - 3
+    return more > 0 ? `${shown} and ${more} more` : shown
+  }
+
+  let probejsControl = $derived.by(() => {
+    switch (probejs.status) {
+      case 'idle':
+      case 'loading':
+        return { label: 'Loading ProbeJS…', tone: 'muted', title: 'Loading ProbeJS typings for completions and hovers.' }
+      case 'ready':
+        if (probejs.failedFiles.length) {
+          return {
+            label: 'ProbeJS partial',
+            tone: 'problems warn',
+            title: `ProbeJS typings active, but we couldn't read ${plural(probejs.failedFiles.length, 'file')} (${failedProbejsFiles()}), so completions from them are missing. Click to reload.`,
+          }
+        }
+        return {
+          label: 'ProbeJS',
+          tone: '',
+          title: `ProbeJS typings active (${probejs.fileCount.toLocaleString()} files, ${probejs.typeCount.toLocaleString()} types, ${formatProbejsSize(probejs.totalBytes)} indexed in ${formatProbejsTime(probejs.loadMs)}). Click to reload after /probejs dump.`,
+        }
+      case 'unavailable':
+        return { label: 'No ProbeJS', tone: 'muted', title: 'No ProbeJS typings in this pack yet. Run /probejs dump in game, then click to load them.' }
+      case 'error':
+        return { label: 'ProbeJS error', tone: 'problems warn', title: `Couldn't load ProbeJS typings: ${probejs.error}. Click to retry.` }
+    }
+  })
+
+  // The hover text never shows for keyboard focus, so after a click we put the outcome and the
+  // next step in the toolbar note.
+  async function reloadProbejs() {
+    const path = current?.path
+    if (!path || probejs.status === 'loading') return
+    const ok = await refreshProbejs()
+    if (current?.path !== path) return
+    const failed = probejs.failedFiles.length
+    if (ok && !failed) {
+      showToolbarNote(path, 'Reloaded ProbeJS typings.', { warn: false, lingers: false })
+    } else if (ok) {
+      showToolbarNote(path, `Reloaded ProbeJS typings, but we couldn't read ${plural(failed, 'file')}: ${failedProbejsFiles()}.`, { warn: true, lingers: true })
+    } else if (probejs.error) {
+      showToolbarNote(path, `Couldn't load ProbeJS typings: ${probejs.error}`, { warn: true, lingers: true })
+    } else {
+      showToolbarNote(path, 'No ProbeJS typings yet. Run /probejs dump in game, then click No ProbeJS to load them.', { warn: false, lingers: true })
+    }
+  }
+
   let problems = $derived.by(() => {
     if (!current?.state) return null
     const { errors, warnings } = current.problems
@@ -890,6 +986,15 @@
           {#if problems}
             <button class="ghost action problems {problems.tone}" title="Show problems ({shortcut('Ctrl+Shift+M')})" onclick={showProblems}>{problems.text}</button>
           {/if}
+          {#if current.state && !current.large && !readOnly && isKubejsScript(current.path)}
+            <button
+              class="ghost action {probejsControl.tone}"
+              aria-busy={probejs.status === 'loading'}
+              aria-disabled={probejs.status === 'loading'}
+              title={probejsControl.title}
+              onclick={reloadProbejs}
+            >{probejsControl.label}</button>
+          {/if}
           {#if current.state && current.large}
             <span class="muted small" title="Checking and folding are off for this large file, so typing stays responsive.">Simplified editor</span>
           {:else if current.state && current.lintPaused}
@@ -919,8 +1024,8 @@
             </button>
           {/if}
         </span>
-        {#if formatNote?.path === current.path}
-          <p class="toolbar-note" class:warn={formatNote.warn} aria-hidden="true">{formatNote.text}</p>
+        {#if toolbarNote?.path === current.path}
+          <p class="toolbar-note" class:warn={toolbarNote.warn} aria-hidden="true">{toolbarNote.text}</p>
         {:else if overrideNote?.path === current.path}
           <p class="toolbar-note" aria-hidden="true">{overrideNote.text}</p>
         {:else if readOnly && blockedNotice}
@@ -1129,6 +1234,10 @@
     padding-inline: 6px;
     color: var(--forest);
     white-space: nowrap;
+  }
+
+  .action.muted {
+    color: var(--muted);
   }
 
   .editor {

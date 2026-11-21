@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -32,13 +32,17 @@ const TESTED_MODS: &str = "tested-mods.json";
 const SECOND_CLIENT_OWNS: [&str; 8] = ["saves", "logs", "crash-reports", "screenshots", ".fabric", "options.txt", "servers.dat", "usercache.json"];
 const SEEDED_FROM_INSTANCE: [&str; 2] = ["options.txt", "servers.dat"];
 
-#[derive(Default)]
 pub struct Managed {
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     kill: Mutex<Option<oneshot::Sender<()>>>,
+    pub started: SystemTime,
 }
 
 impl Managed {
+    fn starting_now() -> Self {
+        Self { stdin: Default::default(), kill: Default::default(), started: SystemTime::now() }
+    }
+
     pub async fn send(&self, line: &str) -> Result<()> {
         let mut stdin = self.stdin.lock().await;
         let pipe = stdin.as_mut().context("the server is not running")?;
@@ -192,6 +196,65 @@ pub fn sync_server_dir(mut plan: FilePlan, pack: &Pack, test_dir: &Path, recopy_
     mirror(test_dir, &plan, &KEPT_ON_RESYNC, recopy_all).context("couldn't update the test server folder. Is a server from an earlier run still open?")
 }
 
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct KubejsSyncReport {
+    pub updated: usize,
+    pub removed: usize,
+    pub unchanged: usize,
+    pub startup_changed: bool,
+    pub client_changed: bool,
+}
+
+// KubeJS 6's `/kubejs reload server_scripts` doesn't rerun recipe, tag or loot events, so we always
+// send a full datapack reload, which reruns the server scripts too.
+pub const KUBEJS_RELOAD_COMMAND: &str = "reload";
+
+const KUBEJS_SERVER_FOLDERS: [&str; 2] = ["kubejs/server_scripts", "kubejs/data"];
+
+// The first test client runs from the pack folder itself, so it reads your client scripts and
+// assets as you save them, but only loads them again when you press F3+T.
+const KUBEJS_CLIENT_FOLDERS: [&str; 2] = ["kubejs/client_scripts", "kubejs/assets"];
+
+fn server_plan(pack: &Pack, folder: &str) -> Result<FilePlan> {
+    let mut plan = FilePlan::new();
+    for file in crate::export::server_files_under(pack, folder)? {
+        let relative = file.strip_prefix(folder).unwrap_or(&file).trim_start_matches('/').to_string();
+        plan.insert(relative, Planned::Copy(pack.dir.join(&file)));
+    }
+    Ok(plan)
+}
+
+pub fn sync_kubejs_to_server(pack: &Pack, test_dir: &Path, client_started: Option<SystemTime>) -> Result<KubejsSyncReport> {
+    if !test_dir.is_dir() {
+        bail!("the test server folder isn't ready yet");
+    }
+    let mut report = KubejsSyncReport { updated: 0, removed: 0, unchanged: 0, startup_changed: false, client_changed: false };
+    for folder in KUBEJS_SERVER_FOLDERS {
+        let plan = server_plan(pack, folder)?;
+        let dest = test_dir.join(folder);
+        if plan.is_empty() && !dest.exists() {
+            continue;
+        }
+        let mirrored = mirror(&dest, &plan, &[], false).with_context(|| format!("syncing {folder} to the test server"))?;
+        report.updated += mirrored.written;
+        report.removed += mirrored.removed;
+        report.unchanged += mirrored.unchanged;
+    }
+    // A running server has already run its startup scripts, so we leave them as they are and
+    // tell you a restart is needed.
+    report.startup_changed = crate::mirror::out_of_date(&test_dir.join("kubejs/startup_scripts"), &server_plan(pack, "kubejs/startup_scripts")?);
+    report.client_changed = client_started.is_some_and(|started| {
+        KUBEJS_CLIENT_FOLDERS.iter().any(|folder| {
+            walkdir::WalkDir::new(pack.dir.join(folder))
+                .into_iter()
+                .flatten()
+                .any(|entry| entry.file_type().is_file() && entry.metadata().ok().and_then(|m| m.modified().ok()).is_some_and(|modified| modified > started))
+        })
+    });
+    Ok(report)
+}
+
 // We leave online-mode to the pack. A test server only ever listens on this PC, since a pack with
 // online mode off would let anyone join under any name. The test client joins by that address too.
 fn test_properties(text: &str, port: u16) -> String {
@@ -310,7 +373,7 @@ pub async fn run_server(app: AppHandle, run: Arc<TestRun>, pack: &Pack, java: Pa
         }
     });
     let child = spawn_watched(command, &log, true, Some(hook))?;
-    let managed = Arc::new(Managed::default());
+    let managed = Arc::new(Managed::starting_now());
     *run.server.lock().unwrap() = Some(managed.clone());
     emit(&app, "server-started", test_dir.to_string_lossy());
     let result = supervise(child, managed, &run.server).await;
@@ -333,7 +396,7 @@ pub async fn run_client(app: AppHandle, run: Arc<TestRun>, settings: &Settings, 
     let mut command = Command::new(&launch.java);
     command.current_dir(&dirs.game).args(&launch.args);
     let child = spawn_watched(command, &log, false, None)?;
-    let managed = Arc::new(Managed::default());
+    let managed = Arc::new(Managed::starting_now());
     *run.client(slot).lock().unwrap() = Some(managed.clone());
     emit(&app, "client-started", client_job(slot));
     let result = supervise(child, managed, run.client(slot)).await;
@@ -436,5 +499,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&pack.dir);
         assert_eq!(changed, Some(Untested::Changed { mods: 1, minecraft: false, loader: false }));
         assert_eq!(never, Some(Untested::Never));
+    }
+
+    #[test]
+    fn syncs_kubejs_server_files_the_server_pack_would_ship() {
+        let mut pack = pack_in("kubejs-sync");
+        let server = pack_in("kubejs-sync-server").dir;
+        std::fs::create_dir_all(server.join("world")).unwrap();
+        std::fs::write(server.join("world/level.dat"), "keep").unwrap();
+        for (path, text) in [
+            ("kubejs/server_scripts/recipes.js", "ServerEvents.recipes(e => {})"),
+            ("kubejs/server_scripts/dev_only.js", "// dev"),
+            ("kubejs/server_scripts/scratch.js", "// scratch"),
+            (".gitignore", "scratch.js"),
+        ] {
+            std::fs::create_dir_all(pack.dir.join(path).parent().unwrap()).unwrap();
+            std::fs::write(pack.dir.join(path), text).unwrap();
+        }
+        crate::git::run(&pack.dir, &["init", "-q"]).unwrap();
+        pack.config.server.exclude = vec!["kubejs/server_scripts/dev_only.js".into()];
+
+        let first = sync_kubejs_to_server(&pack, &server, None).unwrap();
+        assert_eq!(first, KubejsSyncReport { updated: 1, removed: 0, unchanged: 0, startup_changed: false, client_changed: false });
+        assert!(server.join("kubejs/server_scripts/recipes.js").is_file());
+        assert!(!server.join("kubejs/server_scripts/dev_only.js").exists());
+        assert!(!server.join("kubejs/server_scripts/scratch.js").exists());
+        assert_eq!(std::fs::read_to_string(server.join("world/level.dat")).unwrap(), "keep");
+
+        let client_started = SystemTime::now() - Duration::from_secs(5);
+        for path in ["kubejs/data/test/recipes/a.json", "kubejs/startup_scripts/items.js", "kubejs/client_scripts/tooltips.js"] {
+            std::fs::create_dir_all(pack.dir.join(path).parent().unwrap()).unwrap();
+            std::fs::write(pack.dir.join(path), "{}").unwrap();
+        }
+        let second = sync_kubejs_to_server(&pack, &server, Some(client_started)).unwrap();
+        assert_eq!(second, KubejsSyncReport { updated: 1, removed: 0, unchanged: 1, startup_changed: true, client_changed: true });
+        assert!(server.join("kubejs/data/test/recipes/a.json").is_file());
+        assert!(!server.join("kubejs/startup_scripts/items.js").exists());
+        let _ = std::fs::remove_dir_all(&pack.dir);
+        let _ = std::fs::remove_dir_all(&server);
     }
 }

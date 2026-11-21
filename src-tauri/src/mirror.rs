@@ -16,9 +16,9 @@ pub type FilePlan = BTreeMap<String, Planned>;
 
 #[derive(Default)]
 pub struct MirrorReport {
-    written: usize,
-    unchanged: usize,
-    removed: usize,
+    pub written: usize,
+    pub unchanged: usize,
+    pub removed: usize,
 }
 
 impl fmt::Display for MirrorReport {
@@ -48,6 +48,17 @@ pub fn mirror(dest: &Path, plan: &FilePlan, keep: &[&str], recopy_all: bool) -> 
         report.written += 1;
     }
     Ok(report)
+}
+
+pub fn out_of_date(dest: &Path, plan: &FilePlan) -> bool {
+    let stale = plan.iter().any(|(path, planned)| !up_to_date(&dest.join(path), planned));
+    let extra = || {
+        WalkDir::new(dest).into_iter().flatten().filter(|entry| entry.file_type().is_file()).any(|entry| {
+            let relative = entry.path().strip_prefix(dest).map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            !plan.contains_key(&relative)
+        })
+    };
+    stale || (dest.exists() && extra())
 }
 
 fn remove_unplanned(dest: &Path, plan: &FilePlan, keep: &[&str], remove_all: bool) -> Result<usize> {

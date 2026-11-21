@@ -2,11 +2,11 @@
   import { onMount, tick } from 'svelte'
   import { openUrl } from '@tauri-apps/plugin-opener'
   import Notice from '../components/Notice.svelte'
-  import { api, errorText, type ClientSlot, type Overview } from '../lib/api'
+  import { api, errorText, type ClientSlot, type KubejsSyncReport, type Overview } from '../lib/api'
   import { SIGN_IN_FIRST, cancelSignIn, minecraft, signIn } from '../lib/minecraft.svelte'
   import { clientJob, job, serverPack, setQuickTestSecondClient, testOptions, testState } from '../lib/jobs.svelte'
   import { killServer, launch, launchClient, memoryWarningText, restartServer, startServer, stopServer } from '../lib/launch.svelte'
-  import { appSettingsView, nav, packSettingsView, serverView } from '../lib/nav.svelte'
+  import { appSettingsView, nav, packSettingsView, serverView, showInFiles } from '../lib/nav.svelte'
   import JobLog from '../components/JobLog.svelte'
   import Tip from '../components/Tip.svelte'
   import LinkedText from '../components/LinkedText.svelte'
@@ -29,6 +29,10 @@
   let serverWidth = $derived(clamp(splitTotal * (logSplit.value ?? 0.5), logMin, splitTotal - logMin))
 
   let command = $state('')
+  let kubejsReloading = $state(false)
+  let kubejsPending = $state<{ startup: boolean; client: boolean } | null>(null)
+  let kubejsAnnouncement = $state('')
+  let kubejsNoteElement = $state<HTMLElement | null>(null)
   let error: string | null = $state(null)
 
   const WAIT_FOR_MODS = 'Wait for packraven to finish changing mods'
@@ -82,6 +86,39 @@
     if (!line || whyNoSend) return
     await run(() => (line === 'stop' ? stopServer() : api.serverCommand(line)))
     command = ''
+  }
+
+  const STARTUP_PENDING = "Restart the server to apply your startup script changes, and the game too if it's open."
+  const CLIENT_PENDING = 'Press F3+T in the game to load your client script and asset changes.'
+
+  $effect(() => {
+    if (!serverRunning) kubejsPending = null
+  })
+
+  // Reload only reaches server scripts and data, so we say which of your other edits it left out.
+  // We clear the live region first, so the same result read twice is still announced.
+  async function reloadKubejs() {
+    if (whyNoReloadKubejs) return
+    kubejsReloading = true
+    kubejsPending = null
+    kubejsAnnouncement = ''
+    try {
+      await run(async () => {
+        const report: KubejsSyncReport = await api.reloadKubejsServer()
+        const pending = { startup: report.startupChanged, client: report.clientChanged }
+        kubejsAnnouncement = [
+          'Reloaded KubeJS server scripts and data.',
+          pending.startup ? STARTUP_PENDING : '',
+          pending.client ? CLIENT_PENDING : '',
+        ].filter(Boolean).join(' ')
+        if (!pending.startup && !pending.client) return
+        kubejsPending = pending
+        await tick()
+        kubejsNoteElement?.scrollIntoView({ block: 'nearest' })
+      })
+    } finally {
+      kubejsReloading = false
+    }
   }
 
   function openAccounts(anchor: string) {
@@ -204,6 +241,15 @@
               : null,
   )
   let whyNoSend = $derived(!serverRunning ? "The test server isn't running" : !command.trim() ? 'Type a command first' : null)
+  let whyNoReloadKubejs = $derived(
+    !serverRunning
+      ? "The test server isn't running"
+      : !testState.serverReady
+        ? 'Wait for the test server to finish starting'
+        : kubejsReloading
+          ? 'Syncing and reloading KubeJS'
+          : null,
+  )
   let recopyHint = $derived(
     serverRunning
       ? 'Stop the test server to change this.'
@@ -382,10 +428,43 @@
           {#snippet children(why)}<button type="submit" aria-disabled={!!whyNoSend} aria-describedby={why}>Send</button>{/snippet}
         </Tip>
       </form>
-      <p class="hint muted" id="console-hint">
-        {serverRunning ? 'Send commands to the server console. Use Stop to save and shut down, or Kill to end the process without saving.' : 'You can send commands once the server is running.'}
-        Server crashing due to a mod? <button class="link" onclick={() => ((serverView.tab = 'mods'), (serverView.filter = 'all'), onserver())}>Leave it off the server</button>.
-      </p>
+      <div class="hint">
+        <p class="muted" id="console-hint">
+          {serverRunning ? 'Send commands to the server console. Use Stop to save and shut down, or Kill to end the process without saving.' : 'You can send commands once the server is running.'}
+          Server crashing due to a mod? <button class="link" onclick={() => ((serverView.tab = 'mods'), (serverView.filter = 'all'), onserver())}>Leave it off the server</button>.
+        </p>
+        {#if overview?.kubejsInstalled || overview?.kubejsLogs.length}
+          <div class="kubejs-bar">
+            {#if overview?.kubejsInstalled}
+              <Tip tip={whyNoReloadKubejs ?? 'Copy changed kubejs/server_scripts and kubejs/data to the test server and reload them'}>
+                {#snippet children(why)}
+                  <button type="button" class="kubejs-reload" class:busy={kubejsReloading} aria-disabled={!!whyNoReloadKubejs} aria-describedby={why} onclick={reloadKubejs}>
+                    {kubejsReloading ? 'Reloading KubeJS' : 'Reload KubeJS'}
+                  </button>
+                {/snippet}
+              </Tip>
+            {/if}
+            {#if overview?.kubejsLogs.length}
+              <span class="kubejs-logs muted">
+                KubeJS logs:
+                {#each overview.kubejsLogs as logPath, index (logPath)}
+                  {#if index > 0}<span aria-hidden="true">·</span>{/if}
+                  <button type="button" class="link" onclick={() => showInFiles(logPath)}>{logPath.slice(logPath.lastIndexOf('/') + 1)}</button>
+                {/each}
+              </span>
+            {/if}
+            <p class="visually-hidden" role="status">{kubejsAnnouncement}</p>
+            {#if kubejsPending}
+              <div class="kubejs-note" bind:this={kubejsNoteElement}>
+                {#if kubejsPending.startup}
+                  <p>{STARTUP_PENDING} <button type="button" class="link" onclick={() => run(restartServer)}>Restart server</button></p>
+                {/if}
+                {#if kubejsPending.client}<p>{CLIENT_PENDING}</p>{/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
+      </div>
     </div>
 
     <Splitter value={serverWidth} min={logMin} max={splitTotal - logMin} total={splitTotal} label="Resize the server and client logs" controls="server-pane" onresize={(px) => logSplit.set(px / splitTotal)} onreset={() => logSplit.reset()} />
@@ -653,6 +732,37 @@
 
   .hint {
     font-size: var(--step--1);
+  }
+
+  .kubejs-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
+    margin-top: 8px;
+  }
+
+  .kubejs-reload {
+    padding: 3px 10px;
+    font-size: var(--step--1);
+    white-space: nowrap;
+  }
+
+  .kubejs-note {
+    flex-basis: 100%;
+    font-size: var(--step--1);
+    color: var(--warn);
+  }
+
+  .kubejs-note p {
+    margin: 0;
+  }
+
+  .kubejs-logs {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0 5px;
   }
 
   .console input {

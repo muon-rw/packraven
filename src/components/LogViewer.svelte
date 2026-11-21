@@ -2,6 +2,7 @@
   import { untrack } from 'svelte'
   import { api, errorText } from '../lib/api'
   import { LogModel } from '../lib/logs'
+  import { kubejsLogFolder } from '../lib/logLinks'
   import LogPanel from './LogPanel.svelte'
 
   let { path }: { path: string } = $props()
@@ -64,7 +65,7 @@
 <div class="viewer">
   {#if truncated}<p class="note muted">This log is larger than 64 MB, so we show only its end.</p>{/if}
   {#if loadError}<p class="note failed">{loadError}</p>{/if}
-  <LogPanel {model} {version} {generation} live={followable} loading={!loaded && !loadError} label="Log lines" empty="This log is empty." />
+  <LogPanel {model} {version} {generation} live={followable} loading={!loaded && !loadError} label="Log lines" empty="This log is empty." scriptFolder={kubejsLogFolder(path)} />
 </div>
 
 <style>

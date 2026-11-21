@@ -37,6 +37,7 @@
     },
     openloader: { data: 'Loads the packs in config/openloader/data.', resource: 'Turns on the packs in config/openloader/resources.' },
     globalpacks: { data: 'Loads the folders and packs listed in config/global_packs.toml.', resource: 'Turns on the folders and packs listed in config/global_packs.toml.' },
+    kubejs: { data: 'Loads data overrides directly from kubejs/data.', resource: 'Loads resource overrides directly from kubejs/assets.' },
   }
 
   let dialog: HTMLDialogElement
@@ -78,6 +79,8 @@
   let allDirs = $derived(targets.length > 0 && targets.every((t) => t.isDir))
   let what = $derived(describeItems(targets))
   let installed = $derived(loaders?.filter((l) => l.installed) ?? [])
+  // Offer only dedicated pack loaders to install; KubeJS shows up automatically when already present.
+  let offerLoaders = $derived(loaders?.filter((l) => l.id !== 'kubejs') ?? [])
   let folders = $derived(
     [
       ...installed.flatMap((l) => l.folders.map((f) => ({ folder: f, by: l.name }))),
@@ -89,7 +92,7 @@
     folders.flatMap(({ folder, by }) =>
       folder.packs
         .filter((p) => !p.zipped)
-        .map((p): Option => ({ path: p.path, name: p.name, enabled: p.enabled, where: [folder.path, by, enabledLabel(p.enabled)].filter(Boolean).join(' · ') })),
+        .map((p): Option => ({ path: p.path, name: p.name, enabled: p.enabled, where: [folder.path, by === p.name ? '' : by, enabledLabel(p.enabled)].filter(Boolean).join(' · ') })),
     ),
   )
   let zipped = $derived(folders.flatMap(({ folder }) => folder.packs.filter((p) => p.zipped).map((p) => p.name)))
@@ -163,7 +166,7 @@
       showOffer()
       return
     }
-    selected = remembered.pack && options.some((o) => o.path === remembered.pack) ? remembered.pack : NEW
+    selected = remembered.pack && options.some((o) => o.path === remembered.pack) ? remembered.pack : creatable.length ? NEW : (options[0]?.path ?? NEW)
     newFolder = creatable[0] ?? ''
     await tick()
     focusChoice()
@@ -180,7 +183,7 @@
     await tick()
     dialog.querySelector<HTMLElement>('#override-cancel')?.focus()
     focusPending = true
-    for (const loader of loaders ?? []) {
+    for (const loader of offerLoaders) {
       if (found[loader.id]?.state === 'found') continue
       found[loader.id] = { state: 'searching' }
       api
@@ -197,7 +200,7 @@
   // We wait for the loaders listed before one, so focus lands on the recommended one when it's there.
   async function focusFirstAdd() {
     if (!focusPending || mode !== 'offer') return
-    const first = (loaders ?? []).find((l) => found[l.id]?.state !== 'missing' && found[l.id]?.state !== 'failed')
+    const first = offerLoaders.find((l) => found[l.id]?.state !== 'missing' && found[l.id]?.state !== 'failed')
     if (!first || found[first.id]?.state !== 'found') {
       if (!first) focusPending = false
       return
@@ -469,7 +472,7 @@
               : 'Players have to turn on a resource pack themselves. Add a mod that turns it on for everyone:'}
           </p>
           <ul class="loaders">
-            {#each loaders ?? [] as loader, index (loader.id)}
+            {#each offerLoaders as loader, index (loader.id)}
               {@const lookup = found[loader.id]}
               {@const reason = `override-reason-${loader.id}`}
               <li>

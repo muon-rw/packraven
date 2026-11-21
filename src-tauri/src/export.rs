@@ -72,6 +72,16 @@ pub fn override_files(pack: &Pack, extra_exclude: &[String]) -> Result<Vec<Strin
     Ok(git::tracked_files(&pack.dir)?.into_iter().filter(|path| !excluded.is_match(path) && pack.dir.join(path).is_file()).collect())
 }
 
+// A KubeJS reload is for trying out a script before you commit it, so unlike a full sync we also take
+// untracked files that git doesn't ignore.
+pub fn server_files_under(pack: &Pack, folder: &str) -> Result<Vec<String>> {
+    let excluded = globs(&[pack.config.export.exclude.clone(), server_pack_sources(), pack.config.server.exclude.clone()].concat())?;
+    let listed = git::run(&pack.dir, &["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", folder])?;
+    let mut files: Vec<String> = listed.split('\0').filter(|path| !path.is_empty() && !excluded.is_match(path) && pack.dir.join(path).is_file()).map(String::from).collect();
+    files.dedup();
+    Ok(files)
+}
+
 // We check these on every overview refresh, so we ask git for tracked jars instead of checking
 // every override file. CurseForge rejects packs with jars it doesn't host in overrides. It doesn't
 // check resource packs, shaders or data packs yet, so those go into the client pack without asking;

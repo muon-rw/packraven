@@ -2,6 +2,22 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0]
+### Added
+- Native KubeJS and ProbeJS support:
+- - Autocomplete and hover docs from ProbeJS 6 (`kubejs/probe/`) and ProbeJS 7 (`.probe/`) dumps, powered by a native Rust indexer
+- - Rhino and KubeJS linting for unsupported JS syntax, wrong-folder event hooks, and script header directives
+- - Treat KubeJS as a resource loader (you can quick-copy mod `data/` and `assets/` files into `kubejs/data` and `kubejs/assets`)
+- - Client-only KubeJS folders are excluded from server packs and ProbeJS/Rhino caches are added to `.gitignore`
+- - One-click Reload KubeJS on the running test server, quick links to `logs/kubejs/`, and clickable script links in logs that jump straight to the file and line
+
+### Changed
+- If an author forgot to tag only the most recent version as Client-only on Curseforge, still exclude it from server packs automatically (can still be overridden)
+- The bottom problems panel in the file editor is now resizeable 
+
+### Fixed
+- Launching with Neoforge on packs that had not yet been run once in Curseforge. 
+
 ## [0.5.4] - 2026-11-19
 ### Added
 - Universal back/forward navigation, throughout the app. Power users rejoice! 

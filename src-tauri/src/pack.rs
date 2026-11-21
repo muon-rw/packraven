@@ -18,6 +18,7 @@ pub const SERVER_README: &str = "server-readme.txt";
 pub const DEFAULT_SERVER_README: &str = include_str!("../resources/server-readme.txt");
 pub const DEFAULT_SERVER_CHANGELOG: &str = "Made with [packraven](https://packraven.app)";
 pub const BCC_PROJECT_ID: u64 = 551894;
+pub const KUBEJS_PROJECT_ID: u64 = 238086;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "lowercase")]
@@ -279,7 +280,7 @@ impl Default for ExportConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            exclude: ["resourcepacks/**", "shaderpacks/**", "options.txt", "config/fancymenu/**", "config/drippyloadingscreen/**"]
+            exclude: ["resourcepacks/**", "shaderpacks/**", "options.txt", "config/fancymenu/**", "config/drippyloadingscreen/**", "kubejs/assets/**", "kubejs/client_scripts/**"]
                 .map(String::from)
                 .to_vec(),
             client_only: Vec::new(),
@@ -655,6 +656,30 @@ impl Pack {
 
     pub fn has_bcc(&self) -> bool {
         self.lock.files.iter().any(|e| e.curseforge_project() == Some(BCC_PROJECT_ID) && !e.path.ends_with(".disabled"))
+    }
+
+    pub fn has_kubejs(&self) -> bool {
+        if self.dir.join("kubejs").is_dir() {
+            return true;
+        }
+        let in_lock = self.lock.files.iter().any(|e| {
+            !e.path.ends_with(".disabled")
+                && (e.curseforge_project() == Some(KUBEJS_PROJECT_ID)
+                    || e.path
+                        .rsplit('/')
+                        .next()
+                        .is_some_and(|name| {
+                            let lower = name.to_lowercase();
+                            lower.starts_with("kubejs-") || lower.starts_with("kubejs_")
+                        }))
+        });
+        if in_lock {
+            return true;
+        }
+        std::fs::read_dir(self.dir.join("mods")).into_iter().flatten().flatten().any(|entry| {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            name.ends_with(".jar") && (name.starts_with("kubejs-") || name.starts_with("kubejs_"))
+        })
     }
 
     // BCC only writes its config the first time the game loads it, so we write one up front to

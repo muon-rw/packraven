@@ -78,13 +78,21 @@ struct Known {
 
 // CurseForge splits Paxi into a Fabric project, a Forge/NeoForge one, and a NeoForge one for
 // 1.20.4 to 1.21.1.
-const KNOWN: [Known; 3] = [
+const KNOWN: [Known; 4] = [
     Known { id: "paxi", name: "Paxi", project_ids: &[418881, 515708, 1015157], jar_prefixes: &["paxi-"] },
     Known { id: "openloader", name: "Open Loader", project_ids: &[354339], jar_prefixes: &["openloader", "open-loader", "open_loader"] },
     Known { id: "globalpacks", name: "Global Packs", project_ids: &[317134], jar_prefixes: &["globalpacks", "global-packs", "global_packs"] },
+    Known { id: "kubejs", name: "KubeJS", project_ids: &[crate::pack::KUBEJS_PROJECT_ID], jar_prefixes: &["kubejs-", "kubejs_"] },
 ];
 
-fn installed(jars: &[String], lock: Option<&Lockfile>, known: &Known) -> bool {
+pub fn is_kubejs_pack(pack: &str) -> bool {
+    normalize(pack) == "kubejs"
+}
+
+fn installed(root: &Path, jars: &[String], lock: Option<&Lockfile>, known: &Known) -> bool {
+    if known.id == "kubejs" && root.join("kubejs").is_dir() {
+        return true;
+    }
     let by_project = lock.is_some_and(|lock| lock.files.iter().any(|e| e.curseforge_project().is_some_and(|id| known.project_ids.contains(&id)) && !e.path.ends_with(".disabled")));
     by_project || jars.iter().any(|name| known.jar_prefixes.iter().any(|p| name.starts_with(p)))
 }
@@ -101,14 +109,27 @@ pub fn loaders(root: &Path, lock: Option<&Lockfile>, kind: PackKind) -> Vec<Load
     KNOWN
         .iter()
         .map(|known| {
-            let folders = match known.id {
-                "paxi" => paxi_folders(root, kind),
-                "openloader" => open_loader_folders(root, kind),
-                _ => global_packs_folders(root, kind),
+            let folders = if known.id == "kubejs" {
+                let target = match kind {
+                    PackKind::Data => "kubejs/data",
+                    PackKind::Resource => "kubejs/assets",
+                };
+                vec![PackFolder {
+                    path: target.into(),
+                    exists: root.join("kubejs").is_dir(),
+                    can_create: false,
+                    packs: vec![PackEntry { path: "kubejs".into(), name: "KubeJS".into(), zipped: false, enabled: None }],
+                }]
+            } else {
+                let paths = match known.id {
+                    "paxi" => paxi_folders(root, kind),
+                    "openloader" => open_loader_folders(root, kind),
+                    _ => global_packs_folders(root, kind),
+                };
+                let mut seen = std::collections::HashSet::new();
+                paths.into_iter().filter(|f| seen.insert(f.to_lowercase())).filter_map(|f| folder(root, &f).ok()).collect()
             };
-            let mut seen = std::collections::HashSet::new();
-            let folders = folders.into_iter().filter(|f| seen.insert(f.to_lowercase())).filter_map(|f| folder(root, &f).ok()).collect();
-            Loader { id: known.id, name: known.name, installed: installed(&jars, lock, known), project_ids: known.project_ids, folders }
+            Loader { id: known.id, name: known.name, installed: installed(root, &jars, lock, known), project_ids: known.project_ids, folders }
         })
         .collect()
 }
@@ -291,11 +312,12 @@ pub fn copy_into_pack(root: &Path, sources: &[impl AsRef<str>], pack: &str, meta
         items.push((file, inner, inside));
     }
     let pack = normalize(pack);
+    let kubejs = is_kubejs_pack(&pack);
     let pack_dir = crate::files::resolve(root, &pack)?;
     if pack_dir.is_file() {
         bail!("{pack} is a zipped pack. Extract it to add files to it.");
     }
-    if !is_pack_dir(&pack_dir) && meta.is_none() {
+    if !kubejs && !is_pack_dir(&pack_dir) && meta.is_none() {
         bail!("{pack} isn't a {}: it has no pack.mcmeta", kind.noun());
     }
     let mut entries = Vec::new();
@@ -309,7 +331,7 @@ pub fn copy_into_pack(root: &Path, sources: &[impl AsRef<str>], pack: &str, meta
         paths.push(format!("{pack}/{inside}"));
     }
     let mut created = Vec::new();
-    if !is_pack_dir(&pack_dir) {
+    if !kubejs && !is_pack_dir(&pack_dir) {
         let Some(meta) = meta else { bail!("{pack} isn't a {}: it has no pack.mcmeta", kind.noun()) };
         let fresh = !pack_dir.exists();
         std::fs::create_dir_all(&pack_dir).with_context(|| format!("creating {pack}"))?;
@@ -460,5 +482,29 @@ lang:en_us
         assert!(copy_into_pack(&root, &["mods/a.jar/data/a/recipe/one.json", "mods/a.jar/assets/a/lang/en_us.json"], "datapacks/Mine", None).is_err());
         assert!(copy_into_pack(&root, &["mods/a.jar/assets/a/lang/en_us.json"], "resourcepacks/None", None).is_err());
         assert!(copy_into_pack(&root, &["mods/a.jar/data/a/recipe/one.json"], "../outside", Some("{}")).is_err());
+    }
+
+    #[test]
+    fn recognizes_kubejs_and_copies_without_pack_mcmeta() {
+        let root = fresh("packraven-kubejs-pack-test");
+        jar(&root.join("mods/a.jar"), &[("data/a/recipe/one.json", b"1"), ("assets/a/lang/en_us.json", b"{}")]);
+        assert!(!loaders(&root, None, PackKind::Data).iter().find(|l| l.id == "kubejs").unwrap().installed);
+
+        std::fs::create_dir_all(root.join("kubejs")).unwrap();
+        let data_loader = loaders(&root, None, PackKind::Data).into_iter().find(|l| l.id == "kubejs").unwrap();
+        assert!(data_loader.installed);
+        assert_eq!(data_loader.folders[0].path, "kubejs/data");
+        assert!(!data_loader.folders[0].can_create);
+        assert_eq!(data_loader.folders[0].packs[0].path, "kubejs");
+
+        let copied = copy_into_pack(&root, &["mods/a.jar/data/a/recipe/one.json"], "kubejs", None).unwrap();
+        assert_eq!(copied.paths, ["kubejs/data/a/recipe/one.json"]);
+        assert!(root.join("kubejs/data/a/recipe/one.json").is_file());
+        assert!(!root.join("kubejs/pack.mcmeta").exists());
+
+        let copied_assets = copy_into_pack(&root, &["mods/a.jar/assets/a/lang/en_us.json"], "kubejs", None).unwrap();
+        assert_eq!(copied_assets.paths, ["kubejs/assets/a/lang/en_us.json"]);
+        assert!(root.join("kubejs/assets/a/lang/en_us.json").is_file());
+        assert!(!root.join("kubejs/pack.mcmeta").exists());
     }
 }

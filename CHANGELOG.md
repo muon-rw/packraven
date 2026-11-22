@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.0]
 ### Added
 - Autocomplete, suggestions, hover docs, and error validation for datapack JSON, powered by packraven's own (fast!) engine for [mcdoc](https://github.com/SpyglassMC/vanilla-mcdoc) (the schemas behind misode's datapack website):
 - - Vanilla datapack and `pack.mcmeta` schemas for each Minecraft version

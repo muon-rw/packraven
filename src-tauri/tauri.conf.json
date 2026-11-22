@@ -52,7 +52,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "resources/vineflower.jar": "vineflower.jar"
+      "resources/vineflower.jar": "vineflower.jar",
+      "resources/proberaven/*.jar": "proberaven/"
     },
     "windows": {
       "nsis": {

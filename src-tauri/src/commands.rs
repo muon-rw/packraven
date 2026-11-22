@@ -38,6 +38,7 @@ pub struct AppState {
     pub minecraft: Arc<crate::minecraft_auth::Sessions>,
     pub minecraft_sign_in: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     pub probejs: Arc<crate::probejs::ProbeCache>,
+    pub datapack: Arc<crate::mcdoc::DatapackCache>,
 }
 
 impl AppState {
@@ -892,6 +893,7 @@ pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, 
     let jobs = state.jobs.clone();
     let run = state.test.clone();
     let minecraft = state.minecraft.clone();
+    let datapack_cache = state.datapack.clone();
     let launcher = ClientLauncher::new(&app, &state);
     let job_app = app.clone();
     let logged_warning = warning.clone();
@@ -911,7 +913,11 @@ pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, 
         }
         let version = pack.version().unwrap_or_else(|| "dev".into());
         let sides = classify_cached(&cache_path, &pack).await?;
-        let plan = export::test_server_plan(&pack, &sides, &version, &java, &data_dir, &log).await?;
+        let mut plan = export::test_server_plan(&pack, &sides, &version, &java, &data_dir, &log).await?;
+        let proberaven_hook = crate::mcdoc::proberaven::resolve_bundled_jar(&job_app, &pack).map(|(jar_name, jar_path)| {
+            plan.insert(format!("mods/{jar_name}"), crate::mirror::Planned::Copy(jar_path));
+            (crate::mcdoc::proberaven::dump_output_path(&pack.dir), datapack_cache.clone())
+        });
         log.info(if recopy_all { "Recopying every file in the test server folder" } else { "Syncing changed files to the test server folder" });
         let report = testrun::sync_server_dir(plan, &pack, &test_dir, recopy_all, &log)?;
         let online = testrun::online_mode(&test_dir);
@@ -923,7 +929,7 @@ pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, 
         let server_pack = Pack::open(&pack.dir)?;
         let (server_app, server_run) = (job_app.clone(), run.clone());
         jobs.start(&job_app, "server", move |server_log| async move {
-            testrun::run_server(server_app, server_run, &server_pack, java, test_dir, run_args, ready_tx, tested, server_log).await
+            testrun::run_server(server_app, server_run, &server_pack, java, test_dir, run_args, ready_tx, tested, proberaven_hook, server_log).await
         })
         .map_err(anyhow::Error::msg)?;
         if !clients.contains(&Slot::First) {
@@ -935,6 +941,25 @@ pub fn start_test(app: AppHandle, state: State<'_, AppState>, recopy_all: bool, 
         Ok(if clients.len() > 1 { "Server ready, clients launching" } else { "Server ready, client launching" }.into())
     })
     .map(|()| warning)
+}
+
+#[tauri::command]
+pub fn datapack_probe(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    let settings = state.settings();
+    if !settings.minecraft_eula_accepted {
+        return Err("Accept the Minecraft EULA in Test Server before running a headless registry dump.".into());
+    }
+    let pack = state.pack().map_err(err)?;
+    let java = launch::java(&settings).map_err(err)?;
+    let (data_dir, cache_path) = (state.data_dir.clone(), state.cache_path());
+    let pack_data = state.pack_data();
+    let run_args = settings.combined_run_args(&settings.instance_dir);
+    let datapack_cache = state.datapack.clone();
+    let job_app = app.clone();
+    state.jobs.start(&app, "datapack-probe", move |log| async move {
+        let sides = classify_cached(&cache_path, &pack).await?;
+        crate::mcdoc::proberaven::run_headless_dump(job_app, pack, sides, java, data_dir, pack_data, run_args, datapack_cache, log).await
+    })
 }
 
 fn already_running(slot: Slot) -> &'static str {

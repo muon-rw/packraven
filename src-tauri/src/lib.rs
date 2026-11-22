@@ -31,6 +31,7 @@ mod links;
 mod minecraft_auth;
 mod minecraft_commands;
 mod logs;
+mod mcdoc;
 mod memory;
 mod mirror;
 mod mod_commands;
@@ -148,6 +149,7 @@ pub fn run() {
                 minecraft: Arc::default(),
                 minecraft_sign_in: Mutex::default(),
                 probejs: Arc::default(),
+                datapack: Arc::default(),
             });
             presence::start();
             app.state::<AppState>().rewatch(app.handle());
@@ -312,6 +314,11 @@ pub fn run() {
             file_commands::kubejs_context,
             file_commands::probejs_complete,
             file_commands::probejs_hover,
+            file_commands::datapack_status,
+            file_commands::datapack_lint,
+            file_commands::datapack_complete,
+            file_commands::datapack_hover,
+            commands::datapack_probe,
             file_commands::decompile_class,
             file_commands::extract_archive,
             file_commands::compress_paths,

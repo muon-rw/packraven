@@ -7,14 +7,15 @@ import { parse as parseToml, TomlError } from 'smol-toml'
 import { parseAllDocuments } from 'yaml'
 import { checkKubejsAst, isKubejsScript } from './kubejs'
 import { currentKubejsContext, loadKubejsContext } from './kubejsContext'
+import { api } from './api'
+import { datapack, ensureDatapack, isDatapackJson } from './datapack.svelte'
 
-type Check = (doc: Text) => Diagnostic[]
+type Check = (doc: Text) => Diagnostic[] | Promise<Diagnostic[]>
 
 // Prettier's parser is large, so we load it only once you open a script.
 const javascript = () => import('./javascript')
 
-// Each check re-parses the whole file, so past this long a pass stalls typing noticeably. How
-// long a pass takes depends on the device as much as the file, so we measure it.
+// Each synchronous JS-thread check re-parses the whole file, so past this long a pass stalls typing noticeably.
 const SLOW_CHECK_MS = 150
 
 const checkOnce = Facet.define<() => void>()
@@ -22,11 +23,13 @@ const recheck = StateEffect.define<null>()
 
 /**
  * Returns a linter for the file type that turns itself off, and calls `onPaused`, once a single
- * check runs slow. After that it only checks when you run {@link checkNow}.
+ * main-thread check runs slow. Off-thread checks (like Rust datapack validation) do not stall typing
+ * and are not auto-paused.
  */
 export function lintFor(path: string, onPaused: () => void): Extension {
   const check = checkFor(path)
   if (!check) return []
+  const offThread = isDatapackJson(path)
   let paused = false
   let forced = false
   const source = async (view: EditorView) => {
@@ -35,8 +38,8 @@ export function lintFor(path: string, onPaused: () => void): Extension {
     const doc = view.state.doc
     const run = await check
     const started = performance.now()
-    const diagnostics = run(doc)
-    if (!paused && performance.now() - started > SLOW_CHECK_MS) {
+    const diagnostics = await run(doc)
+    if (!offThread && !paused && performance.now() - started > SLOW_CHECK_MS) {
       paused = true
       onPaused()
     }
@@ -59,11 +62,11 @@ function checkFor(path: string): Check | Promise<Check> | null {
   const ext = name.slice(name.lastIndexOf('.') + 1)
   switch (ext) {
     case 'json':
-      return (doc) => checkJson(doc, false)
+      return isDatapackJson(path) ? datapackCheck(path, (doc) => checkJson(doc, false)) : (doc) => checkJson(doc, false)
     case 'jsonc':
       return (doc) => checkJson(doc, true)
     case 'mcmeta':
-      return name === 'pack.mcmeta' ? checkPackMcmeta : (doc) => checkJson(doc, false)
+      return name === 'pack.mcmeta' ? datapackCheck(path, checkPackMcmeta) : (doc) => checkJson(doc, false)
     case 'json5':
       return checkJson5
     case 'toml':
@@ -117,6 +120,19 @@ const Token = { CloseBrace: 2, CloseBracket: 4, Comma: 5, LineComment: 12, Block
 function checkJson(doc: Text, allowExtensions: boolean): Diagnostic[] {
   const { diagnostics } = parseJson(doc, allowExtensions)
   return diagnostics
+}
+
+function datapackCheck(path: string, local: (doc: Text) => Diagnostic[]): Check {
+  return async (doc: Text) => {
+    const ok = datapack.status === 'ready' || (await ensureDatapack())
+    if (!ok) return local(doc)
+    try {
+      const res = await api.datapackLint(path, doc.toString())
+      return res.map((d) => ({ ...clamp(doc, d.from, Math.max(d.to, d.from + 1)), severity: d.severity, message: d.message }))
+    } catch {
+      return local(doc)
+    }
+  }
 }
 
 // We parse leniently (comments and trailing commas allowed) so one stray comma doesn't

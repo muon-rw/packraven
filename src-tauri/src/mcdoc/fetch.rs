@@ -1,0 +1,653 @@
+#![allow(dead_code)]
+
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::types::SymbolTables;
+use super::version::compare_version;
+use crate::http::CLIENT;
+
+const VANILLA_MCDOC_SYMBOLS_URL: &str = "https://api.spyglassmc.com/vanilla-mcdoc/symbols";
+const MISODE_PARTNER_MCDOC_BASE: &str = "https://raw.githubusercontent.com/misode/misode.github.io/master/public/mcdoc";
+const MISODE_CONFIG_URL: &str = "https://raw.githubusercontent.com/misode/misode.github.io/master/src/config.json";
+const MUON_MCDOCS_BASE: &str = "https://raw.githubusercontent.com/muon-rw/mcdocs/main";
+
+/// Offline fallback copy of `muon-rw/mcdocs`'s Apotheosis schema (1.21.1+ and 26.1).
+pub const APOTHEOSIS_MCDOC: &str = include_str!("apotheosis.mcdoc");
+
+/// Pairs each load condition dispatcher in [`PACKRAVEN_MCDOC`] with the registry its `type` field names.
+/// NeoForge's name matches its real registry, so a ProbeRaven dump fills in modded conditions. Fabric
+/// and Forge 1.20.1 keep conditions in plain maps that no dump can read, so their `type` fields only
+/// complete our built-in list and accept any other ID.
+pub const CONDITION_REGISTRIES: &[(&str, &str)] = &[("neoforge:condition_codec", "neoforge:condition_codecs")];
+
+/// Bundled Packraven mcdoc overlay covering NeoForge, Fabric, and Forge load conditions.
+pub const PACKRAVEN_MCDOC: &str = r#"
+struct NeoForgeCondition {
+	type: #[id="neoforge:condition_codecs"] string,
+	...neoforge:condition_codec[[type]],
+}
+
+dispatch minecraft:resource["packraven:neoforge_condition"] to NeoForgeCondition
+
+#[neoforge_until="21.4.20"]
+dispatch neoforge:condition_codec["neoforge:true", "neoforge:false"] to struct {}
+
+#[neoforge_since="21.4.20"]
+dispatch neoforge:condition_codec["neoforge:always", "neoforge:never"] to struct {}
+
+dispatch neoforge:condition_codec["neoforge:not"] to struct {
+	value: NeoForgeCondition,
+}
+
+dispatch neoforge:condition_codec["neoforge:and", "neoforge:or"] to struct {
+	values: [NeoForgeCondition],
+}
+
+dispatch neoforge:condition_codec["neoforge:mod_loaded"] to struct {
+	modid: string,
+}
+
+#[neoforge_until="21.4.20"]
+dispatch neoforge:condition_codec["neoforge:item_exists"] to struct {
+	item: #[id="item"] string,
+}
+
+#[neoforge_since="21.4.20"]
+dispatch neoforge:condition_codec["neoforge:registered"] to struct {
+	registry?: #[id="root"] string,
+	value: string,
+}
+
+dispatch neoforge:condition_codec["neoforge:tag_empty"] to struct {
+	#[neoforge_since="21.4.20"]
+	registry?: #[id="root"] string,
+	tag: #[id(registry="item", tags="implicit")] string,
+}
+
+#[neoforge_since="21.3"]
+dispatch neoforge:condition_codec["neoforge:feature_flags_enabled"] to struct {
+	flags: [string],
+}
+
+struct FabricCondition {
+	condition: #[dispatcher_key="fabric:condition_codec"] string,
+	...fabric:condition_codec[[condition]],
+}
+
+dispatch minecraft:resource["packraven:fabric_condition"] to FabricCondition
+
+dispatch fabric:condition_codec["fabric:true", "fabric:false"] to struct {}
+
+dispatch fabric:condition_codec["fabric:all_mods_loaded", "fabric:any_mod_loaded"] to struct {
+	values: [string],
+}
+
+dispatch fabric:condition_codec["fabric:not"] to struct {
+	value: FabricCondition,
+}
+
+dispatch fabric:condition_codec["fabric:and", "fabric:or"] to struct {
+	values: [FabricCondition],
+}
+
+dispatch fabric:condition_codec["fabric:tags_populated"] to struct {
+	registry?: #[id="root"] string,
+	values: [string],
+}
+
+dispatch fabric:condition_codec["fabric:item_tags_populated"] to struct {
+	values: [#[id(registry="item", tags="implicit")] string],
+}
+
+dispatch fabric:condition_codec["fabric:registry_contains"] to struct {
+	registry?: #[id="root"] string,
+	values: [string],
+}
+
+struct ForgeCondition {
+	type: #[dispatcher_key="forge:condition_codec"] string,
+	...forge:condition_codec[[type]],
+}
+
+dispatch minecraft:resource["packraven:forge_condition"] to ForgeCondition
+
+dispatch forge:condition_codec["forge:true", "forge:false"] to struct {}
+
+dispatch forge:condition_codec["forge:not"] to struct {
+	value: ForgeCondition,
+}
+
+dispatch forge:condition_codec["forge:and", "forge:or"] to struct {
+	values: [ForgeCondition],
+}
+
+dispatch forge:condition_codec["forge:mod_loaded"] to struct {
+	modid: string,
+}
+
+dispatch forge:condition_codec["forge:item_exists"] to struct {
+	item: #[id="item"] string,
+}
+
+dispatch forge:condition_codec["forge:tag_empty"] to struct {
+	tag: #[id(registry="item", tags="implicit")] string,
+}
+"#;
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MuonManifest {
+    #[serde(default)]
+    pub format_version: u32,
+    #[serde(default)]
+    pub schemas: Vec<MuonSchemaEntry>,
+    #[serde(default)]
+    pub recipe_dispatcher_bridges: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MuonSchemaEntry {
+    pub id: String,
+    pub file: String,
+    pub module: String,
+    #[serde(default)]
+    pub mod_ids: Vec<String>,
+    #[serde(default)]
+    pub always_load: bool,
+    #[serde(default)]
+    pub min_minecraft: Option<String>,
+    #[serde(default)]
+    pub max_minecraft: Option<String>,
+    #[serde(default)]
+    pub paths: Vec<PathRule>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathRule {
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub folder: Option<String>,
+    #[serde(default)]
+    pub exact: Option<String>,
+    pub category: String,
+}
+
+impl PathRule {
+    /// Matches a path relative to `data/<namespace>/` (without `.json` suffix).
+    pub fn matches(&self, namespace: &str, rest: &str) -> bool {
+        if let Some(req_ns) = self.namespace.as_deref()
+            && !req_ns.eq_ignore_ascii_case(namespace)
+        {
+            return false;
+        }
+        if let Some(exact) = self.exact.as_deref() {
+            return rest == exact;
+        }
+        if let Some(folder) = self.folder.as_deref() {
+            let trimmed = folder.trim_matches('/');
+            return rest.strip_prefix(trimmed).is_some_and(|after| after.starts_with('/'));
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MisodeGenerator {
+    pub id: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub dependency: Option<String>,
+    #[serde(default)]
+    pub min_version: Option<String>,
+    #[serde(default)]
+    pub max_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MisodeConfig {
+    #[serde(default)]
+    pub generators: Vec<MisodeGenerator>,
+}
+
+/// Fallback partner schema names used only when `misode/misode.github.io/src/config.json` is offline and uncached.
+const FALLBACK_PARTNERS: &[&str] = &[
+    "ad_astra",
+    "ars_nouveau",
+    "create",
+    "fabric",
+    "immersive_weathering",
+    "loot-table-modifier",
+    "lychee",
+    "neoforge",
+    "ohthetreesyoullgrow",
+    "pixelmon",
+    "sky_aesthetics",
+    "starexpress",
+    "tauridev",
+    "thermoo",
+    "treeplacer",
+];
+
+/// Maps misode partner dependency names to mod namespaces when the two differ.
+fn partner_mod_aliases(dep: &str) -> &'static [&'static str] {
+    match dep {
+        "tauridev" => &["jsg", "jsg_core", "tauridev"],
+        "loot-table-modifier" => &["loot-table-modifier", "loot_table_modifier"],
+        _ => &[],
+    }
+}
+
+pub fn schema_matches_version(mc: Option<&str>, min: Option<&str>, max: Option<&str>) -> bool {
+    let Some(mc) = mc else { return true };
+    if let Some(min_v) = min
+        && compare_version(mc, min_v) == Ordering::Less
+    {
+        return false;
+    }
+    if let Some(max_v) = max
+        && compare_version(mc, max_v) == Ordering::Greater
+    {
+        return false;
+    }
+    true
+}
+
+/// Returns the list of misode partner `.mcdoc` schema names relevant to a pack, discovered dynamically
+/// from `misode/misode.github.io/src/config.json` (with an offline fallback list).
+pub fn partner_schemas_for_pack(
+    loader_name: Option<&str>,
+    mod_ids: &HashSet<String>,
+    misode_config: Option<&MisodeConfig>,
+) -> Vec<String> {
+    let mut deps: Vec<String> = match misode_config {
+        Some(cfg) => {
+            let mut set = Vec::new();
+            for generator in &cfg.generators {
+                if let Some(dep) = &generator.dependency
+                    && !set.contains(dep)
+                {
+                    set.push(dep.clone());
+                }
+            }
+            set
+        }
+        None => FALLBACK_PARTNERS.iter().map(|s| (*s).to_string()).collect(),
+    };
+    deps.sort();
+
+    let mut out = Vec::new();
+    for dep in deps {
+        let loader_match = (dep == "neoforge" && loader_name.is_some_and(|l| l.eq_ignore_ascii_case("neoforge")))
+            || (dep == "fabric" && loader_name.is_some_and(|l| l.eq_ignore_ascii_case("fabric")));
+        let alias_match = partner_mod_aliases(&dep).iter().any(|a| mod_ids.contains(*a));
+        if loader_match || mod_ids.contains(&dep) || alias_match {
+            out.push(dep);
+        }
+    }
+    out
+}
+
+/// Builds dynamic datapack folder-to-category rules from `misode`'s live partner generators.
+pub fn misode_partner_path_rules(misode_config: &MisodeConfig, active_partners: &[String], mc: Option<&str>) -> Vec<PathRule> {
+    let active: HashSet<&str> = active_partners.iter().map(String::as_str).collect();
+    let mut rules = Vec::new();
+    for generator in &misode_config.generators {
+        let Some(dep) = generator.dependency.as_deref() else { continue };
+        if !active.contains(dep) {
+            continue;
+        }
+        if !schema_matches_version(mc, generator.min_version.as_deref(), generator.max_version.as_deref()) {
+            continue;
+        }
+        let Some(path) = generator.path.as_deref().filter(|p| !p.is_empty()) else { continue };
+        // NeoForge data maps use real disk paths under `data/neoforge/data_maps/...` (handled in `registries.rs`),
+        // and recipe-only generators (`create`, `ars_nouveau`, `lychee`) bridge into `minecraft:recipe_serializer`.
+        if generator.id.starts_with("neoforge:data_map_") || matches!(generator.id.as_str(), "create:recipes" | "ars_nouveau:recipes" | "lychee:recipe") {
+            continue;
+        }
+        rules.push(PathRule {
+            namespace: None,
+            folder: Some(path.to_string()),
+            exact: None,
+            category: generator.id.clone(),
+        });
+    }
+    rules
+}
+
+/// Loads `muon-rw/mcdocs/manifest.json` from persistent local storage, refreshing from GitHub only when absent or `force` is true.
+pub async fn load_muon_manifest(force: bool) -> Result<MuonManifest> {
+    let path = cache_dir().join("muon").join("manifest.json");
+    let url = format!("{MUON_MCDOCS_BASE}/manifest.json");
+    load_cached(&path, &url, force, |bytes| {
+        serde_json::from_slice(bytes).context("parsing muon-rw/mcdocs manifest.json")
+    })
+    .await
+}
+
+/// Loads a `.mcdoc` file from `muon-rw/mcdocs`, persisted locally and refreshed non-destructively.
+pub async fn load_muon_mcdoc(file: &str, force: bool) -> Result<String> {
+    let rel = file.trim_start_matches('/');
+    let safe_name = sanitize_version(&rel.replace('/', "_"));
+    let path = cache_dir().join("muon").join(safe_name);
+    let url = format!("{MUON_MCDOCS_BASE}/{rel}");
+    load_cached(&path, &url, force, |bytes| parse_mcdoc_bytes(bytes, rel)).await
+}
+
+/// Loads `misode/misode.github.io/src/config.json` from persistent local storage, refreshing only when absent or `force` is true.
+pub async fn load_misode_config(force: bool) -> Result<MisodeConfig> {
+    let path = cache_dir().join("misode-config.json");
+    load_cached(&path, MISODE_CONFIG_URL, force, |bytes| {
+        serde_json::from_slice(bytes).context("parsing misode config.json")
+    })
+    .await
+}
+
+/// Loads a partner `.mcdoc` file from persistent local storage, refreshing from `misode/misode.github.io` only when absent or `force` is true.
+pub async fn load_partner_mcdoc(name: &str, force: bool) -> Result<String> {
+    let safe = sanitize_version(name);
+    let path = cache_dir().join("partners").join(format!("{safe}.mcdoc"));
+    let url = format!("{MISODE_PARTNER_MCDOC_BASE}/{safe}.mcdoc");
+    load_cached(&path, &url, force, |bytes| parse_mcdoc_bytes(bytes, name)).await
+}
+
+/// Bridges partner recipe dispatchers (e.g. `create:recipes`, `ars_nouveau:recipes`) into
+/// `minecraft:recipe_serializer` so vanilla `data/<ns>/recipe/*.json` files validate modded recipes,
+/// and widens vanilla/Create ingredient types to accept custom loader ingredients (`forge:nbt`, `neoforge:components`, etc.).
+pub fn bridge_partner_dispatchers(tables: &mut SymbolTables, extra_bridges: &[String]) {
+    let mut sources: Vec<&str> = vec!["create:recipes", "ars_nouveau:recipes", "lychee:recipe", "lychee:recipes", "jsg_core:recipes"];
+    for extra in extra_bridges {
+        if !sources.contains(&extra.as_str()) {
+            sources.push(extra.as_str());
+        }
+    }
+    for source_reg in sources {
+        let Some(entries) = tables.dispatchers.get(source_reg).cloned() else { continue };
+        let target = tables.dispatchers.entry("minecraft:recipe_serializer".into()).or_default();
+        for (k, v) in entries {
+            target.entry(k).or_insert(v);
+        }
+    }
+
+    // Allow Forge/NeoForge (`{ "type": ... }`) and Fabric (`{ "fabric:type": ... }`) custom ingredients inside vanilla and Create recipes.
+    let make_custom_ingredient = |key_name: &str, desc: &str, loaders: &str| super::types::McdocType::Struct {
+        fields: vec![
+            super::types::StructField::Pair {
+                key: super::types::StructKey::Literal(key_name.into()),
+                field_type: super::types::McdocType::String { length_range: None, attributes: Vec::new() },
+                optional: false,
+                deprecated: false,
+                desc: Some(desc.into()),
+                attributes: vec![super::checker::loader_attr(loaders)],
+            },
+            super::types::StructField::Pair {
+                key: super::types::StructKey::Dynamic(super::types::McdocType::String {
+                    length_range: None,
+                    attributes: Vec::new(),
+                }),
+                field_type: super::types::McdocType::Any { attributes: Vec::new() },
+                optional: true,
+                deprecated: false,
+                desc: None,
+                attributes: Vec::new(),
+            },
+        ],
+        attributes: Vec::new(),
+    };
+    let custom_forge = make_custom_ingredient("type", "Custom Forge/NeoForge ingredient serializer ID.", "forge,neoforge");
+    let custom_fabric = make_custom_ingredient("fabric:type", "Custom Fabric ingredient serializer ID.", "fabric");
+    for symbol in [
+        "::java::data::recipe::Ingredient",
+        "::java::data::recipe::IngredientValue",
+        "::partner::create::ItemOrTag",
+        "::partner::create::ItemOrTagWithCount",
+    ] {
+        if let Some(existing) = tables.mcdoc.get_mut(symbol) {
+            match existing {
+                super::types::McdocType::Union { members, .. } => {
+                    members.push(custom_forge.clone());
+                    members.push(custom_fabric.clone());
+                }
+                other => {
+                    let prev = std::mem::replace(other, super::types::McdocType::Any { attributes: Vec::new() });
+                    *other = super::types::McdocType::Union {
+                        members: vec![prev, custom_forge.clone(), custom_fabric.clone()],
+                        attributes: Vec::new(),
+                    };
+                }
+            }
+        }
+    }
+
+    // Widen NeoForge's closed BiomeModifierType / StructureModifierType enums to also accept modded serializer IDs.
+    for (symbol, reg) in [
+        ("::partner::neoforge::BiomeModifierType", "neoforge:biome_modifier_serializer"),
+        ("::partner::neoforge::StructureModifierType", "neoforge:structure_modifier_serializer"),
+    ] {
+        if let Some(existing) = tables.mcdoc.get_mut(symbol) {
+            let prev = std::mem::replace(existing, super::types::McdocType::Any { attributes: Vec::new() });
+            let modded_id = super::types::McdocType::String {
+                length_range: None,
+                attributes: vec![super::types::Attribute {
+                    name: "id".into(),
+                    value: Some(super::types::AttributeValue::Type(super::types::McdocType::Literal {
+                        value: super::types::LiteralValue::String { value: reg.into() },
+                        attributes: Vec::new(),
+                    })),
+                }],
+            };
+            *existing = super::types::McdocType::Union {
+                members: vec![prev, modded_id],
+                attributes: Vec::new(),
+            };
+        }
+    }
+}
+
+/// Persistent local directory where downloaded mcdoc schemas and vanilla registry snapshots are saved.
+pub fn cache_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("dev.muon.packraven")
+        .join("mcdoc")
+}
+
+/// Loads `vanilla-mcdoc/symbols` from persistent local storage, refreshing from Spyglass's API only when absent or `force` is true.
+pub async fn load_vanilla_symbols(force: bool) -> Result<SymbolTables> {
+    let path = cache_dir().join("vanilla-mcdoc-symbols.json");
+    load_cached(&path, VANILLA_MCDOC_SYMBOLS_URL, force, |bytes| {
+        serde_json::from_slice(bytes).context("parsing vanilla-mcdoc symbols.json")
+    })
+    .await
+}
+
+/// Loads vanilla registries (`summary/registries/data.min.json`) for `mc_version` from persistent local storage.
+pub async fn load_mcmeta_registries(mc_version: &str, force: bool) -> Result<HashMap<String, Vec<String>>> {
+    let safe_ver = sanitize_version(mc_version);
+    let path = cache_dir().join("mcmeta").join(&safe_ver).join("registries.json");
+    let url = format!("https://raw.githubusercontent.com/misode/mcmeta/{mc_version}-summary/registries/data.min.json");
+    load_cached(&path, &url, force, |bytes| {
+        serde_json::from_slice(bytes).with_context(|| format!("parsing mcmeta registries for {mc_version}"))
+    })
+    .await
+}
+
+/// Loads vanilla block state definitions (`summary/blocks/data.min.json`) for `mc_version` from persistent local storage.
+pub async fn load_mcmeta_block_states(mc_version: &str, force: bool) -> Result<HashMap<String, BTreeMap<String, Vec<String>>>> {
+    let safe_ver = sanitize_version(mc_version);
+    let path = cache_dir().join("mcmeta").join(&safe_ver).join("blocks.json");
+    let url = format!("https://raw.githubusercontent.com/misode/mcmeta/{mc_version}-summary/blocks/data.min.json");
+    load_cached(&path, &url, force, |bytes| {
+        parse_mcmeta_blocks(bytes).with_context(|| format!("parsing mcmeta blocks for {mc_version}"))
+    })
+    .await
+}
+
+fn parse_mcdoc_bytes(bytes: &[u8], label: &str) -> Result<String> {
+    let text = std::str::from_utf8(bytes)
+        .with_context(|| format!("decoding mcdoc file {label}"))?
+        .to_string();
+    super::parser::validate_syntax(&text)
+        .map_err(|e| anyhow::anyhow!("parsing mcdoc file {label}: {e}"))?;
+    Ok(text)
+}
+
+/// Reads a persisted local file when present; on refresh (`force`) or cache miss, fetches from `url`,
+/// validates with `parse`, and atomically replaces the file on disk. A failed or invalid fetch falls back
+/// to the existing local file so flaky networks never block or wipe schemas.
+async fn load_cached<T, F>(path: &Path, url: &str, force: bool, parse: F) -> Result<T>
+where
+    F: Fn(&[u8]) -> Result<T>,
+{
+    let existing = if path.is_file() {
+        tokio::fs::read(path).await.ok().and_then(|bytes| parse(&bytes).ok())
+    } else {
+        None
+    };
+    if !force && let Some(cached) = existing {
+        return Ok(cached);
+    }
+    match fetch_bytes(url).await.and_then(|bytes| parse(&bytes).map(|parsed| (bytes, parsed))) {
+        Ok((bytes, parsed)) => {
+            let _ = write_atomic(path, &bytes).await;
+            Ok(parsed)
+        }
+        Err(err) => match existing {
+            Some(cached) => Ok(cached),
+            None => Err(err),
+        },
+    }
+}
+
+fn parse_mcmeta_blocks(bytes: &[u8]) -> Result<HashMap<String, BTreeMap<String, Vec<String>>>> {
+    // misode's summary/blocks/data.min.json maps block ID -> [properties_object, default_state_object].
+    let raw: HashMap<String, Value> = serde_json::from_slice(bytes)?;
+    let mut out = HashMap::with_capacity(raw.len());
+    for (block, entry) in raw {
+        let Some(props_obj) = entry.as_array().and_then(|arr| arr.first()).and_then(Value::as_object) else {
+            continue;
+        };
+        let mut props = BTreeMap::new();
+        for (prop, vals) in props_obj {
+            if let Some(arr) = vals.as_array() {
+                let list: Vec<String> = arr.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+                if !list.is_empty() {
+                    props.insert(prop.clone(), list);
+                }
+            }
+        }
+        if !props.is_empty() {
+            out.insert(block, props);
+        }
+    }
+    Ok(out)
+}
+
+async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    let response = CLIENT.get(url).send().await?.error_for_status().with_context(|| format!("fetching {url}"))?;
+    Ok(response.bytes().await?.to_vec())
+}
+
+async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let tmp = path.with_extension("part");
+    tokio::fs::write(&tmp, bytes).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
+fn sanitize_version(version: &str) -> String {
+    version
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_mcmeta_block_state_summary() {
+        let raw = br#"{"oak_stairs":[{"facing":["north","south"],"half":["top","bottom"]},{"facing":"north","half":"bottom"}]}"#;
+        let parsed = parse_mcmeta_blocks(raw).unwrap();
+        assert_eq!(parsed["oak_stairs"]["facing"], vec!["north", "south"]);
+        assert_eq!(parsed["oak_stairs"]["half"], vec!["top", "bottom"]);
+    }
+
+    #[tokio::test]
+    async fn load_cached_uses_persisted_copy_and_preserves_it_on_failed_refresh() {
+        let dir = std::env::temp_dir().join(format!("packraven-fetch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("schema.mcdoc");
+        let original = "struct KeepMe { id: string }\n";
+        std::fs::write(&file, original).unwrap();
+
+        // Non-forced load must return the persisted file without touching the unreachable URL.
+        let cached = load_cached(&file, "http://127.0.0.1:1/unreachable", false, |b| parse_mcdoc_bytes(b, "test"))
+            .await
+            .expect("should load local copy");
+        assert_eq!(cached, original);
+
+        // Forced refresh against an unreachable URL must fall back to the local copy without wiping it.
+        let preserved = load_cached(&file, "http://127.0.0.1:1/unreachable", true, |b| parse_mcdoc_bytes(b, "test"))
+            .await
+            .expect("failed refresh must preserve local copy");
+        assert_eq!(preserved, original);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_muon_manifest_and_misode_partner_path_rules() {
+        let manifest_json = r#"{
+            "formatVersion": 1,
+            "schemas": [{
+                "id": "apotheosis",
+                "file": "mcdoc/apotheosis.mcdoc",
+                "module": "::apotheosis",
+                "modIds": ["apotheosis", "placebo"],
+                "minMinecraft": "1.21.1",
+                "paths": [
+                    { "folder": "apotheosis/affixes", "category": "apotheosis:affixes" },
+                    { "namespace": "apotheosis", "exact": "data_maps/item/loot_category_overrides", "category": "apotheosis:data_map_loot_category_overrides" }
+                ]
+            }],
+            "recipeDispatcherBridges": ["create:recipes"]
+        }"#;
+        let manifest: MuonManifest = serde_json::from_str(manifest_json).unwrap();
+        assert_eq!(manifest.schemas.len(), 1);
+        assert!(manifest.schemas[0].paths[0].matches("mypack", "apotheosis/affixes/sword"));
+        assert!(!manifest.schemas[0].paths[0].matches("mypack", "affixes/sword"));
+        assert!(manifest.schemas[0].paths[1].matches("apotheosis", "data_maps/item/loot_category_overrides"));
+        assert!(!manifest.schemas[0].paths[1].matches("minecraft", "data_maps/item/loot_category_overrides"));
+
+        let misode_json = r#"{
+            "generators": [
+                { "id": "thermoo:temperature_effect", "path": "thermoo/temperature_effect", "dependency": "thermoo", "minVersion": "1.20" },
+                { "id": "create:recipes", "path": "recipe", "dependency": "create" },
+                { "id": "neoforge:data_map_furnace_fuels", "path": "data_maps/item/furnace_fuels", "dependency": "neoforge" }
+            ]
+        }"#;
+        let cfg: MisodeConfig = serde_json::from_str(misode_json).unwrap();
+        let active = vec!["thermoo".into(), "create".into(), "neoforge".into()];
+        let rules = misode_partner_path_rules(&cfg, &active, Some("1.21.1"));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].category, "thermoo:temperature_effect");
+        assert!(rules[0].matches("mypack", "thermoo/temperature_effect/frost"));
+    }
+}

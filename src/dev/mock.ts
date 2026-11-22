@@ -855,6 +855,7 @@ function mockServerIcon() {
 
 let serverIcon: string | null = scenario === 'empty' ? null : 'pending'
 let serverReadme = false
+let datapackProbed = false
 
 // We fill the default template the app ships, the way the backend does, so the preview can't drift from it.
 function mockServerReadme() {
@@ -1478,6 +1479,70 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     const idx = text.indexOf('recipes')
     if (idx >= 0 && offset >= idx && offset <= idx + 7) {
       return { from: idx, to: idx + 7, signature: 'ServerEvents.recipes(handler: (event: Internal.RecipesEventJS) => void): void', docs: 'Register or modify crafting recipes.' }
+    }
+    return null
+  },
+  datapack_status: () => ({
+    available: true,
+    minecraft: '1.21.1',
+    loader: 'NeoForge 21.1.265',
+    symbolCount: 2114,
+    registryEntries: datapackProbed ? 18420 : 12450,
+    codeSource: datapackProbed ? 'probeRaven' : 'probeJs',
+    probeAvailable: true,
+    loadMs: 14,
+    error: null,
+  }),
+  datapack_probe: () => {
+    mockJob(
+      'datapack-probe',
+      ['Preparing headless registry dump for Minecraft 1.21.1 (NeoForge 21.1.265)', 'ProbeRaven dump complete: 117 registries'],
+      'Dumped 117 registries (18420 entries), 1004 tags, and 1060 block states.',
+      () => {
+        datapackProbed = true
+      },
+    )
+  },
+  datapack_lint: (a) => {
+    const text = String(a.text ?? '')
+    const diags: { from: number; to: number; severity: 'error' | 'warning' | 'info'; message: string }[] = []
+    const badCount = /"count"\s*:\s*(0|-\d+)/.exec(text)
+    if (badCount) {
+      const start = badCount.index + badCount[0].length - badCount[1].length
+      diags.push({ from: start, to: start + badCount[1].length, severity: 'error', message: 'Expected a number in range 1..99.' })
+    }
+    const badKey = /"bogus_key"/.exec(text)
+    if (badKey) {
+      diags.push({ from: badKey.index, to: badKey.index + badKey[0].length, severity: 'warning', message: 'Unknown key "bogus_key".' })
+    }
+    return diags
+  },
+  datapack_complete: (a) => {
+    const text = String(a.text ?? '')
+    const offset = Number(a.offset ?? 0)
+    const before = text.slice(0, offset)
+    const strMatch = /"([^"]*)$/.exec(before)
+    if (strMatch) {
+      const typed = strMatch[1]
+      const from = offset - typed.length
+      const items = ['minecraft:diamond', 'minecraft:stick', 'create:brass_ingot', '#c:ingots/iron']
+        .filter((id) => id.toLowerCase().includes(typed.toLowerCase()))
+        .map((label) => ({ label, kind: 'constant', detail: 'item', signature: null, docs: null, insertText: null }))
+      return { from, to: offset, items, inString: true }
+    }
+    return { from: offset, to: offset, items: [], inString: false }
+  },
+  datapack_hover: (a) => {
+    const text = String(a.text ?? '')
+    const offset = Number(a.offset ?? 0)
+    const idx = text.indexOf('"result"')
+    if (idx >= 0 && offset >= idx && offset <= idx + '"result"'.length) {
+      return {
+        from: idx,
+        to: idx + '"result"'.length,
+        signature: '"result": struct { id: #[id="item"] string, count?: int @ 1..99 }',
+        docs: 'Output item stack produced by the recipe.',
+      }
     }
     return null
   },

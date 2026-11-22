@@ -355,12 +355,31 @@ impl JoinRecord {
     }
 }
 
-pub async fn run_server(app: AppHandle, run: Arc<TestRun>, pack: &Pack, java: PathBuf, test_dir: PathBuf, run_args: RunArgs, ready: watch::Sender<bool>, tested: JoinRecord, log: Log) -> Result<String> {
+#[allow(clippy::too_many_arguments)]
+pub async fn run_server(
+    app: AppHandle,
+    run: Arc<TestRun>,
+    pack: &Pack,
+    java: PathBuf,
+    test_dir: PathBuf,
+    run_args: RunArgs,
+    ready: watch::Sender<bool>,
+    tested: JoinRecord,
+    proberaven: Option<(PathBuf, Arc<crate::mcdoc::DatapackCache>)>,
+    log: Log,
+) -> Result<String> {
     remind_to_update(java.clone(), log.clone());
     let (extra_jvm, extra) = (run_args.server_jvm(), run_args.server());
     log_extra_args(&log, &extra_jvm, &extra);
     let mut command = Command::new(&java);
     command.current_dir(&test_dir).args(server_args(pack, &test_dir, &extra_jvm, &extra)?);
+    let dump_hook = proberaven.map(|(output, cache)| {
+        if crate::mcdoc::proberaven::ensure_gitignored(&pack.dir) {
+            log.info("Added .proberaven/ to .gitignore");
+        }
+        command.env("PROBERAVEN_OUTPUT", &output);
+        (pack.dir.clone(), cache)
+    });
     let hook_app = app.clone();
     let hook: LineHook = Arc::new(move |line: &str| {
         if line.contains("Done (") && line.contains(")! For help") {
@@ -370,6 +389,10 @@ pub async fn run_server(app: AppHandle, run: Arc<TestRun>, pack: &Pack, java: Pa
             let name = line[..index].rsplit(' ').next().unwrap_or_default();
             let _ = std::fs::write(&tested.path, &tested.contents);
             emit(&hook_app, "player-joined", name);
+        } else if line.contains("ProbeRaven dump complete:")
+            && let Some((pack_dir, cache)) = &dump_hook
+        {
+            cache.invalidate(pack_dir);
         }
     });
     let child = spawn_watched(command, &log, true, Some(hook))?;

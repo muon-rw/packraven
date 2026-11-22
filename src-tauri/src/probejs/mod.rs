@@ -204,6 +204,70 @@ impl ProbeIndex {
     pub fn event_sides(&self) -> &BTreeMap<String, Vec<String>> {
         &self.event_sides
     }
+
+    /// Extracts ProbeJS's live registry string unions (`RegistryTypes.*` / `Special.*`) mapped to
+    /// Minecraft registry and tag keys (e.g. `item`, `tag/item`, `block`, `entity_type`).
+    pub fn registries(&self) -> HashMap<String, Vec<String>> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, alias) in &self.aliases {
+            let AliasDef::StringUnion(entries) = alias else { continue };
+            let Some(raw) = name.strip_prefix("RegistryTypes.").or_else(|| name.strip_prefix("Special.")) else {
+                continue;
+            };
+            if let Some(category) = probejs_registry_category(raw) {
+                let target = out.entry(category).or_default();
+                target.extend(entries.iter().map(|s| s.to_string()));
+            }
+        }
+        for list in out.values_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
+        out
+    }
+}
+
+fn probejs_registry_category(name: &str) -> Option<String> {
+    if matches!(name, "Mod" | "ModId" | "JavaClass" | "ClassPath" | "RecipeId" | "LangKey" | "RawFormattedText") {
+        return None;
+    }
+    let (base, is_tag) = match name.strip_suffix("Tag") {
+        Some(b) if !b.is_empty() => (b, true),
+        _ => (name, false),
+    };
+    let snake = match base {
+        "Effect" | "MobEffect" => "mob_effect".to_string(),
+        "Biome" => "worldgen/biome".to_string(),
+        "ConfiguredFeature" => "worldgen/configured_feature".to_string(),
+        "PlacedFeature" => "worldgen/placed_feature".to_string(),
+        "Structure" => "worldgen/structure".to_string(),
+        "StructureSet" => "worldgen/structure_set".to_string(),
+        "ProcessorList" => "worldgen/processor_list".to_string(),
+        "TemplatePool" => "worldgen/template_pool".to_string(),
+        "NoiseSettings" => "worldgen/noise_settings".to_string(),
+        "Dimension" | "Level" => "dimension".to_string(),
+        _ => pascal_to_snake(base),
+    };
+    if is_tag {
+        Some(format!("tag/{snake}"))
+    } else {
+        Some(snake)
+    }
+}
+
+fn pascal_to_snake(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 4);
+    for (i, ch) in input.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 // ProbeJS 8 writes each script folder's events into its own `@side-only/<side>` folder, so an event

@@ -4,6 +4,7 @@ import type { Problems } from './editor'
 import { listen } from '@tauri-apps/api/event'
 import { api, type DirEntry, type FileContent, type GitStatus } from './api'
 import { resetProbejs } from './probejs.svelte'
+import { resetDatapack } from './datapack.svelte'
 import { resetKubejsContext } from './kubejsContext'
 import { isGzip, isLog, outerArchive } from './viewers'
 
@@ -64,6 +65,7 @@ export function resetFor(pack: string | null) {
   treeUi.focused = null
   treeUi.status = null
   resetProbejs()
+  resetDatapack()
   resetKubejsContext()
 }
 

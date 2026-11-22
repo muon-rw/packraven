@@ -719,6 +719,9 @@ export interface ProbejsCompletionItem {
   signature?: string | null
   docs?: string | null
   insertText?: string | null
+  cursorOffset?: number | null
+  consumeClosingQuote?: boolean
+  retrigger?: boolean
 }
 
 export interface ProbejsCompletionResult {
@@ -733,6 +736,29 @@ export interface ProbejsHover {
   to: number
   signature: string
   docs: string
+}
+
+export interface DatapackCompletionResult extends ProbejsCompletionResult {
+  replaceTo?: number
+}
+
+export interface DatapackStatusInfo {
+  available: boolean
+  minecraft: string | null
+  loader: string | null
+  symbolCount: number
+  registryEntries: number
+  codeSource: 'vanillaOnly' | 'probeJs' | 'probeRaven'
+  probeAvailable: boolean
+  loadMs: number
+  error: string | null
+}
+
+export interface DatapackDiagnostic {
+  from: number
+  to: number
+  severity: 'error' | 'warning' | 'info'
+  message: string
 }
 
 export interface CopiedIntoPack {
@@ -870,6 +896,11 @@ export const api = {
   probejsStatus: (force = false) => invoke<ProbejsStatusInfo>('probejs_status', { force }),
   probejsComplete: (text: string, offset: number) => invoke<ProbejsCompletionResult>('probejs_complete', { text, offset }),
   probejsHover: (text: string, offset: number) => invoke<ProbejsHover | null>('probejs_hover', { text, offset }),
+  datapackStatus: (force = false) => invoke<DatapackStatusInfo>('datapack_status', { force }),
+  datapackLint: (path: string, text: string) => invoke<DatapackDiagnostic[]>('datapack_lint', { path, text }),
+  datapackComplete: (path: string, text: string, offset: number) => invoke<DatapackCompletionResult>('datapack_complete', { path, text, offset }),
+  datapackHover: (path: string, text: string, offset: number) => invoke<ProbejsHover | null>('datapack_hover', { path, text, offset }),
+  datapackProbe: () => invoke<void>('datapack_probe'),
   indexFiles: () => invoke<{ paths: string[]; truncated: boolean }>('index_files'),
   searchText: (query: TextQuery) => invoke<TextResults | null>('search_text', { query }),
   replaceText: (query: TextQuery, targets: { path: string; matches: [number, number][] }[]) => invoke<Replaced>('replace_text', { query, targets }),

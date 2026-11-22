@@ -32,7 +32,12 @@ pub fn read_file(state: State<'_, AppState>, path: String, allow_large: Option<b
 
 #[tauri::command]
 pub fn write_file(state: State<'_, AppState>, path: String, text: String, crlf: bool, bom: bool) -> CmdResult<()> {
-    files::write(&state.settings().instance_dir, &path, &text, crlf, bom).map_err(err)
+    let root = state.settings().instance_dir;
+    files::write(&root, &path, &text, crlf, bom).map_err(err)?;
+    if path.ends_with(".proberaven/dump.json") || path.ends_with("proberaven/dump.json") || path == crate::pack::LOCKFILE {
+        state.datapack.invalidate(&root);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -92,6 +97,7 @@ pub fn absolute_path(state: State<'_, AppState>, path: String) -> CmdResult<Stri
 pub fn create_file(state: State<'_, AppState>, path: String) -> CmdResult<()> {
     let root = state.settings().instance_dir;
     files::create_file(&root, &path).map_err(err)?;
+    invalidate_if_datapack(&state, &root, &[path.as_str()]);
     record_created(&state, &root, "New file", &path);
     Ok(())
 }
@@ -174,6 +180,72 @@ pub async fn probejs_hover(state: State<'_, AppState>, text: String, offset: usi
     .map_err(err)
 }
 
+fn touches_datapack(path: &str) -> bool {
+    let norm = path.replace('\\', "/").to_lowercase();
+    norm.starts_with("data/")
+        || norm.contains("/data/")
+        || norm.starts_with("datapacks/")
+        || norm.starts_with("mods/")
+        || norm.contains(".proberaven/")
+        || norm == crate::pack::LOCKFILE
+}
+
+fn invalidate_if_datapack(state: &AppState, root: &Path, paths: &[&str]) {
+    if paths.iter().any(|p| touches_datapack(p)) {
+        state.datapack.invalidate(root);
+    }
+}
+
+#[tauri::command]
+pub async fn datapack_status(state: State<'_, AppState>, force: bool) -> CmdResult<crate::mcdoc::DatapackStatus> {
+    let settings = state.settings();
+    let cache = std::sync::Arc::clone(&state.datapack);
+    let probe = std::sync::Arc::clone(&state.probejs);
+    Ok(cache.ensure(settings.instance_dir, settings.install_dir, probe, force).await.0)
+}
+
+#[tauri::command]
+pub async fn datapack_lint(state: State<'_, AppState>, path: String, text: String) -> CmdResult<Vec<crate::mcdoc::LintDiagnostic>> {
+    let settings = state.settings();
+    let cache = std::sync::Arc::clone(&state.datapack);
+    let probe = std::sync::Arc::clone(&state.probejs);
+    let index = match cache.get(&settings.instance_dir) {
+        Some(idx) => Some(idx),
+        None => cache.ensure(settings.instance_dir, settings.install_dir, probe, false).await.1,
+    };
+    let Some(idx) = index else { return Ok(Vec::new()) };
+    tauri::async_runtime::spawn_blocking(move || idx.lint(&path, &text))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn datapack_complete(state: State<'_, AppState>, path: String, text: String, offset: usize) -> CmdResult<crate::mcdoc::completer::CompletionResult> {
+    let settings = state.settings();
+    let cache = std::sync::Arc::clone(&state.datapack);
+    let probe = std::sync::Arc::clone(&state.probejs);
+    let index = match cache.get(&settings.instance_dir) {
+        Some(idx) => Some(idx),
+        None => cache.ensure(settings.instance_dir, settings.install_dir, probe, false).await.1,
+    };
+    let Some(idx) = index else {
+        return Ok(crate::mcdoc::completer::CompletionResult::empty(offset));
+    };
+    tauri::async_runtime::spawn_blocking(move || idx.complete(&path, &text, offset))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn datapack_hover(state: State<'_, AppState>, path: String, text: String, offset: usize) -> CmdResult<Option<crate::mcdoc::completer::HoverInfo>> {
+    let root = state.settings().instance_dir;
+    let cache = std::sync::Arc::clone(&state.datapack);
+    let Some(idx) = cache.get(&root) else { return Ok(None) };
+    tauri::async_runtime::spawn_blocking(move || idx.hover(&path, &text, offset))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn read_nbt(state: State<'_, AppState>, path: String) -> CmdResult<crate::nbt::Document> {
     let root = state.settings().instance_dir;
@@ -244,6 +316,8 @@ pub async fn copy_into_pack(state: State<'_, AppState>, sources: Vec<String>, pa
         .map_err(|e| e.to_string())?
         .map_err(err)?;
     if !copied.created.is_empty() {
+        let refs: Vec<&str> = copied.created.iter().map(String::as_str).collect();
+        invalidate_if_datapack(&state, &root, &refs);
         let label = format!("Override {}", history::describe(&sources));
         let created = copied.created.iter().map(|p| root.join(p)).collect();
         state.history.lock().unwrap().record(&root, label, Some(Action::Trash(created)));
@@ -284,8 +358,12 @@ fn record_pasted(state: &AppState, root: &Path, verb: &str, pasted: &Pasted) {
 pub async fn trash_paths(state: State<'_, AppState>, paths: Vec<String>) -> CmdResult<()> {
     let root = state.settings().instance_dir;
     let label = format!("Delete {}", history::describe(&paths));
+    let datapack_affected = paths.iter().any(|p| touches_datapack(p));
     let task_root = root.clone();
     let trashed = tauri::async_runtime::spawn_blocking(move || files::trash(&task_root, &paths)).await.map_err(|e| e.to_string())?.map_err(err)?;
+    if datapack_affected {
+        state.datapack.invalidate(&root);
+    }
     state.history.lock().unwrap().record(&root, label, trashed.map(Action::Restore));
     Ok(())
 }
@@ -324,6 +402,7 @@ fn explorer_cut(clipboard: &ClipboardContext) -> bool {
 #[tauri::command]
 pub async fn paste_files(state: State<'_, AppState>, dir: String, cut: Vec<String>) -> CmdResult<Pasted> {
     let root = state.settings().instance_dir;
+    let datapack_affected = touches_datapack(&dir) || cut.iter().any(|p| touches_datapack(p));
     let task_root = root.clone();
     let pasted = tauri::async_runtime::spawn_blocking(move || {
         let root = task_root;
@@ -347,6 +426,9 @@ pub async fn paste_files(state: State<'_, AppState>, dir: String, cut: Vec<Strin
     })
     .await
     .map_err(|e| e.to_string())??;
+    if datapack_affected {
+        state.datapack.invalidate(&root);
+    }
     record_pasted(&state, &root, "Paste", &pasted);
     Ok(pasted)
 }
@@ -355,6 +437,7 @@ pub async fn paste_files(state: State<'_, AppState>, dir: String, cut: Vec<Strin
 pub fn rename_path(state: State<'_, AppState>, from: String, to: String) -> CmdResult<()> {
     let root = state.settings().instance_dir;
     files::rename(&root, &from, &to).map_err(err)?;
+    invalidate_if_datapack(&state, &root, &[from.as_str(), to.as_str()]);
     let label = format!("Rename {}", history::describe(&[&from]));
     state.history.lock().unwrap().record(&root, label, Some(Action::Move(vec![(root.join(&to), root.join(&from))])));
     Ok(())
@@ -366,6 +449,8 @@ pub async fn rename_paths(state: State<'_, AppState>, renames: Vec<(String, Stri
     let task_root = root.clone();
     let renamed = tauri::async_runtime::spawn_blocking(move || files::rename_all(&task_root, &renames)).await.map_err(|e| e.to_string())?.map_err(err)?;
     if !renamed.is_empty() {
+        let refs: Vec<&str> = renamed.iter().flat_map(|(f, t)| [f.as_str(), t.as_str()]).collect();
+        invalidate_if_datapack(&state, &root, &refs);
         let sources: Vec<&String> = renamed.iter().map(|(from, _)| from).collect();
         let label = format!("Rename {}", history::describe(&sources));
         let undo = Action::Move(renamed.iter().map(|(from, to)| (root.join(to), root.join(from))).collect());
@@ -379,6 +464,8 @@ pub fn move_paths(state: State<'_, AppState>, paths: Vec<String>, dir: String) -
     let root = state.settings().instance_dir;
     let moved = files::move_into(&root, &paths, &dir).map_err(err)?;
     if !moved.is_empty() {
+        let refs: Vec<&str> = moved.iter().flat_map(|(f, t)| [f.as_str(), t.as_str()]).collect();
+        invalidate_if_datapack(&state, &root, &refs);
         let targets: Vec<&String> = moved.iter().map(|(_, to)| to).collect();
         let label = format!("Move {}", history::describe(&targets));
         let undo = Action::Move(moved.iter().map(|(from, to)| (root.join(to), root.join(from))).collect());
@@ -390,9 +477,13 @@ pub fn move_paths(state: State<'_, AppState>, paths: Vec<String>, dir: String) -
 #[tauri::command]
 pub async fn import_paths(state: State<'_, AppState>, dir: String, sources: Vec<PathBuf>) -> CmdResult<Pasted> {
     let root = state.settings().instance_dir;
+    let datapack_affected = touches_datapack(&dir);
     let requested_move = os_drag::requested_move();
     let task_root = root.clone();
     let pasted = tauri::async_runtime::spawn_blocking(move || files::import(&task_root, &dir, &sources, requested_move)).await.map_err(|e| e.to_string())?.map_err(err)?;
+    if datapack_affected {
+        state.datapack.invalidate(&root);
+    }
     record_pasted(&state, &root, if pasted.transfers.is_empty() { "Copy in" } else { "Move in" }, &pasted);
     Ok(pasted)
 }
@@ -407,7 +498,11 @@ pub async fn file_undo(state: State<'_, AppState>, redo: bool) -> CmdResult<Opti
     let root = state.settings().instance_dir;
     // Restoring from the trash or moving across drives can take a while, but undo steps must
     // run one at a time, so we hold the history for the whole step.
-    tokio::task::block_in_place(|| state.history.lock().unwrap().step(&root, redo)).map_err(err)
+    let outcome = tokio::task::block_in_place(|| state.history.lock().unwrap().step(&root, redo)).map_err(err)?;
+    if outcome.is_some() {
+        state.datapack.invalidate(&root);
+    }
+    Ok(outcome)
 }
 
 // The OS drag loop needs the main thread, and on Windows it blocks that thread until you drop,

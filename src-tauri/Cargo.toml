@@ -37,7 +37,7 @@ dirs = "7.0.0"
 futures-util = "0.3.34"
 tokio = { version = "1.53.2", features = ["full"] }
 zip = { version = "9.0.2", default-features = false, features = ["deflate"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart", "stream", "rustls", "query", "form"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json", "multipart", "stream", "rustls", "query", "form", "gzip"] }
 notify = "8.2.0"
 base64 = "0.23.1"
 keyring = { version = "3.6.3", features = ["windows-native", "apple-native", "sync-secret-service", "crypto-rust"] }

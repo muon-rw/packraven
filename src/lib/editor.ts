@@ -15,6 +15,7 @@ import { tags } from '@lezer/highlight'
 import { forEachDiagnostic, lintKeymap } from '@codemirror/lint'
 import { lintFor } from './lint'
 import { probejsExtensions } from './probejs.svelte'
+import { datapackExtensions } from './datapack.svelte'
 
 const highlight = HighlightStyle.define([
   { tag: [tags.keyword, tags.bool, tags.null, tags.atom], color: 'var(--forest)', fontWeight: '700' },
@@ -392,6 +393,7 @@ export function createState(
       simplified ? [] : lintFor(path, onLintPaused),
       simplified ? [] : lintPanelResize(),
       simplified || readOnly ? [] : probejsExtensions(path),
+      simplified || readOnly ? [] : datapackExtensions(path),
       EditorState.readOnly.of(readOnly),
       readOnly ? blockedEdits(onBlocked) : [],
       theme,

@@ -1,0 +1,1564 @@
+// Bundled mcdoc schemas for Apotheosis (1.21.1+ and 26.1) and Placebo gear sets.
+// Converted from Shadows-of-Fire/Apotheosis and Shadows-of-Fire/Placebo schema documentation
+// and verified against both 1.21 and 26.1 data codecs.
+
+// ============================================================================
+// Shared Enums & Primitives
+// ============================================================================
+
+/// One of the five fixed Apotheosis world difficulty tiers.
+enum(string) WorldTier {
+	Haven = "haven",
+	Frontier = "frontier",
+	Ascent = "ascent",
+	Summit = "summit",
+	Pinnacle = "pinnacle",
+}
+
+/// Fixed gem purity tiers, in ascending order of strength.
+enum(string) Purity {
+	Cracked = "cracked",
+	Chipped = "chipped",
+	Flawed = "flawed",
+	Normal = "normal",
+	Flawless = "flawless",
+	Perfect = "perfect",
+}
+
+/// Coarse affix grouping used by loot rules when selecting which affix pool to roll from.
+enum(string) AffixType {
+	/// Passive stat affixes, such as attribute modifiers.
+	Stat = "stat",
+	/// Minor triggered effects, weaker than full abilities.
+	BasicEffect = "basic_effect",
+	/// Powerful and unique effects, usually reserved for higher rarities.
+	Ability = "ability",
+}
+
+/// Attribute modifier operation (Placebo's enum codec accepts both snake_case and Java enum UPPER_CASE).
+enum(string) AttributeOperation {
+	/// Adds the value directly to the attribute base.
+	AddValue = "add_value",
+	/// Adds value * effective base to the final attribute value.
+	AddMultipliedBase = "add_multiplied_base",
+	/// Multiplies the final attribute value by (1.0 + value).
+	AddMultipliedTotal = "add_multiplied_total",
+	AddValueUpper = "ADD_VALUE",
+	AddMultipliedBaseUpper = "ADD_MULTIPLIED_BASE",
+	AddMultipliedTotalUpper = "ADD_MULTIPLIED_TOTAL",
+}
+
+/// Damage category used by damage reduction affixes, gem bonuses, and tier augments.
+enum(string) ApothDamageType {
+	/// Physical (non-magical) damage.
+	Physical = "physical",
+	/// Magic damage.
+	Magic = "magic",
+	/// Fire damage.
+	Fire = "fire",
+	/// Fall damage.
+	Fall = "fall",
+	/// Explosion damage.
+	Explosion = "explosion",
+	/// Projectile damage.
+	Projectile = "projectile",
+	/// Lightning damage.
+	Lightning = "lightning",
+}
+
+/// Application mode for enchantment affixes and gem bonuses.
+enum(string) EnchantmentMode {
+	/// Adds levels unconditionally, granting the enchantment even if absent.
+	Single = "single",
+	/// Adds levels only if the item already has the enchantment.
+	Existing = "existing",
+	/// Adds levels to every enchantment already present on the item.
+	Global = "global",
+}
+
+/// Event and recipient pair for mob effect affixes and gem bonuses.
+enum(string) MobEffectTarget {
+	/// When the user attacks an entity, applied to the user.
+	AttackSelf = "attack_self",
+	/// When the user attacks an entity, applied to the target entity.
+	AttackTarget = "attack_target",
+	/// When the user is hurt, applied to the user.
+	HurtSelf = "hurt_self",
+	/// When the user is hurt, applied to the attacker.
+	HurtAttacker = "hurt_attacker",
+	/// When the user breaks a block, applied to the user.
+	BreakSelf = "break_self",
+	/// When an arrow fired by the user hits an entity, applied to the user.
+	ArrowSelf = "arrow_self",
+	/// When an arrow fired by the user hits an entity, applied to the hit entity.
+	ArrowTarget = "arrow_target",
+	/// When the user blocks damage with a shield, applied to the user.
+	BlockSelf = "block_self",
+	/// When the user blocks damage with a shield, applied to the direct attacker.
+	BlockAttacker = "block_attacker",
+	/// When any projectile fired by the user hits an entity, applied to the user.
+	ProjectileSelf = "projectile_self",
+	/// When any projectile fired by the user hits an entity, applied to the hit entity.
+	ProjectileTarget = "projectile_target",
+}
+
+/// Positional surface check used by spawn conditions and invader spawn rules.
+enum(string) SurfaceType {
+	/// The sky must be visible at the target position. Always fails in skylight-less dimensions.
+	NeedsSky = "needs_sky",
+	/// The position must be at or above surface level (ignoring leaves).
+	NeedsSurface = "needs_surface",
+	/// The position must be below surface level.
+	BelowSurface = "below_surface",
+	/// The sky must not be visible at the target position. Always passes in skylight-less dimensions.
+	CannotSeeSky = "cannot_see_sky",
+	/// The surface must be visible and X or Z must be more than 1024 blocks from the origin.
+	SurfaceOuterEnd = "surface_outer_end",
+	/// Always passes.
+	Any = "any",
+	/// The sky must be visible, or the position must be within 8 blocks on Y of the nearest player.
+	NeedsSkyOrSameVerticalSlice = "needs_sky_or_same_vertical_slice",
+}
+
+/// Vanilla spawn reason checked by `apotheosis:spawn_type` conditions.
+enum(string) MobSpawnType {
+	/// Natural mob spawning (excluding chunk generation).
+	Natural = "natural",
+	/// Mobs placed during chunk generation.
+	ChunkGeneration = "chunk_generation",
+	/// Mobs spawned by a mob spawner (not trial spawners).
+	Spawner = "spawner",
+	/// Mobs spawned by a structure.
+	Structure = "structure",
+	/// Mobs spawned by breeding (used by villagers).
+	Breeding = "breeding",
+	/// Mobs summoned by another mob, such as Iron Golems from villagers.
+	MobSummoned = "mob_summoned",
+	/// Mobs spawned as a jockey mount.
+	Jockey = "jockey",
+	/// Mobs spawned by an event such as raids or wandering traders.
+	Event = "event",
+	/// Mobs converted from another entity, such as zombie villagers.
+	Conversion = "conversion",
+	/// Mobs summoned as reinforcements, such as by zombies.
+	Reinforcement = "reinforcement",
+	/// Mobs triggered by a mechanic, such as sculk shriekers summoning a Warden.
+	Triggered = "triggered",
+	/// Mobs placed from a bucket.
+	Bucket = "bucket",
+	/// Mobs spawned using a spawn egg (1.21.1).
+	#[until="1.21.2"]
+	SpawnEgg = "spawn_egg",
+	/// Mobs spawned by using a spawn item (1.21.2+).
+	#[since="1.21.2"]
+	SpawnItemUse = "spawn_item_use",
+	/// Mobs summoned by `/summon`.
+	Command = "command",
+	/// Mobs dispensed from a spawn egg.
+	Dispenser = "dispenser",
+	/// Mobs spawned by patrol logic.
+	Patrol = "patrol",
+	/// Mobs spawned by a Trial Spawner.
+	TrialSpawner = "trial_spawner",
+	/// Mobs loaded from disk (1.21.2+).
+	#[since="1.21.2"]
+	Load = "load",
+	/// Mobs arriving from dimension travel (1.21.2+).
+	#[since="1.21.2"]
+	DimensionTravel = "dimension_travel",
+}
+
+/// Target group for a world tier augment.
+enum(string) TierAugmentTarget {
+	/// Applied to players in this tier and removed when they switch tiers.
+	Players = "players",
+	/// Permanently applied to monsters spawned while this tier is active.
+	Monsters = "monsters",
+}
+
+/// Built-in Apotheosis loot categories eligible for affixes and gems.
+enum(string) BuiltinLootCategory {
+	/// Bows and crossbows (active in either hand).
+	Bow = "apotheosis:bow",
+	/// Digging tools such as pickaxes and shovels (active in main hand).
+	Breaker = "apotheosis:breaker",
+	/// Head-slot armor excluding skulls and carved pumpkins.
+	Helmet = "apotheosis:helmet",
+	/// Chest-slot armor.
+	Chestplate = "apotheosis:chestplate",
+	/// Legs-slot armor.
+	Leggings = "apotheosis:leggings",
+	/// Feet-slot armor.
+	Boots = "apotheosis:boots",
+	/// Blocking shields (active in either hand).
+	Shield = "apotheosis:shield",
+	/// Tridents (active in main hand).
+	Trident = "apotheosis:trident",
+	/// Swords and weapons with more than one attack damage (active in main hand).
+	MeleeWeapon = "apotheosis:melee_weapon",
+	/// Shears (active in main hand).
+	Shears = "apotheosis:shears",
+	BowShort = "bow",
+	BreakerShort = "breaker",
+	HelmetShort = "helmet",
+	ChestplateShort = "chestplate",
+	LeggingsShort = "leggings",
+	BootsShort = "boots",
+	ShieldShort = "shield",
+	TridentShort = "trident",
+	MeleeWeaponShort = "melee_weapon",
+	ShearsShort = "shears",
+}
+
+/// Loot category ID. Omitting the namespace defaults to `apotheosis`.
+type LootCategory = (BuiltinLootCategory | #[id="apotheosis:loot_category"] string)
+
+/// Loot category ID including `apotheosis:none`, used by loot category override data maps.
+type LootCategoryOrNone = (BuiltinLootCategory | "apotheosis:none" | "none" | #[id="apotheosis:loot_category"] string)
+
+/// Registry reference to an Apotheosis loot rarity.
+type LootRarityRef = #[id="apotheosis:rarities"] string
+
+/// Named vanilla or Placebo color.
+enum(string) NamedColor {
+	Black = "black",
+	DarkBlue = "dark_blue",
+	DarkGreen = "dark_green",
+	DarkAqua = "dark_aqua",
+	DarkRed = "dark_red",
+	DarkPurple = "dark_purple",
+	Gold = "gold",
+	Gray = "gray",
+	DarkGray = "dark_gray",
+	Blue = "blue",
+	Green = "green",
+	Aqua = "aqua",
+	Red = "red",
+	LightPurple = "light_purple",
+	Yellow = "yellow",
+	White = "white",
+	/// Animated rainbow color provided by Placebo.
+	Rainbow = "rainbow",
+}
+
+/// Color string: either a named color (vanilla or Placebo `"rainbow"`) or `"#RRGGBB"` hex.
+type Color = (NamedColor | #[color="hex_rgb"] string)
+
+/// Vanilla or NeoForge HolderSet: a single ID or `#tag`, a list of IDs, or a compound holder set object.
+type HolderSet<T> = (
+	T |
+	[T] |
+	struct {
+		type: string,
+		[string]: any,
+	}
+)
+
+/// Placebo CompoundTag: either an inline JSON object or an SNBT string.
+type CompoundTag = (
+	string |
+	struct {
+		[string]: any,
+	}
+)
+
+/// Vanilla data component patch map. Prefix a component ID with `!` to remove it.
+type DataComponentPatch = struct {
+	[string]: any,
+}
+
+/// Vanilla text component, translation key, or literal string.
+type TextComponent = (
+	string |
+	struct {
+		text?: string,
+		translate?: string,
+		fallback?: string,
+		with?: [TextComponent],
+		color?: Color,
+		bold?: boolean,
+		italic?: boolean,
+		underlined?: boolean,
+		strikethrough?: boolean,
+		obfuscated?: boolean,
+		extra?: [TextComponent],
+		[string]: any,
+	} |
+	[TextComponent]
+)
+
+/// Placebo ItemStack codec supporting full data component patches and optional stacks.
+struct PlaceboItemStack {
+	/// Registry ID of the item to load.
+	id: #[id="item"] string,
+	/// If true, produces an empty stack instead of failing when the item ID is missing. Defaults to false.
+	optional?: boolean,
+	/// Stack count. Defaults to 1.
+	count?: int @ 1..99,
+	/// Data components to apply to the stack.
+	components?: DataComponentPatch,
+}
+
+/// Item stack paired with selection weight and optional mob equipment drop chance.
+struct WeightedItemStack {
+	/// The item stack to provide.
+	stack: PlaceboItemStack,
+	/// Relative selection weight in the list.
+	weight: int @ 0..,
+	/// Drop chance when equipped on an entity. Negative values keep the entity's default drop chance.
+	drop_chance?: float,
+}
+
+/// Vanilla or NeoForge ingredient (supports both 1.21 object form and 1.21.2+ simplified form).
+type PlaceboIngredient = (
+	#[id(registry="item", tags="allowed")] string |
+	[#[id="item"] string] |
+	struct {
+		item: #[id="item"] string,
+	} |
+	struct {
+		tag: #[id(registry="item", tags="implicit")] string,
+	} |
+	struct {
+		type: string,
+		[string]: any,
+	} |
+	[PlaceboIngredient]
+)
+
+/// Vanilla loot condition object.
+struct VanillaLootCondition {
+	condition: #[id="loot_condition_type"] string,
+	[string]: any,
+}
+
+/// Relative selection weight and luck quality.
+struct Weight {
+	/// Relative selection weight.
+	weight: int @ 0..65536,
+	/// Quality bonus applied per point of luck. Defaults to 0.
+	quality?: float @ -16..16,
+}
+
+/// Per-tier weights map, or a single Weight applied uniformly across all world tiers.
+/// Do not mix top-level `weight`/`quality` with tier keys: `TieredWeights.CODEC` uses `Codec.mapEither`, so `Weight.CODEC` matches first and silently ignores all per-tier overrides.
+type TieredWeights = (
+	Weight |
+	struct {
+		[WorldTier]: Weight,
+	}
+)
+
+/// Context-based generation constraints. Omitted or empty fields impose no restriction.
+struct Constraints {
+	/// World tiers this object may generate in.
+	tiers?: [WorldTier],
+	/// Dimension IDs this object may generate in.
+	dimensions?: [#[id="dimension"] string],
+	/// Biome IDs or `#tag` this object may generate in.
+	biomes?: HolderSet<#[id(registry="worldgen/biome", tags="allowed")] string>,
+	/// Game stages required for this object to generate.
+	stages?: [string],
+}
+
+/// Interpolates a 0..1 level to discrete values cleanly divisible by `step`.
+type StepFunction = (
+	float |
+	struct {
+		/// Minimum value of the output range.
+		min: float,
+		/// Maximum value of the output range.
+		max: float,
+		/// Step increment between outputs. Must evenly divide (max - min). Defaults to 0.01.
+		step?: float,
+	} |
+	struct {
+		/// Minimum value of the output range.
+		min: float,
+		/// Deprecated step count form. Prefer `{ "min", "max", "step" }`.
+		#[deprecated]
+		steps: int @ 1..,
+		/// Step increment per step.
+		step: float,
+	}
+)
+
+/// Mob effect instance with an application chance and randomized amplifier.
+struct ChancedEffectInstance {
+	/// Chance that this effect is applied (1.0 = 100%). Defaults to 1.0.
+	chance?: float @ 0..1,
+	/// Registry ID of the mob effect.
+	effect: #[id="mob_effect"] string,
+	/// Amplifier step function (truncated to an integer; 0 is level I). Defaults to 0.
+	amplifier?: StepFunction,
+	/// Whether the effect is marked ambient. Defaults to true.
+	ambient?: boolean,
+	/// Whether effect particles are visible. Defaults to false.
+	visible?: boolean,
+}
+
+/// Mob effect instance in constant mode (used by `apotheosis:mob_effect` entity modifiers).
+struct ConstantEffectInstance {
+	/// Registry ID of the mob effect.
+	effect: #[id="mob_effect"] string,
+	/// Constant amplifier (0 is level I). Defaults to 0.
+	amplifier?: int @ 0..255,
+	/// Whether the effect is marked ambient. Defaults to true.
+	ambient?: boolean,
+	/// Whether effect particles are visible. Defaults to false.
+	visible?: boolean,
+	/// Ignored in constant mode (treated as 1.0).
+	chance?: float @ 0..1,
+}
+
+/// Attribute modifier with a step-function or constant value.
+struct RandomAttributeModifier {
+	/// Registry ID of the attribute to modify.
+	attribute: #[id="attribute"] string,
+	/// Modifier operation.
+	operation: AttributeOperation,
+	/// Value or step function for the modifier.
+	value: StepFunction,
+	/// Optional modifier resource ID (26.1+).
+	#[since="26.1"]
+	modifier_id?: string,
+}
+
+/// Attribute modifier in constant mode (used by `apotheosis:attribute` tier augments).
+struct ConstantAttributeModifier {
+	/// Registry ID of the attribute to modify.
+	attribute: #[id="attribute"] string,
+	/// Modifier operation.
+	operation: AttributeOperation,
+	/// Constant float value for the modifier.
+	value: float,
+	/// Unique modifier ID per attribute (moved inside `modifier` in 26.1).
+	#[since="26.1"]
+	modifier_id: string,
+}
+
+/// Gear set selector: list of SetPredicates (`#tag` or ID) in 1.21, or a vanilla HolderSet in 26.1+.
+type GearSetSelector = (
+	#[until="26.1"] [string] |
+	#[since="26.1"] HolderSet<#[id(registry="placebo:gear_sets", tags="allowed")] string>
+)
+
+/// Additional loot tables rolled when an entity is killed.
+type BonusLootTables = [#[id="loot_table"] string]
+
+/// Dimensions and offsets for radial block mining.
+struct RadialData {
+	/// Width of the mined area.
+	x: int,
+	/// Height of the mined area.
+	y: int,
+	/// Horizontal offset of the mined area.
+	xOff: int,
+	/// Vertical offset of the mined area.
+	yOff: int,
+}
+
+/// Toolset definition emulated by omnetic affixes and gem bonuses.
+struct OmneticData {
+	/// Toolset name shown via lang key `misc.apotheosis.<name>`.
+	name: string,
+	/// Items whose harvest levels and mining speeds are emulated.
+	items: [PlaceboItemStack],
+}
+
+// ============================================================================
+// Affixes (`data/<ns>/affixes/` or `data/<ns>/apotheosis/affixes/`)
+// ============================================================================
+
+/// Common metadata shared by all affixes.
+struct AffixDefinition {
+	/// Affix pool grouping used by loot rules.
+	affix_type: AffixType,
+	/// Affix IDs that cannot coexist with this affix on the same item (checked bidirectionally).
+	exclusive_set: [#[id="apotheosis:affixes"] string],
+	/// Relative selection weights for this affix.
+	weights: TieredWeights,
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:affixes"] to struct Affix {
+	/// Affix codec type ID.
+	type: #[dispatcher_key="apotheosis:affix"] string,
+	/// Common affix type, exclusivity set, and weights.
+	definition: AffixDefinition,
+	...apotheosis:affix[[type]],
+}
+
+/// Applies a single attribute modifier to items in the configured loot categories.
+dispatch apotheosis:affix["apotheosis:attribute"] to struct {
+	/// Registry ID of the attribute to modify.
+	attribute: #[id="attribute"] string,
+	/// Modifier operation.
+	operation: AttributeOperation,
+	/// Modifier value step function per supported rarity.
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+	/// Loot categories this affix may roll on. When empty, all categories are allowed.
+	categories: [LootCategory],
+}
+
+/// Lets the wearer toggle bonuses to one or more attributes on or off with a keybind (boots only).
+dispatch apotheosis:affix["apotheosis:attribute_toggle"] to struct {
+	/// Registry IDs of attributes toggled together by this affix.
+	attributes: [#[id="attribute"] string] @ 1..,
+	/// Rarities this affix may roll at.
+	rarities: [LootRarityRef],
+}
+
+/// Applies multiple attribute modifiers displayed as a single tooltip line.
+dispatch apotheosis:affix["apotheosis:multi_attr"] to struct {
+	/// Attribute modifiers granted together. Every modifier must cover the same rarities.
+	modifiers: [struct {
+		/// Registry ID of the attribute to modify.
+		attribute: #[id="attribute"] string,
+		/// Modifier operation.
+		operation: AttributeOperation,
+		/// Modifier value step function per supported rarity.
+		values: struct {
+			[LootRarityRef]: StepFunction,
+		},
+	}],
+	/// Translation key for the combined tooltip line.
+	desc: string,
+	/// Loot categories this affix may roll on. When empty, all categories are allowed.
+	categories: [LootCategory],
+}
+
+/// Applies a mob effect when a specific combat or block event occurs.
+dispatch apotheosis:affix["apotheosis:mob_effect"] to struct {
+	/// Registry ID of the mob effect to apply.
+	mob_effect: #[id="mob_effect"] string,
+	/// Event and recipient pair triggering this effect.
+	target: MobEffectTarget,
+	/// Effect duration, amplifier, and cooldown per supported rarity.
+	values: struct {
+		[LootRarityRef]: struct {
+			/// Effect duration in ticks (truncated to integer).
+			duration: StepFunction,
+			/// Effect amplifier (zero-indexed, truncated to integer).
+			amplifier: StepFunction,
+			/// Cooldown between applications in ticks. Defaults to 0.
+			cooldown?: int @ 0..,
+		},
+	},
+	/// Loot categories this affix may roll on. When empty, all categories are allowed.
+	types: [LootCategory],
+	/// If true, reapplying while active increases amplifier up to `stacking_limit`. Defaults to false.
+	stack_on_reapply?: boolean,
+	/// Maximum amplifier when stacking. Defaults to 255.
+	stacking_limit?: int @ 1..255,
+}
+
+/// Reduces incoming damage of a specific type by a percentage.
+dispatch apotheosis:affix["apotheosis:damage_reduction"] to struct {
+	/// Damage category reduced by this affix.
+	damage_type: ApothDamageType,
+	/// Fraction of damage removed per supported rarity (0..1).
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+	/// Loot categories this affix may roll on. When empty, all categories are allowed.
+	categories: [LootCategory],
+}
+
+/// Grants Strength when blocking an explosion (shields only).
+dispatch apotheosis:affix["apotheosis:catalyzing"] to struct {
+	/// Duration of the Strength effect in ticks per supported rarity.
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+}
+
+/// Grants a chance for fully-charged melee attacks to strike nearby enemies (melee weapons and tridents).
+dispatch apotheosis:affix["apotheosis:cleaving"] to struct {
+	/// Cleave chance and extra target count per supported rarity.
+	values: struct {
+		[LootRarityRef]: struct {
+			/// Chance for a fully-charged attack to cleave (0..1).
+			chance: StepFunction,
+			/// Extra targets hit (truncated to integer).
+			targets: StepFunction,
+		},
+	},
+}
+
+/// Grants bonus levels of an enchantment to the item.
+dispatch apotheosis:affix["apotheosis:enchantment"] to struct {
+	/// Registry ID of the enchantment to boost.
+	enchantment: #[id="enchantment"] string,
+	/// Application mode. Defaults to `"single"`.
+	mode?: EnchantmentMode,
+	/// Bonus enchantment levels per supported rarity (truncated to integer).
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+	/// Loot categories this affix may roll on. When empty, all categories are allowed.
+	categories: [LootCategory],
+}
+
+/// Allows placing torches by right-clicking with the tool at a durability cost (breakers only).
+dispatch apotheosis:affix["apotheosis:enlightened"] to struct {
+	/// Durability cost per torch placed per supported rarity (truncated to integer).
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+}
+
+/// Instantly executes enemies below a remaining health fraction on fully-charged attacks.
+dispatch apotheosis:affix["apotheosis:executing"] to struct {
+	/// Loot categories this affix may roll on. An empty list matches nothing.
+	categories: [LootCategory],
+	/// Remaining health fraction threshold per supported rarity (0..1).
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+}
+
+/// Grants a chance for slain mobs to explode into extra copies of their drops.
+dispatch apotheosis:affix["apotheosis:festive"] to struct {
+	/// Loot categories this affix may roll on. An empty list matches nothing.
+	categories: [LootCategory],
+	/// Pinata trigger chance and extra drop roll count per supported rarity.
+	values: struct {
+		[LootRarityRef]: struct {
+			/// Chance a kill triggers the pinata (0..1).
+			chance: StepFunction,
+			/// Extra copies of each dropped item.
+			rolls: int @ 1..,
+		},
+	},
+}
+
+/// Makes fired arrows deal armor-bypassing magic damage (ranged weapons only).
+dispatch apotheosis:affix["apotheosis:magical"] to struct {
+	/// Rarities this affix may roll at.
+	rarities: [LootRarityRef],
+}
+
+/// Makes the tool emulate an entire toolset's harvest levels and mining speeds.
+dispatch apotheosis:affix["apotheosis:omnetic"] to struct {
+	/// Loot categories this affix may roll on. An empty list matches nothing.
+	categories: [LootCategory],
+	/// Emulated toolset per supported rarity.
+	values: struct {
+		[LootRarityRef]: OmneticData,
+	},
+}
+
+/// Reflects blocked projectile damage back at the shooter (shields only).
+dispatch apotheosis:affix["apotheosis:psychic"] to struct {
+	/// Fraction of blocked damage reflected per supported rarity.
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+}
+
+/// Mines an X-by-Y plane of blocks when breaking a block.
+dispatch apotheosis:affix["apotheosis:radial"] to struct {
+	/// Loot categories this affix may roll on. An empty list matches nothing.
+	categories: [LootCategory],
+	/// Ordered list of mining areas from weakest to strongest per supported rarity.
+	values: struct {
+		[LootRarityRef]: [RadialData],
+	},
+}
+
+/// Launches the user backwards when blocking a close-range attack (shields only).
+dispatch apotheosis:affix["apotheosis:retreating"] to struct {
+	/// Rarities this affix may roll at.
+	rarities: [LootRarityRef],
+}
+
+/// Grants a chance to fire a bonus spectral arrow alongside the original shot (ranged weapons only).
+dispatch apotheosis:affix["apotheosis:spectral"] to struct {
+	/// Chance to fire a bonus spectral arrow per supported rarity (0..1).
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+}
+
+/// Converts mined blocks within a candidate set into a player-selected target block.
+dispatch apotheosis:affix["apotheosis:stoneforming"] to struct {
+	/// Loot categories this affix may roll on. An empty list matches nothing.
+	categories: [LootCategory],
+	/// Interchangeable candidate blocks (block list or `#tag`).
+	candidates: HolderSet<#[id(registry="block", tags="allowed")] string>,
+}
+
+/// Teleports block and mob drops directly to the player (ranged weapons, melee weapons, and breakers).
+dispatch apotheosis:affix["apotheosis:telepathic"] to struct {
+	/// Rarities this affix may roll at.
+	rarities: [LootRarityRef],
+}
+
+/// Chains flat armor-bypassing lightning damage to all nearby enemies on fully-charged melee hits.
+dispatch apotheosis:affix["apotheosis:thunderstruck"] to struct {
+	/// Loot categories this affix may roll on. An empty list matches nothing.
+	categories: [LootCategory],
+	/// Flat chained lightning damage dealt per supported rarity.
+	values: struct {
+		[LootRarityRef]: StepFunction,
+	},
+}
+
+// ============================================================================
+// Gems, Gem Bonuses, Extra Gem Bonuses & Purity Weights
+// ============================================================================
+
+/// Named group of loot categories a gem bonus applies to, or a single loot category string.
+type GemClass = (
+	LootCategory |
+	struct {
+		/// Tooltip lang key suffix (`gem_class.<key>`).
+		key: string,
+		/// Loot categories covered by this gem class (non-empty list, `#tag`, or NeoForge compound holder set).
+		types: HolderSet<LootCategory>,
+	}
+)
+
+/// Polymorphic gem bonus entry.
+struct GemBonus {
+	/// Gem bonus codec type ID.
+	type: #[dispatcher_key="apotheosis:gem_bonus"] string,
+	...apotheosis:gem_bonus[[type]],
+}
+
+/// Applies a single attribute modifier per gem purity.
+dispatch apotheosis:gem_bonus["apotheosis:attribute"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Registry ID of the attribute to modify.
+	attribute: #[id="attribute"] string,
+	/// Modifier operation.
+	operation: AttributeOperation,
+	/// Modifier value per supported purity.
+	values: struct {
+		[Purity]: float,
+	},
+}
+
+/// Applies multiple attribute modifiers displayed as a single tooltip line.
+dispatch apotheosis:gem_bonus["apotheosis:multi_attribute"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Attribute modifiers granted together.
+	modifiers: [struct {
+		/// Registry ID of the attribute to modify.
+		attribute: #[id="attribute"] string,
+		/// Modifier operation.
+		operation: AttributeOperation,
+		/// Modifier value per supported purity.
+		values: struct {
+			[Purity]: float,
+		},
+	}],
+	/// Translation key for the combined tooltip line.
+	desc: string,
+}
+
+/// Grants a percentage chance to ignore durability damage taken by the socketed item.
+dispatch apotheosis:gem_bonus["apotheosis:durability"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Fraction of durability damage ignored per supported purity (0..1).
+	values: struct {
+		[Purity]: float @ 0..1,
+	},
+}
+
+/// Reduces incoming damage of a specific type by a percentage.
+dispatch apotheosis:gem_bonus["apotheosis:damage_reduction"] to struct {
+	/// Damage category reduced by this bonus.
+	damage_type: ApothDamageType,
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Fraction of damage removed per supported purity (0..1).
+	values: struct {
+		[Purity]: float @ 0..1,
+	},
+}
+
+/// Grants bonus levels of an enchantment to the socketed item.
+dispatch apotheosis:gem_bonus["apotheosis:enchantment"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Registry ID of the enchantment to boost.
+	enchantment: #[id="enchantment"] string,
+	/// Application mode. Defaults to `"single"`.
+	mode?: EnchantmentMode,
+	/// Bonus enchantment levels per supported purity (1..127).
+	values: struct {
+		[Purity]: int @ 1..127,
+	},
+}
+
+/// Applies a mob effect when a specific combat or block event occurs.
+dispatch apotheosis:gem_bonus["apotheosis:mob_effect"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Registry ID of the mob effect to apply.
+	mob_effect: #[id="mob_effect"] string,
+	/// Event and recipient pair triggering this effect.
+	target: MobEffectTarget,
+	/// Effect duration, amplifier, and cooldown per supported purity.
+	values: struct {
+		[Purity]: struct {
+			/// Effect duration in ticks.
+			duration: int @ 0..,
+			/// Effect amplifier (zero-indexed; 0 is level I).
+			amplifier: int @ 0..255,
+			/// Cooldown between applications in ticks. Defaults to 0.
+			cooldown?: int @ 0..,
+		},
+	},
+	/// If true, reapplying while active increases amplifier up to `stacking_limit`. Defaults to false.
+	stack_on_reapply?: boolean,
+	/// Maximum amplifier when stacking. Defaults to 255.
+	stacking_limit?: int @ 1..255,
+}
+
+/// Empowers fired arrows at the cost of the shooter's health (bows only; no `gem_class`).
+dispatch apotheosis:gem_bonus["apotheosis:bloody_arrow"] to struct {
+	/// Health cost, damage multiplier, and cooldown per supported purity.
+	values: struct {
+		[Purity]: struct {
+			/// Fraction of maximum health paid per empowered shot.
+			health_cost: float @ 0..1,
+			/// Multiplier applied to the arrow's base damage.
+			damage_mult: float @ 0..,
+			/// Cooldown between empowered shots in ticks.
+			cooldown: int @ 0..,
+		},
+	},
+}
+
+/// Removes gravity from fired arrows and thrown tridents while in flight.
+dispatch apotheosis:gem_bonus["apotheosis:anti_gravity_arrow"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Lowest purity at which this bonus is active. Defaults to `"cracked"`.
+	min_purity?: Purity,
+}
+
+/// Heals the user for a fraction of blocked damage (shields only; no `gem_class`).
+dispatch apotheosis:gem_bonus["apotheosis:leech_block"] to struct {
+	/// Heal fraction and cooldown per supported purity.
+	values: struct {
+		[Purity]: struct {
+			/// Fraction of blocked damage restored as health.
+			heal_factor: float @ 0..,
+			/// Cooldown between heals in ticks.
+			cooldown: int @ 0..,
+		},
+	},
+}
+
+/// Applies the same modifier value and operation to every listed attribute.
+dispatch apotheosis:gem_bonus["apotheosis:all_stats"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Modifier operation applied to every attribute.
+	operation: AttributeOperation,
+	/// Modifier value per supported purity.
+	values: struct {
+		[Purity]: float,
+	},
+	/// Attributes receiving the modifier (list of IDs or `#tag`).
+	attributes: HolderSet<#[id(registry="attribute", tags="allowed")] string>,
+}
+
+/// Randomly replaces dropped items matching `inputs` with `output` when `conditions` pass.
+dispatch apotheosis:gem_bonus["apotheosis:drop_transform"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Vanilla loot conditions that must pass for conversion.
+	conditions: [VanillaLootCondition],
+	/// Ingredient matching drops eligible for replacement.
+	inputs: PlaceboIngredient,
+	/// Replacement item stack (count is overwritten with the original drop count).
+	output: PlaceboItemStack,
+	/// Transform trigger chance per supported purity (0..1).
+	values: struct {
+		[Purity]: float @ 0..1,
+	},
+	/// Translation key for the tooltip line.
+	desc: string,
+}
+
+/// Converts a fraction of incoming `#c:is_magic` damage into healing.
+dispatch apotheosis:gem_bonus["apotheosis:mageslayer"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Fraction of magic damage converted into healing per supported purity (0..1).
+	values: struct {
+		[Purity]: float @ 0..1,
+	},
+}
+
+/// Grants bonus loot from mobs killed primarily via cold damage.
+dispatch apotheosis:gem_bonus["apotheosis:frozen_drops"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Bonus loot multiplier per supported purity (1.0 = +100% loot).
+	values: struct {
+		[Purity]: float @ 0..100,
+	},
+}
+
+/// Makes the socketed tool emulate an entire toolset.
+dispatch apotheosis:gem_bonus["apotheosis:omnetic"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Emulated toolset per supported purity.
+	values: struct {
+		[Purity]: OmneticData,
+	},
+}
+
+/// Makes the socketed tool mine an X-by-Y plane of blocks.
+dispatch apotheosis:gem_bonus["apotheosis:radial"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Mining area dimensions and offsets per supported purity.
+	values: struct {
+		[Purity]: RadialData,
+	},
+}
+
+/// Grants a chance to receive five Twilight Forest fortification shields when hurt.
+dispatch apotheosis:gem_bonus["apotheosis:twilight_fortification"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Trigger chance and cooldown per supported purity.
+	values: struct {
+		[Purity]: struct {
+			/// Chance to gain fortification shields when hurt (0..1).
+			chance: float @ 0..1,
+			/// Cooldown between activations in ticks.
+			cooldown: int @ 0..,
+		},
+	},
+}
+
+/// Allows using the socketed tool as a Twilight Forest Ore Magnet at a durability cost.
+dispatch apotheosis:gem_bonus["apotheosis:twilight_ore_magnet"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Durability cost per activation per supported purity.
+	values: struct {
+		[Purity]: int @ 0..4096,
+	},
+}
+
+/// Grants a chance to summon a Twilight Forest Treasure Goblin when attacking.
+dispatch apotheosis:gem_bonus["apotheosis:twilight_treasure_goblin"] to struct {
+	/// Loot categories this bonus applies to.
+	gem_class: GemClass,
+	/// Summon chance and cooldown per supported purity.
+	values: struct {
+		[Purity]: struct {
+			/// Chance to summon a Treasure Goblin on attack (0..1).
+			chance: float @ 0..1,
+			/// Cooldown between summons in ticks.
+			cooldown: int @ 0..,
+		},
+	},
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:gems"] to struct Gem {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:gem",
+	/// Relative selection weights for this gem.
+	weights: TieredWeights,
+	/// Optional generation constraints.
+	constraints?: Constraints,
+	/// Minimum purity this gem may generate with. Defaults to `"cracked"`.
+	min_purity?: Purity,
+	/// Non-empty list of gem bonuses. Gem classes may not overlap across bonuses.
+	bonuses: [GemBonus] @ 1..,
+	/// If true, only one copy of this gem may be socketed into an item. Defaults to false.
+	unique?: boolean,
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:extra_gem_bonuses"] to struct ExtraGemBonus {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:extra_gem_bonus",
+	/// Registry ID of the target gem.
+	gem: #[id="apotheosis:gems"] string,
+	/// Additional bonuses to attach to the gem.
+	bonuses: [GemBonus] @ 1..,
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:purity_weights"] to struct PurityWeights {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:purity_weights",
+	/// Per-world-tier map of purity selection weights. Omitted purities receive weight 0.
+	weights: struct {
+		[WorldTier]: struct {
+			[Purity]: Weight,
+		},
+	},
+}
+
+// ============================================================================
+// Loot Rules, Rarities, Rarity Overrides & Affix Loot Entries
+// ============================================================================
+
+/// Action applied to an item when generated or reforged under a loot rarity.
+struct LootRule {
+	/// Loot rule codec type ID.
+	type: #[dispatcher_key="apotheosis:loot_rule"] string,
+	...apotheosis:loot_rule[[type]],
+}
+
+/// Applies or removes data components on the reforged item stack.
+dispatch apotheosis:loot_rule["apotheosis:component"] to struct {
+	/// Data component patch to apply. Prefix keys with `!` to remove components.
+	components: DataComponentPatch,
+}
+
+/// Applies a random affix of the specified affix type.
+dispatch apotheosis:loot_rule["apotheosis:affix"] to struct {
+	/// Pool of affixes to draw from.
+	affix_type: AffixType,
+}
+
+/// Applies a random number of sockets without reducing existing sockets.
+dispatch apotheosis:loot_rule["apotheosis:socket"] to struct {
+	/// Minimum number of sockets to apply.
+	min: int @ 0..16,
+	/// Maximum number of sockets to apply.
+	max: int @ 1..16,
+}
+
+/// Applies a random durability bonus, overwriting any existing durability bonus.
+dispatch apotheosis:loot_rule["apotheosis:durability"] to struct {
+	/// Minimum durability bonus fraction (0..1).
+	min: float @ 0..1,
+	/// Maximum durability bonus fraction (0..1).
+	max: float @ 0..1,
+}
+
+/// Rolls a chance before executing an inner loot rule.
+dispatch apotheosis:loot_rule["apotheosis:chanced"] to struct {
+	/// Chance the rule executes (0..1).
+	chance: float @ 0..1,
+	/// Underlying loot rule applied on success.
+	rule: LootRule,
+}
+
+/// Executes multiple loot rules together in sequence.
+dispatch apotheosis:loot_rule["apotheosis:combined"] to struct {
+	/// Ordered list of loot rules to apply.
+	rules: [LootRule],
+}
+
+/// Rolls a chance and runs `if_true` on success or `if_false` on failure.
+dispatch apotheosis:loot_rule["apotheosis:select"] to struct {
+	/// Chance that `if_true` is selected (0..1).
+	chance: float @ 0..1,
+	/// Loot rule applied when the roll succeeds.
+	if_true: LootRule,
+	/// Loot rule applied when the roll fails.
+	if_false: LootRule,
+}
+
+/// Dropped item shadow settings for a rarity.
+struct RarityShadowData {
+	/// Shadow size. Zero disables the shadow.
+	size: float @ 0..2,
+	/// Shadow opacity (0 transparent, 255 opaque).
+	alpha: int @ 0..255,
+	/// Texture resource location for the shadow.
+	texture: string,
+	/// Animation frame count (1 disables animation). Defaults to 1.
+	frames?: int @ 1..128,
+	/// Time in ticks between animation frames. Defaults to 1.
+	frame_time?: float @ 0.5..40,
+}
+
+/// Dropped item particle toggle for a rarity.
+struct RarityParticleData {
+	/// Whether particles appear for dropped items of this rarity.
+	enabled: boolean,
+}
+
+/// In-world drop rendering effects (beam, ground glow, shadow, and particles) for a rarity.
+struct RarityRenderData {
+	/// Beam and glow height. Zero disables both.
+	beam_height: float @ 0..256,
+	/// Beam radius. Zero disables the beam.
+	beam_radius: float @ 0..5,
+	/// Beam texture resource location.
+	beam_texture: string,
+	/// Ground glow radius. Zero disables the glow.
+	glow_radius: float @ 0..7,
+	/// Ground glow texture resource location.
+	glow_texture: string,
+	/// Shadow rendered beneath dropped items.
+	shadow?: RarityShadowData,
+	/// Particle settings for dropped items.
+	particle?: RarityParticleData,
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:rarities"] to struct LootRarity {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:rarity",
+	/// Display color identifying this rarity.
+	color: Color,
+	/// Registry ID of the rarity material item (must not be air).
+	material: #[id(registry="item", exclude=["minecraft:air"])] string,
+	/// Per-world-tier selection weights for this rarity.
+	weights: TieredWeights,
+	/// Ordered loot rules executed when reforging or generating an item of this rarity.
+	rules: [LootRule],
+	/// Display sort order (lower numbers appear first). Defaults to 1000.
+	sort_index?: int @ 0..2000,
+	/// Visual drop effects (beam, glow, shadow, particles).
+	render_data?: RarityRenderData,
+	/// Sound event played when an invader spawns with this rarity.
+	invader_sound?: #[id="sound_event"] string,
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:rarity_override"] to struct RarityOverride {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:rarity_override",
+	/// Loot category this override applies to (must match the file path).
+	category: LootCategory,
+	/// Replacement loot rules keyed by rarity ID. Omitted rarities keep their normal rules.
+	overrides: struct {
+		[LootRarityRef]: [LootRule],
+	},
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:affix_loot_entries"] to struct AffixLootEntry {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:affix_loot_entry",
+	/// Relative selection weights for this entry.
+	weights: TieredWeights,
+	/// Optional generation constraints.
+	constraints?: Constraints,
+	/// Item stack generated by this entry.
+	stack: PlaceboItemStack,
+	/// Optional subset of rarities this entry may generate with. Empty allows all rarities.
+	rarities?: [LootRarityRef],
+}
+
+// ============================================================================
+// Mobs: Spawn Conditions, Entity Modifiers, Invaders, Elites & Augmentations
+// ============================================================================
+
+/// Condition evaluated against a spawning mob.
+struct SpawnCondition {
+	/// Spawn condition codec type ID.
+	type: #[dispatcher_key="apotheosis:spawn_condition"] string,
+	...apotheosis:spawn_condition[[type]],
+}
+
+/// Requires the mob's spawn reason to be in `spawn_types`.
+dispatch apotheosis:spawn_condition["apotheosis:spawn_type"] to struct {
+	/// Set of matching mob spawn types.
+	spawn_types: [MobSpawnType],
+}
+
+/// Requires the spawn position to satisfy a surface check.
+dispatch apotheosis:spawn_condition["apotheosis:surface_type"] to struct {
+	/// Required surface type.
+	surface_type: SurfaceType,
+}
+
+/// Requires the entity type to belong to an entity type tag.
+dispatch apotheosis:spawn_condition["apotheosis:has_tag"] to struct {
+	/// Entity type tag ID (without leading `#`).
+	tag: #[id(registry="entity_type", tags="implicit")] string,
+}
+
+/// Requires the entity to derive from vanilla's Monster class.
+dispatch apotheosis:spawn_condition["apotheosis:is_monster"] to struct {}
+
+/// Requires the entity to match arbitrary NBT data (expensive; serializes every spawning entity).
+dispatch apotheosis:spawn_condition["apotheosis:nbt"] to struct {
+	/// Required entity NBT compound.
+	nbt: CompoundTag,
+}
+
+/// Logical AND of all child spawn conditions.
+dispatch apotheosis:spawn_condition["apotheosis:and"] to struct {
+	/// Child conditions that must all pass.
+	spawn_conditions: [SpawnCondition],
+}
+
+/// Logical OR of all child spawn conditions.
+dispatch apotheosis:spawn_condition["apotheosis:or"] to struct {
+	/// Child conditions where at least one must pass.
+	spawn_conditions: [SpawnCondition],
+}
+
+/// Logical NOT inverting a single child spawn condition.
+dispatch apotheosis:spawn_condition["apotheosis:not"] to struct {
+	/// Condition to invert.
+	spawn_condition: SpawnCondition,
+}
+
+/// Logical XOR of two child spawn conditions.
+dispatch apotheosis:spawn_condition["apotheosis:xor"] to struct {
+	/// Left condition.
+	left: SpawnCondition,
+	/// Right condition.
+	right: SpawnCondition,
+}
+
+/// Modification applied to a spawning mob by an augmentation.
+struct EntityModifier {
+	/// Entity modifier codec type ID.
+	type: #[dispatcher_key="apotheosis:entity_modifier"] string,
+	...apotheosis:entity_modifier[[type]],
+}
+
+/// Applies a permanent mob effect (5 minutes on creepers) to the entity.
+dispatch apotheosis:entity_modifier["apotheosis:mob_effect"] to struct {
+	/// Effect to apply (constant mode).
+	effect: ConstantEffectInstance,
+}
+
+/// Applies a random attribute modifier to the entity.
+dispatch apotheosis:entity_modifier["apotheosis:attribute"] to struct {
+	/// Registry ID of the attribute to modify.
+	attribute: #[id="attribute"] string,
+	/// Modifier operation.
+	operation: AttributeOperation,
+	/// Value or step function for the modifier.
+	value: StepFunction,
+}
+
+/// Equips a random gear set matching the configured predicates or holder set.
+dispatch apotheosis:entity_modifier["apotheosis:gear_set"] to struct {
+	/// Set predicates (1.21) or gear set HolderSet (26.1+) controlling eligible gear sets.
+	valid_gear_sets: GearSetSelector,
+}
+
+/// Generates a random affix item and equips it on the entity as a guaranteed drop.
+dispatch apotheosis:entity_modifier["apotheosis:random_affix_item"] to struct {
+	/// Pool of rarities to draw from. Empty uses all rarities.
+	rarities?: [LootRarityRef],
+	/// Pool of affix loot entry IDs to draw from. Empty uses all entries.
+	entries?: [#[id="apotheosis:affix_loot_entries"] string],
+}
+
+/// Extra entity spawned alongside a boss as a mount or reinforcement.
+struct SupportingEntity {
+	/// Registry ID of the entity type to spawn.
+	entity: #[id="entity_type"] string,
+	/// Entity NBT loaded onto the spawned entity.
+	nbt?: CompoundTag,
+	/// X offset from the boss spawn position. Defaults to 0.
+	x?: float,
+	/// Y offset from the boss spawn position. Defaults to 0.
+	y?: float,
+	/// Z offset from the boss spawn position. Defaults to 0.
+	z?: float,
+}
+
+/// Common boss fields shared between Invaders and Elites.
+struct BasicBossData {
+	/// Selection weights relative to other bosses of the same kind.
+	weights: TieredWeights,
+	/// Generation constraints.
+	constraints?: Constraints,
+	/// Entity name (literal, translation key, text component, or `"use_name_generation"`).
+	name?: TextComponent,
+	/// Additional loot tables rolled on death.
+	bonus_loot?: BonusLootTables,
+	/// Per-world-tier gear set selectors.
+	valid_gear_sets?: struct {
+		[WorldTier]: GearSetSelector,
+	},
+	/// Entity NBT applied to the spawned mob.
+	nbt?: CompoundTag,
+	/// Mount entity that the boss rides.
+	mount?: SupportingEntity,
+	/// Extra entities spawned alongside the boss.
+	supporting_entities?: [SupportingEntity],
+	/// Whether vanilla spawn finalization runs on the mob. Defaults to false.
+	finalize?: boolean,
+	/// Conditions that must all pass for the boss to spawn.
+	spawn_conditions?: [SpawnCondition],
+}
+
+/// Enchantment, potion effect, and attribute buffs applied to a boss.
+struct BossStats {
+	/// Chance that each non-affix equipped item is enchanted.
+	enchant_chance: float @ 0..1,
+	/// Enchanting levels for the boss's equipment.
+	enchantment_levels: struct {
+		/// Enchanting level used for the affix item.
+		primary: int @ 0..,
+		/// Enchanting level used for all other items.
+		secondary: int @ 0..,
+	},
+	/// Potion effects applied on spawn.
+	effects?: [ChancedEffectInstance],
+	/// Attribute modifiers applied on spawn.
+	attribute_modifiers?: [RandomAttributeModifier],
+}
+
+/// Controls whether one of an elite's equipped items is converted into an affix item.
+struct AffixData {
+	/// Chance an equipped item becomes an affix item (0..1).
+	affix_chance: float @ 0..1,
+	/// Pool of rarities to select from. Empty allows all rarities.
+	rarities?: [LootRarityRef],
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:apothic_invaders"] to struct Invader {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:invader",
+	/// Common boss weights, constraints, name, and gear sets.
+	basic_data: BasicBossData,
+	/// Registry ID of the entity type to spawn.
+	entity: #[id="entity_type"] string,
+	/// Bounding box size checked to confirm the invader fits at the spawn position.
+	size: struct {
+		/// Bounding box width.
+		width: float @ 0..,
+		/// Bounding box height.
+		height: float @ 0..,
+	},
+	/// Per-rarity boss stats. The invader only generates with rarities present here.
+	stats: struct {
+		[LootRarityRef]: BossStats,
+	},
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:apothic_elites"] to struct Elite {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:elite",
+	/// Common boss weights, constraints, name, and gear sets.
+	basic_data: BasicBossData,
+	/// Chance a matching spawn is converted into this elite (0..1).
+	success_chance: float @ 0..1,
+	/// Entity types this elite may apply to (single ID, list, or `#tag`).
+	entities: HolderSet<#[id(registry="entity_type", tags="allowed")] string>,
+	/// Stats applied to the converted mob.
+	stats: BossStats,
+	/// Controls whether one of the elite's items becomes an affix item.
+	affix_data?: AffixData,
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:apothic_augments"] to struct Augmentation {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:augment",
+	/// Chance this augmentation applies after the mob is selected for augmenting (0..1).
+	application_chance: float @ 0..1,
+	/// Context-based generation constraints.
+	constraints?: Constraints,
+	/// Entity-based spawn conditions that must all pass.
+	conditions?: [SpawnCondition],
+	/// Non-empty list of modifiers applied to the mob.
+	modifiers: [EntityModifier] @ 1..,
+}
+
+// ============================================================================
+// Rogue Spawners (`data/<ns>/rogue_spawners/` or `data/<ns>/apotheosis/rogue_spawners/`)
+// ============================================================================
+
+/// Spawner stats keyed by Apothic Spawners stat ID.
+struct PresetSpawnerStats {
+	/// Minimum delay between spawn attempts, in ticks.
+	"apothic_spawners:min_delay"?: int @ 0..,
+	/// Maximum delay between spawn attempts, in ticks.
+	"apothic_spawners:max_delay"?: int @ 0..,
+	/// Number of spawn attempts per activation.
+	"apothic_spawners:spawn_count"?: int @ 0..,
+	/// Maximum nearby entities before spawning pauses.
+	"apothic_spawners:max_nearby_entities"?: int @ 0..,
+	/// Player activation distance in blocks.
+	"apothic_spawners:req_player_range"?: int @ 0..,
+	/// Horizontal spawn radius in blocks.
+	"apothic_spawners:spawn_range"?: int @ 0..,
+	/// Additional Apothic Spawners stats (numbers or booleans).
+	[string]: (float | boolean),
+}
+
+/// Vanilla SpawnData entry holding an entity compound and optional custom spawn rules.
+struct RogueSpawnData {
+	/// Entity NBT compound including `"id"`.
+	entity: struct {
+		/// Registry ID of the entity to spawn.
+		id: #[id="entity_type"] string,
+		[string]: any,
+	},
+	/// Optional custom light-level spawn rules.
+	custom_spawn_rules?: struct {
+		block_light_limit?: (int @ 0..15 | struct { min_inclusive: int @ 0..15, max_inclusive: int @ 0..15 }),
+		sky_light_limit?: (int @ 0..15 | struct { min_inclusive: int @ 0..15, max_inclusive: int @ 0..15 }),
+	},
+	/// Optional equipment table override.
+	equipment?: struct {
+		loot_table: #[id="loot_table"] string,
+		slot_drop_chances?: (float | struct { [string]: float }),
+	},
+}
+
+/// Weighted spawn potential entry in a rogue spawner.
+struct RogueSpawnPotential {
+	/// Relative weight of this spawn entry.
+	weight: int @ 1..,
+	/// Vanilla SpawnData payload.
+	data: RogueSpawnData,
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:rogue_spawners"] to struct RogueSpawner {
+	/// Legacy codec type marker (1.21).
+	type?: "apotheosis:rogue_spawner",
+	/// Worldgen selection weight relative to other rogue spawners.
+	weight: int @ 0..,
+	/// Spawner stats applied to the generated spawner.
+	stats: PresetSpawnerStats,
+	/// Loot table ID used for the chest placed below the spawner.
+	loot_table: #[id="loot_table"] string,
+	/// Non-empty weighted list of possible mob spawns.
+	spawn_potentials: [RogueSpawnPotential] @ 1..,
+}
+
+// ============================================================================
+// World Tier Augments (`data/<ns>/tier_augments/` or `data/<ns>/apotheosis/tier_augments/`)
+// ============================================================================
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:tier_augments"] to struct TierAugment {
+	/// Tier augment codec type ID.
+	type: #[dispatcher_key="apotheosis:tier_augment"] string,
+	/// World tier in which this augment is active.
+	tier: WorldTier,
+	/// Whether this augment affects players or monsters.
+	target: TierAugmentTarget,
+	/// Display sort order in the world tier window (lower appears first). Defaults to 1000.
+	sort_index?: int @ 0..2000,
+	...apotheosis:tier_augment[[type]],
+}
+
+/// Applies a constant attribute modifier to all targets in the tier.
+dispatch apotheosis:tier_augment["apotheosis:attribute"] to struct {
+	/// Constant attribute modifier to apply.
+	modifier: ConstantAttributeModifier,
+	/// Unique modifier ID per attribute (top-level in 1.21; moved inside `modifier` in 26.1).
+	#[until="26.1"]
+	modifier_id: string,
+}
+
+/// Grants a multiplicative incoming damage reduction to all targets in the tier.
+dispatch apotheosis:tier_augment["apotheosis:damage_reduction"] to struct {
+	/// Damage category reduced by this augment.
+	damage_type: ApothDamageType,
+	/// Fraction of damage removed (0..1).
+	amount: float @ 0..1,
+	/// Unique reduction ID per damage type.
+	reduction_id: string,
+}
+
+// ============================================================================
+// Placebo Gear Sets (`data/<ns>/gear_sets/` or `data/<ns>/placebo/gear_sets/`)
+// ============================================================================
+
+#[since="1.21.1"]
+dispatch minecraft:resource["placebo:gear_sets"] to struct GearSet {
+	/// Legacy codec type marker (1.21).
+	type?: "placebo:gear_set",
+	/// Relative selection weight.
+	weight: int @ 0..,
+	/// Luck quality bonus. Defaults to 0.
+	quality?: float @ 0..,
+	/// Weighted stacks for the main hand slot.
+	mainhands?: [WeightedItemStack],
+	/// Weighted stacks for the off hand slot.
+	offhands?: [WeightedItemStack],
+	/// Weighted stacks for the head slot.
+	helmets?: [WeightedItemStack],
+	/// Weighted stacks for the chest slot.
+	chestplates?: [WeightedItemStack],
+	/// Weighted stacks for the legs slot.
+	leggings?: [WeightedItemStack],
+	/// Weighted stacks for the feet slot.
+	boots?: [WeightedItemStack],
+	/// Legacy SetPredicate tags (1.21; replaced by `tags/placebo/gear_sets/` in 26.1).
+	tags?: [string],
+}
+
+// ============================================================================
+// Apotheosis NeoForge Data Maps (`data/apotheosis/data_maps/...`)
+// ============================================================================
+
+/// Per-dimension invader spawn configuration.
+struct InvaderSpawnRules {
+	/// Per-world-tier chances that an eligible natural spawn becomes an invader (0..1).
+	spawn_chances: struct {
+		haven: float @ 0..1,
+		frontier: float @ 0..1,
+		ascent: float @ 0..1,
+		summit: float @ 0..1,
+		pinnacle: float @ 0..1,
+	},
+	/// Surface check required at the spawn position.
+	surface_type: SurfaceType,
+	/// Optional per-dimension cooldown override in ticks (0..720000).
+	cooldown?: int @ 0..720000,
+	/// Optional per-dimension override for cursing boss items.
+	cursed?: boolean,
+	/// Optional per-dimension override for boss auto-aggro.
+	auto_aggro?: boolean,
+	/// Optional NeoForge load conditions for this data map entry.
+	"neoforge:conditions"?: [minecraft:resource["packraven:neoforge_condition"]],
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:data_map_invader_spawn_rules"] to struct InvaderSpawnRulesDataMap {
+	/// Whether to replace lower-priority data map entries.
+	replace?: boolean,
+	/// Per-dimension-type invader spawn rules.
+	values: struct {
+		[#[id(registry="dimension_type", tags="allowed")] string]: (
+			InvaderSpawnRules |
+			struct {
+				"neoforge:conditions"?: [minecraft:resource["packraven:neoforge_condition"]],
+				value: InvaderSpawnRules,
+			}
+		),
+	},
+	/// Dimension types to remove from this data map.
+	remove?: [#[id(registry="dimension_type", tags="allowed")] string],
+}
+
+#[since="1.21.1"]
+dispatch minecraft:resource["apotheosis:data_map_loot_category_overrides"] to struct LootCategoryOverridesDataMap {
+	/// Whether to replace lower-priority data map entries.
+	replace?: boolean,
+	/// Per-item loot category overrides (use `"apotheosis:none"` to exclude an item).
+	values: struct {
+		[#[id(registry="item", tags="allowed")] string]: (
+			LootCategoryOrNone |
+			struct {
+				"neoforge:conditions"?: [minecraft:resource["packraven:neoforge_condition"]],
+				value: LootCategoryOrNone,
+			}
+		),
+	},
+	/// Items to remove from this data map.
+	remove?: [#[id(registry="item", tags="allowed")] string],
+}

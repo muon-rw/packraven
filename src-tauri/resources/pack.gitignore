@@ -30,6 +30,7 @@ usernamecache.json
 # Per-machine mod state
 .mixin.out
 .probe/
+.proberaven/
 .rhino_cache/
 rhino.local.properties
 ds_private_storage.json

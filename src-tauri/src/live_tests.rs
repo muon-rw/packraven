@@ -497,3 +497,588 @@ fn read_mod_manifest() {
     let jar = std::env::var("PACKRAVEN_JAR").expect("set PACKRAVEN_JAR to a mod jar");
     println!("{:?}", crate::mod_manifest::read(Path::new(&jar)));
 }
+
+fn live_settings() -> Settings {
+    let path = dirs::config_dir()
+        .map(|d| d.join("dev.muon.packraven").join("settings.json"))
+        .unwrap_or_default();
+    let mut settings = if path.is_file() { Settings::load(&path) } else { Settings::default() };
+    settings.instance_dir = instance();
+    settings
+}
+
+#[tokio::test]
+#[ignore]
+async fn proberaven_headless_dump() {
+    let settings = live_settings();
+    let pack = Pack::open(&settings.instance_dir).expect("instance");
+    let mc = pack.lock.minecraft().expect("minecraft").to_string();
+    let loader = pack.lock.mod_loader().expect("loader");
+    let loader_label = loader.to_string_label();
+    let jar_name = crate::mcdoc::proberaven::jar_name_for(&mc, &loader)
+        .unwrap_or_else(|| panic!("no bundled ProbeRaven jar for {mc} ({loader_label})"));
+    let jar_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources/proberaven")
+        .join(&jar_name);
+    assert!(jar_path.is_file(), "missing bundled jar at {}", jar_path.display());
+
+    let java = launch::java(&settings).expect("java");
+    println!("Pack: {} | MC {mc} ({loader_label}) | Java: {}", pack.name(), java.display());
+
+    let log = Log::console("proberaven-live");
+    let mut cache = MetadataCache::load(&scratch().join("metadata-cache.json"));
+    let sides = sides::classify(&pack, &mut cache).await.unwrap();
+    cache.save(&scratch().join("metadata-cache.json")).unwrap();
+
+    let safe_name: String = pack
+        .dir
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
+        .collect();
+    let data_dir = dirs::config_dir()
+        .map(|d| d.join("dev.muon.packraven"))
+        .unwrap_or_else(|| scratch().join("data"));
+    let probe_dir = scratch().join("proberaven-live").join(&safe_name);
+    let dump_out = scratch().join("proberaven-live").join(format!("{safe_name}.dump.json"));
+    let _ = std::fs::remove_file(&dump_out);
+
+    let t_stage = std::time::Instant::now();
+    let version = pack.version().unwrap_or_else(|| "dev".into());
+    let mut plan = export::test_server_plan(&pack, &sides, &version, &java, &data_dir, &log).await.unwrap();
+    plan.insert(format!("mods/{jar_name}"), crate::mirror::Planned::Copy(jar_path));
+    let report = crate::testrun::sync_server_dir(plan, &pack, &probe_dir, false, &log).unwrap();
+    println!("Staged in {:.1}s: {report}", t_stage.elapsed().as_secs_f64());
+
+    let t_run = std::time::Instant::now();
+    let run_args = settings.combined_run_args(&settings.instance_dir);
+    let extra_jvm = run_args.server_jvm();
+    let args = export::server_args(&pack, &probe_dir, &extra_jvm, &[]).unwrap();
+    let mut command = Command::new(&java);
+    command
+        .current_dir(&probe_dir)
+        .args(args)
+        .env("PROBERAVEN_EXIT_AFTER_DUMP", "true")
+        .env("PROBERAVEN_OUTPUT", &dump_out)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().expect("spawn headless probe");
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let startup_failed = std::sync::Arc::new(tokio::sync::Notify::new());
+    let fail_signal = std::sync::Arc::clone(&startup_failed);
+    let out_task = tokio::spawn(async move {
+        let mut r = BufReader::new(stdout);
+        let mut tail = Vec::new();
+        while let Some(line) = crate::process::read_line_lossy(&mut r).await {
+            if line.contains("Failed to start the minecraft server") {
+                fail_signal.notify_one();
+            }
+            if line.contains("ProbeRaven") || line.contains("ERROR") || line.contains("Exception") || line.contains("FATAL") {
+                println!("  [out] {line}");
+            }
+            if tail.len() >= 25 {
+                tail.remove(0);
+            }
+            tail.push(line);
+        }
+        tail
+    });
+    let err_task = tokio::spawn(async move {
+        let mut r = BufReader::new(stderr);
+        let mut tail = Vec::new();
+        while let Some(line) = crate::process::read_line_lossy(&mut r).await {
+            if tail.len() >= 25 {
+                tail.remove(0);
+            }
+            tail.push(line);
+        }
+        tail
+    });
+    let status = tokio::select! {
+        res = tokio::time::timeout(Duration::from_secs(300), child.wait()) => {
+            res.expect("headless probe timed out after 300s").unwrap()
+        }
+        _ = startup_failed.notified() => {
+            match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+                Ok(res) => res.unwrap(),
+                Err(_) => {
+                    let _ = child.kill().await;
+                    child.wait().await.unwrap()
+                }
+            }
+        }
+    };
+    let out_tail = out_task.await.unwrap_or_default();
+    let err_tail = err_task.await.unwrap_or_default();
+    let run_secs = t_run.elapsed().as_secs_f64();
+    if !status.success() {
+        eprintln!("--- STDOUT TAIL ---\n{}", out_tail.join("\n"));
+        eprintln!("--- STDERR TAIL ---\n{}", err_tail.join("\n"));
+    }
+    assert!(status.success(), "headless probe exited with {status} after {run_secs:.1}s");
+
+    let raw = std::fs::read_to_string(&dump_out).expect("dump.json should exist");
+    let dump: crate::mcdoc::registries::ProbeRavenDump = serde_json::from_str(&raw).expect("valid ProbeRavenDump JSON");
+    let entries: usize = dump.registries.values().map(Vec::len).sum();
+    let tags: usize = dump.tags.values().map(Vec::len).sum();
+    println!(
+        "SUCCESS in {run_secs:.1}s: mc={} loader={} mods={} registries={} ({entries} entries) tag_regs={} ({tags} tags) blockStates={} ({:.1} KB)",
+        dump.minecraft,
+        dump.loader,
+        dump.mods.len(),
+        dump.registries.len(),
+        dump.tags.len(),
+        dump.block_states.len(),
+        raw.len() as f64 / 1024.0
+    );
+    assert!(!dump.registries.is_empty());
+    assert!(!dump.block_states.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn datapack_corpus_lint() {
+    let settings = live_settings();
+    let pack = Pack::open(&settings.instance_dir).expect("instance");
+    let probe_cache = std::sync::Arc::new(crate::probejs::ProbeCache::default());
+    let dp_cache = crate::mcdoc::DatapackCache::default();
+    let (status, index) = dp_cache
+        .ensure(settings.instance_dir.clone(), settings.install_dir.clone(), probe_cache, false)
+        .await;
+    drop(dp_cache);
+    println!("DatapackStatus: {status:?}");
+    let mut index = std::sync::Arc::try_unwrap(index.expect("datapack index available"))
+        .unwrap_or_else(|arc| panic!("unexpected refcount {}", std::sync::Arc::strong_count(&arc)));
+
+    if let Ok(dump_path) = std::env::var("PACKRAVEN_DUMP") {
+        let raw = std::fs::read_to_string(&dump_path).expect("read PACKRAVEN_DUMP");
+        let dump: crate::mcdoc::registries::ProbeRavenDump = serde_json::from_str(&raw).expect("parse PACKRAVEN_DUMP");
+        index.registries.apply_proberaven(dump);
+        index.registries.finalize();
+        println!("Applied external ProbeRaven dump from {dump_path}");
+    }
+
+    // 1. Collect all loose datapack JSON files (data/, kubejs/data/, datapacks/*/, global_packs/*/).
+    let mut pack_loose: Vec<(String, String)> = Vec::new();
+    let mut pack_zips: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<PathBuf> = vec![pack.dir.join("data"), pack.dir.join("kubejs/data")];
+    for loader in crate::global_packs::loaders(&pack.dir, Some(&pack.lock), crate::global_packs::PackKind::Data) {
+        for folder in loader.folders {
+            for entry in folder.packs {
+                let p = pack.dir.join(&entry.path);
+                if p.is_dir() {
+                    roots.push(p.join("data"));
+                } else if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
+                    pack_zips.push(p);
+                }
+            }
+        }
+    }
+    let dp_dir = pack.dir.join("datapacks");
+    if dp_dir.is_dir() {
+        for entry in std::fs::read_dir(&dp_dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                roots.push(p.join("data"));
+            } else if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
+                pack_zips.push(p);
+            }
+        }
+    }
+    pack_zips.sort();
+    pack_zips.dedup();
+
+    for root in roots {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(&root).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))
+                && let Ok(rel) = p.strip_prefix(&pack.dir)
+                && let Ok(text) = std::fs::read_to_string(p)
+            {
+                pack_loose.push((rel.to_string_lossy().replace('\\', "/"), text));
+            }
+        }
+    }
+
+    // 2. Collect all JSON files inside zipped preinstalled datapacks (in-memory, zero temp files on disk).
+    let mut pack_zip_files: Vec<(String, String)> = Vec::new();
+    for zp in &pack_zips {
+        let rel_zip = zp.strip_prefix(&pack.dir).unwrap_or(zp).to_string_lossy().replace('\\', "/");
+        let Ok(file) = std::fs::File::open(zp) else { continue };
+        let Ok(mut zip) = zip::ZipArchive::new(file) else { continue };
+        for i in 0..zip.len() {
+            let Ok(mut zf) = zip.by_index(i) else { continue };
+            let Ok(name) = zf.name().map(|n| n.into_owned()) else { continue };
+            let is_mcmeta = name.eq_ignore_ascii_case("pack.mcmeta");
+            if !is_mcmeta && (!name.starts_with("data/") || !name.ends_with(".json")) {
+                continue;
+            }
+            let mut text = String::new();
+            if std::io::Read::read_to_string(&mut zf, &mut text).is_ok() {
+                pack_zip_files.push((format!("{rel_zip}!{name}"), text));
+            }
+        }
+    }
+
+    // 3. Collect all bundled `data/**/*.json` across every jar in `mods/*.jar` (in-memory).
+    let mod_jars: Vec<PathBuf> = std::fs::read_dir(pack.dir.join("mods"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("jar")))
+        .collect();
+
+    let index_ref = &index;
+    let mut sample = CorpusSample::default();
+
+    let mut loose = LintTally::default();
+    for (rel, text) in &pack_loose {
+        loose.lint(index_ref, rel, rel, text);
+        sample.offer(index_ref, rel, rel, text);
+    }
+    loose.report("pack-loose", pack_loose.len(), &index_ref.registries.mod_ids);
+
+    let mut zipped = LintTally::default();
+    for (rel, text) in &pack_zip_files {
+        let lint_path = rel.split_once('!').map(|(_, inner)| inner).unwrap_or(rel.as_str());
+        zipped.lint(index_ref, rel, lint_path, text);
+        sample.offer(index_ref, rel, lint_path, text);
+    }
+    zipped.report(&format!("pack-zips ({} archives)", pack_zips.len()), pack_zip_files.len(), &index_ref.registries.mod_ids);
+
+    // Lint mod jars in parallel across CPU threads (streaming per jar to keep RAM modest).
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8).min(mod_jars.len().max(1));
+    let chunk_size = mod_jars.len().div_ceil(threads).max(1);
+    let partials: Vec<(usize, LintTally, CorpusSample)> = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in mod_jars.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                let mut checked = 0usize;
+                let mut tally = LintTally::default();
+                let mut local_sample = CorpusSample::default();
+                for jp in chunk {
+                    let jar_name = jp.file_name().unwrap_or_default().to_string_lossy();
+                    let Ok(file) = std::fs::File::open(jp) else { continue };
+                    let Ok(mut zip) = zip::ZipArchive::new(file) else { continue };
+                    for i in 0..zip.len() {
+                        let Ok(mut zf) = zip.by_index(i) else { continue };
+                        let Ok(name) = zf.name().map(|n| n.into_owned()) else { continue };
+                        if !name.starts_with("data/") || !name.ends_with(".json") {
+                            continue;
+                        }
+                        let mut text = String::new();
+                        if std::io::Read::read_to_string(&mut zf, &mut text).is_err() {
+                            continue;
+                        }
+                        checked += 1;
+                        let rel = format!("{jar_name}!{name}");
+                        tally.lint(index_ref, &rel, &name, &text);
+                        local_sample.offer(index_ref, &rel, &name, &text);
+                    }
+                }
+                (checked, tally, local_sample)
+            }));
+        }
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let mut jar_tally = LintTally::default();
+    let mut jar_files = 0usize;
+    for (checked, tally, part) in partials {
+        jar_files += checked;
+        jar_tally.merge(tally);
+        sample.merge(part);
+    }
+    jar_tally.report(&format!("mod-jars ({} jars)", mod_jars.len()), jar_files, &index_ref.registries.mod_ids);
+
+    sample.sweep(index_ref);
+}
+
+/// Errors and warnings from linting one source of files, grouped by message.
+#[derive(Default)]
+struct LintTally {
+    schema_files: usize,
+    files_with_errors: usize,
+    errors: usize,
+    warnings: usize,
+    timings_us: Vec<u128>,
+    error_messages: std::collections::BTreeMap<String, (usize, String)>,
+    warning_messages: std::collections::BTreeMap<String, (usize, String)>,
+    /// Unknown-ID warnings keyed by `<registry> <namespace>`, to tell registry gaps from references to absent mods.
+    unknown_ids: std::collections::BTreeMap<String, (usize, String)>,
+}
+
+impl LintTally {
+    fn lint(&mut self, index: &crate::mcdoc::DatapackIndex, rel: &str, lint_path: &str, text: &str) {
+        if let Some(cat) = index.resolve_category(lint_path)
+            && crate::mcdoc::checker::resource_root_type(&cat, &index.tables).is_some()
+        {
+            self.schema_files += 1;
+        }
+        let t0 = std::time::Instant::now();
+        let diags = index.lint(lint_path, text);
+        self.timings_us.push(t0.elapsed().as_micros());
+        let mut had_err = false;
+        for d in diags {
+            let (count, messages) = match d.severity {
+                "error" => {
+                    had_err = true;
+                    (&mut self.errors, &mut self.error_messages)
+                }
+                "warning" => (&mut self.warnings, &mut self.warning_messages),
+                _ => continue,
+            };
+            *count += 1;
+            messages.entry(message_shape(&d.message)).or_insert_with(|| (0, format!("{rel}: {}", d.message))).0 += 1;
+            if let Some(rest) = d.message.strip_prefix("Unknown ")
+                && let Some((registry, quoted)) = rest.split_once(" \"")
+                && registry != "key"
+            {
+                let id = quoted.split('"').next().unwrap_or_default().trim_start_matches('#');
+                let namespace = id.split_once(':').map_or("minecraft", |(ns, _)| ns);
+                self.unknown_ids.entry(format!("{registry} {namespace}")).or_insert_with(|| (0, format!("{rel}: {id}"))).0 += 1;
+            }
+        }
+        if had_err {
+            self.files_with_errors += 1;
+        }
+    }
+
+    fn merge(&mut self, other: LintTally) {
+        self.schema_files += other.schema_files;
+        self.files_with_errors += other.files_with_errors;
+        self.errors += other.errors;
+        self.warnings += other.warnings;
+        self.timings_us.extend(other.timings_us);
+        for (mine, theirs) in [
+            (&mut self.error_messages, other.error_messages),
+            (&mut self.warning_messages, other.warning_messages),
+            (&mut self.unknown_ids, other.unknown_ids),
+        ] {
+            for (shape, (count, sample)) in theirs {
+                mine.entry(shape).or_insert((0, sample)).0 += count;
+            }
+        }
+    }
+
+    fn report(mut self, label: &str, files: usize, mod_ids: &std::collections::HashSet<String>) {
+        self.timings_us.sort_unstable();
+        let at = |q: usize| self.timings_us.get(self.timings_us.len() * q / 100).copied().unwrap_or(0);
+        let max = self.timings_us.last().copied().unwrap_or(0);
+        println!(
+            "[{label}] Checked {files} files ({} schema-backed): {} errors in {} files, {} warnings | p50={}us p95={}us max={max}us",
+            self.schema_files,
+            self.errors,
+            self.files_with_errors,
+            self.warnings,
+            at(50),
+            at(95)
+        );
+        for (kind, messages) in [("error", self.error_messages), ("warning", self.warning_messages)] {
+            let mut top: Vec<(usize, String)> = messages.into_values().collect();
+            top.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+            for (count, sample) in top.into_iter().take(15) {
+                println!("  {kind} [{count}x] {sample}");
+            }
+        }
+        let mut unknown: Vec<(usize, String, String)> = self.unknown_ids.into_iter().map(|(k, (c, sample))| (c, k, sample)).collect();
+        unknown.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        for (count, key, sample) in unknown.into_iter().take(15) {
+            let namespace = key.rsplit(' ').next().unwrap_or_default();
+            let installed = if mod_ids.contains(namespace) { "INSTALLED" } else { "absent" };
+            println!("  unknown id [{count}x] {key} ({installed}), e.g. {sample}");
+        }
+    }
+}
+
+/// Groups messages that differ only in the quoted ID, so one unknown registry shows up once.
+fn message_shape(message: &str) -> String {
+    let mut shape = String::with_capacity(message.len());
+    let mut in_quote = false;
+    for ch in message.chars() {
+        if ch == '"' {
+            in_quote = !in_quote;
+            shape.push_str(if in_quote { "\"…" } else { "\"" });
+        } else if !in_quote {
+            shape.push(ch);
+        }
+    }
+    shape
+}
+
+// Each completion re-checks the whole file, so we cap the work per file and skip huge ones.
+const SWEEP_FILES_PER_CATEGORY: usize = 12;
+const SWEEP_MAX_FILE_BYTES: usize = 64 * 1024;
+const SWEEP_STRINGS_PER_FILE: usize = 40;
+
+/// A few schema-backed files per category, for the completion and hover sweep.
+#[derive(Default)]
+struct CorpusSample {
+    files: std::collections::BTreeMap<String, Vec<(String, String, String)>>,
+}
+
+impl CorpusSample {
+    fn offer(&mut self, index: &crate::mcdoc::DatapackIndex, rel: &str, lint_path: &str, text: &str) {
+        if text.len() > SWEEP_MAX_FILE_BYTES {
+            return;
+        }
+        let Some(cat) = index.resolve_category(lint_path) else { return };
+        if crate::mcdoc::checker::resource_root_type(&cat, &index.tables).is_none() {
+            return;
+        }
+        let bucket = self.files.entry(cat).or_default();
+        if bucket.len() < SWEEP_FILES_PER_CATEGORY {
+            bucket.push((rel.to_string(), lint_path.to_string(), text.to_string()));
+        }
+    }
+
+    fn merge(&mut self, other: CorpusSample) {
+        for (cat, files) in other.files {
+            let bucket = self.files.entry(cat).or_default();
+            let room = SWEEP_FILES_PER_CATEGORY.saturating_sub(bucket.len());
+            bucket.extend(files.into_iter().take(room));
+        }
+    }
+
+    /// Completes at the end of every clean key and string value and hovers every key. A key or
+    /// value that lints clean should come back as one of its own completions; anything else is a miss.
+    fn sweep(&self, index: &crate::mcdoc::DatapackIndex) {
+        use crate::mcdoc::completer::byte_to_utf16;
+        let (mut files, mut keys, mut values, mut hovers, mut panics) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut timings_us: Vec<u128> = Vec::new();
+        let mut misses: std::collections::BTreeMap<String, (usize, String)> = std::collections::BTreeMap::new();
+        for (cat, bucket) in &self.files {
+            for (rel, path, text) in bucket {
+                let Some(root) = crate::mcdoc::json_parser::parse(text, false).root else { continue };
+                files += 1;
+                let flagged: Vec<(usize, usize)> = index.lint(path, text).into_iter().map(|d| (d.from, d.to)).collect();
+                let clean = |start: usize, end: usize| {
+                    let (s, e) = (byte_to_utf16(text, start), byte_to_utf16(text, end));
+                    !flagged.iter().any(|&(f, t)| f < e && t > s)
+                };
+                let mut strings = Vec::new();
+                collect_strings(&root, &mut strings);
+                let stride = strings.len().div_ceil(SWEEP_STRINGS_PER_FILE).max(1);
+                for (span, content_start, is_key) in strings.into_iter().step_by(stride) {
+                    let content = &text[content_start..span.end - 1];
+                    if content.contains('\\') || !clean(span.start, span.end) {
+                        continue;
+                    }
+                    let offset = byte_to_utf16(text, span.end - 1);
+                    let t0 = std::time::Instant::now();
+                    let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| index.complete(path, text, offset)));
+                    timings_us.push(t0.elapsed().as_micros());
+                    let Ok(result) = completed else {
+                        panics += 1;
+                        misses.entry(format!("PANIC completing in {cat}")).or_insert((0, format!("{rel} @ {offset}"))).0 += 1;
+                        continue;
+                    };
+                    if is_key {
+                        keys += 1;
+                        let hovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| index.hover(path, text, offset)));
+                        hovers += 1;
+                        if hovered.is_err() {
+                            panics += 1;
+                            misses.entry(format!("PANIC hovering in {cat}")).or_insert((0, format!("{rel} @ {offset}"))).0 += 1;
+                        }
+                    } else {
+                        values += 1;
+                    }
+                    // Only judge slots where we offered something: free-form strings have no completions.
+                    if result.items.is_empty() || result.items.iter().any(|i| i.label == content) {
+                        continue;
+                    }
+                    let kind = if is_key { "key" } else { "value" };
+                    let detail = result.items[0].detail.clone().unwrap_or_default();
+                    misses
+                        .entry(format!("{cat} {kind} ({detail})"))
+                        .or_insert((0, format!("{rel}: \"{content}\" not among {} items, first {:?}", result.items.len(), result.items[0].label)))
+                        .0 += 1;
+                }
+            }
+        }
+        timings_us.sort_unstable();
+        let at = |q: usize| timings_us.get(timings_us.len() * q / 100).copied().unwrap_or(0);
+        println!(
+            "[completion sweep] {files} files in {} categories: {keys} keys, {values} values, {hovers} hovers, {panics} panics | p50={}us p95={}us max={}us",
+            self.files.len(),
+            at(50),
+            at(95),
+            timings_us.last().copied().unwrap_or(0)
+        );
+        let mut top: Vec<(usize, String, String)> = misses.into_iter().map(|(k, (c, s))| (c, k, s)).collect();
+        top.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+        for (count, shape, sample) in top.into_iter().take(25) {
+            println!("  miss [{count}x] {shape}\n      e.g. {sample}");
+        }
+    }
+}
+
+fn collect_strings(node: &crate::mcdoc::json_parser::JsonNode, out: &mut Vec<(crate::mcdoc::json_parser::Span, usize, bool)>) {
+    use crate::mcdoc::json_parser::JsonKind;
+    match &node.kind {
+        JsonKind::Object(pairs) => {
+            for pair in pairs {
+                if pair.key.closed {
+                    out.push((pair.key.span, pair.key.map.content_start, true));
+                }
+                if let Some(value) = &pair.value {
+                    collect_strings(value, out);
+                }
+            }
+        }
+        JsonKind::Array(items) => items.iter().for_each(|item| collect_strings(item, out)),
+        JsonKind::String(s) if s.closed => out.push((s.span, s.map.content_start, false)),
+        _ => {}
+    }
+}
+
+/// Lints the files named in `PACKRAVEN_LINT_FILES` (`;`-separated, each `mods/<jar>!data/...` or a
+/// path inside the instance) and prints every diagnostic with the line it points at.
+#[tokio::test]
+#[ignore]
+async fn datapack_lint_files() {
+    let settings = live_settings();
+    let (_, index) = crate::mcdoc::DatapackCache::default()
+        .ensure(settings.instance_dir.clone(), settings.install_dir.clone(), std::sync::Arc::new(crate::probejs::ProbeCache::default()), false)
+        .await;
+    let index = index.expect("datapack index available");
+    for spec in std::env::var("PACKRAVEN_LINT_FILES").expect("set PACKRAVEN_LINT_FILES").split(';').filter(|s| !s.is_empty()) {
+        let (lint_path, text) = match spec.split_once('!') {
+            Some((archive, entry)) => {
+                let mut zip = zip::ZipArchive::new(std::fs::File::open(settings.instance_dir.join(archive)).expect("archive")).expect("zip");
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut zip.by_name(entry).expect("entry"), &mut text).expect("read entry");
+                (entry.to_string(), text)
+            }
+            None => (spec.to_string(), std::fs::read_to_string(settings.instance_dir.join(spec)).expect("file")),
+        };
+        println!("===== {spec} (category {:?})", index.resolve_category(&lint_path));
+        for d in index.lint(&lint_path, &text) {
+            let start = text.char_indices().nth(d.from).map_or(text.len(), |(i, _)| i);
+            let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+            println!("  {} {}\n      {}", d.severity, d.message, text[line_start..line_end].trim());
+        }
+    }
+}
+
+trait LoaderLabel {
+    fn to_string_label(&self) -> String;
+}
+
+impl LoaderLabel for crate::pack::ModLoader<'_> {
+    fn to_string_label(&self) -> String {
+        format!("{} {}", self.name(), self.version())
+    }
+}

@@ -27,6 +27,8 @@
   import { canFormat, isGzip, outerArchive, packTarget, viewerFor } from '../lib/viewers'
   import { isKubejsScript } from '../lib/kubejs'
   import { probejs, refreshProbejs } from '../lib/probejs.svelte'
+  import { datapack, isDatapackJson, refreshDatapack } from '../lib/datapack.svelte'
+  import { job, onJobEnd } from '../lib/jobs.svelte'
   import type { FormatOutcome } from '../lib/format'
   import ContextMenu from '../components/ContextMenu.svelte'
   import type { MenuItem } from '../lib/menu'
@@ -874,6 +876,78 @@
     }
   }
 
+  function datapackSourceLabel(source: typeof datapack.codeSource) {
+    switch (source) {
+      case 'probeRaven':
+        return 'ProbeRaven dump'
+      case 'probeJs':
+        return 'ProbeJS dump'
+      default:
+        return 'vanilla + mod jars'
+    }
+  }
+
+  let datapackControl = $derived.by(() => {
+    switch (datapack.status) {
+      case 'idle':
+      case 'loading':
+        return { label: 'Loading schemas…', tone: 'muted', title: 'Loading datapack schemas and pack registries.' }
+      case 'ready':
+        return {
+          label: 'Schemas',
+          tone: '',
+          title: `Datapack validation active (${datapack.symbolCount.toLocaleString()} types, ${datapack.registryEntries.toLocaleString()} IDs from ${datapackSourceLabel(datapack.codeSource)}, loaded in ${formatProbejsTime(datapack.loadMs)}). Click to reload.`,
+        }
+      case 'unavailable':
+        return { label: 'No schemas', tone: 'muted', title: 'Datapack schemas are not loaded yet. Click to fetch.' }
+      case 'error':
+        return { label: 'Schema error', tone: 'problems warn', title: `Couldn't load datapack schemas: ${datapack.error}. Click to retry.` }
+    }
+  })
+
+  let probingRegistries = $derived(job('datapack-probe').phase === 'running')
+
+  onJobEnd('datapack-probe', async (phase) => {
+    const path = current?.path
+    if (phase === 'done') {
+      const ok = await refreshDatapack()
+      if (path && current?.path === path) {
+        if (ok && view) checkNow()
+        const msg = job('datapack-probe').message ?? `Updated modded registries (${datapackSourceLabel(datapack.codeSource)}).`
+        showToolbarNote(path, msg, { warn: false, lingers: false })
+      }
+    } else if (phase === 'failed' && path) {
+      const msg = job('datapack-probe').message ?? "Couldn't dump pack registries."
+      showToolbarNote(path, msg, { warn: true, lingers: true })
+    }
+  })
+
+  async function runDatapackProbe() {
+    const path = current?.path
+    if (!path || probingRegistries) return
+    try {
+      await api.datapackProbe()
+      showToolbarNote(path, 'Dumping pack registries in the background…', { warn: false, lingers: false })
+    } catch (e) {
+      showToolbarNote(path, errorText(e), { warn: true, lingers: true })
+    }
+  }
+
+  async function reloadDatapack() {
+    const path = current?.path
+    if (!path || datapack.status === 'loading') return
+    const ok = await refreshDatapack()
+    if (current?.path !== path) return
+    if (ok) {
+      if (view) checkNow()
+      showToolbarNote(path, `Reloaded datapack schemas (${datapackSourceLabel(datapack.codeSource)}).`, { warn: false, lingers: false })
+    } else if (datapack.error) {
+      showToolbarNote(path, `Couldn't load datapack schemas: ${datapack.error}`, { warn: true, lingers: true })
+    } else {
+      showToolbarNote(path, 'Datapack schemas are unavailable offline until cached.', { warn: false, lingers: true })
+    }
+  }
+
   let problems = $derived.by(() => {
     if (!current?.state) return null
     const { errors, warnings } = current.problems
@@ -994,6 +1068,26 @@
               title={probejsControl.title}
               onclick={reloadProbejs}
             >{probejsControl.label}</button>
+          {/if}
+          {#if current.state && !current.large && !readOnly && isDatapackJson(current.path)}
+            <button
+              class="ghost action {datapackControl.tone}"
+              aria-busy={datapack.status === 'loading'}
+              aria-disabled={datapack.status === 'loading'}
+              title={datapackControl.title}
+              onclick={reloadDatapack}
+            >{datapackControl.label}</button>
+            {#if datapack.probeAvailable}
+              <button
+                class="ghost action"
+                aria-busy={probingRegistries}
+                aria-disabled={probingRegistries}
+                title={probingRegistries
+                  ? 'Running a headless server to dump all modded registries, tags, and block states.'
+                  : 'Launch a quick headless server once to extract all modded items, blocks, tags, and block states for this pack.'}
+                onclick={runDatapackProbe}
+              >{probingRegistries ? 'Dumping…' : 'Dump registries'}</button>
+            {/if}
           {/if}
           {#if current.state && current.large}
             <span class="muted small" title="Checking and folding are off for this large file, so typing stays responsive.">Simplified editor</span>

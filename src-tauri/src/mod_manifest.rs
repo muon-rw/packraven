@@ -65,6 +65,21 @@ fn read_into<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, depth: usize, man
     Ok(())
 }
 
+/// Returns the mod IDs an open jar declares itself, without following nested jars.
+pub fn declared_ids<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Vec<String> {
+    let mut ids = Vec::new();
+    if let Some(fabric) = text_of(archive, "fabric.mod.json").and_then(|text| serde_json::from_str::<FabricMod>(&text).ok()) {
+        ids.push(fabric.id);
+        ids.extend(fabric.provides);
+    }
+    for name in ["META-INF/neoforge.mods.toml", "META-INF/mods.toml"] {
+        if let Some(text) = text_of(archive, name) {
+            read_forge(&text, &mut ids, &mut Vec::new());
+        }
+    }
+    ids
+}
+
 fn text_of<R: Read + Seek>(archive: &mut zip::ZipArchive<R>, name: &str) -> Option<String> {
     let mut text = String::new();
     archive.by_name(name).ok()?.read_to_string(&mut text).ok()?;

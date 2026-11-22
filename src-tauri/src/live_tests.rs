@@ -550,6 +550,7 @@ async fn proberaven_headless_dump() {
     let mut plan = export::test_server_plan(&pack, &sides, &version, &java, &data_dir, &log).await.unwrap();
     plan.insert(format!("mods/{jar_name}"), crate::mirror::Planned::Copy(jar_path));
     let report = crate::testrun::sync_server_dir(plan, &pack, &probe_dir, false, &log).unwrap();
+    crate::mcdoc::proberaven::clear_last_dump_world(&probe_dir).unwrap();
     println!("Staged in {:.1}s: {report}", t_stage.elapsed().as_secs_f64());
 
     let t_run = std::time::Instant::now();
@@ -671,7 +672,7 @@ async fn datapack_corpus_lint() {
             for entry in folder.packs {
                 let p = pack.dir.join(&entry.path);
                 if p.is_dir() {
-                    roots.push(p.join("data"));
+                    roots.push(p);
                 } else if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
                     pack_zips.push(p);
                 }
@@ -683,7 +684,7 @@ async fn datapack_corpus_lint() {
         for entry in std::fs::read_dir(&dp_dir).into_iter().flatten().flatten() {
             let p = entry.path();
             if p.is_dir() {
-                roots.push(p.join("data"));
+                roots.push(p);
             } else if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
                 pack_zips.push(p);
             }
@@ -692,6 +693,8 @@ async fn datapack_corpus_lint() {
     pack_zips.sort();
     pack_zips.dedup();
 
+    let instance_files = crate::mcdoc::overlays::InstanceFiles(&pack.dir);
+    let mut overlay_skips = 0usize;
     for root in roots {
         if !root.is_dir() {
             continue;
@@ -701,11 +704,17 @@ async fn datapack_corpus_lint() {
                 continue;
             }
             let p = entry.path();
-            if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))
-                && let Ok(rel) = p.strip_prefix(&pack.dir)
-                && let Ok(text) = std::fs::read_to_string(p)
-            {
-                pack_loose.push((rel.to_string_lossy().replace('\\', "/"), text));
+            let Ok(rel) = p.strip_prefix(&pack.dir) else { continue };
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json")) || !rel.contains("data/") {
+                continue;
+            }
+            if !matches!(index.file_load(&rel, &instance_files), crate::mcdoc::overlays::FileLoad::Loaded) {
+                overlay_skips += 1;
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(p) {
+                pack_loose.push((rel, text));
             }
         }
     }
@@ -716,17 +725,18 @@ async fn datapack_corpus_lint() {
         let rel_zip = zp.strip_prefix(&pack.dir).unwrap_or(zp).to_string_lossy().replace('\\', "/");
         let Ok(file) = std::fs::File::open(zp) else { continue };
         let Ok(mut zip) = zip::ZipArchive::new(file) else { continue };
-        for i in 0..zip.len() {
-            let Ok(mut zf) = zip.by_index(i) else { continue };
-            let Ok(name) = zf.name().map(|n| n.into_owned()) else { continue };
-            let is_mcmeta = name.eq_ignore_ascii_case("pack.mcmeta");
-            if !is_mcmeta && (!name.starts_with("data/") || !name.ends_with(".json")) {
+        let files = ArchiveFiles::open(&mut zip);
+        for name in files.data_json() {
+            if !matches!(index.file_load(&name, &files), crate::mcdoc::overlays::FileLoad::Loaded) {
+                overlay_skips += 1;
                 continue;
             }
-            let mut text = String::new();
-            if std::io::Read::read_to_string(&mut zf, &mut text).is_ok() {
+            if let Some(text) = files.text(&mut zip, &name) {
                 pack_zip_files.push((format!("{rel_zip}!{name}"), text));
             }
+        }
+        if let Some(meta) = files.mcmeta.clone() {
+            pack_zip_files.push((format!("{rel_zip}!pack.mcmeta"), meta));
         }
     }
 
@@ -760,48 +770,92 @@ async fn datapack_corpus_lint() {
     // Lint mod jars in parallel across CPU threads (streaming per jar to keep RAM modest).
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8).min(mod_jars.len().max(1));
     let chunk_size = mod_jars.len().div_ceil(threads).max(1);
-    let partials: Vec<(usize, LintTally, CorpusSample)> = std::thread::scope(|scope| {
+    let partials: Vec<(usize, usize, LintTally, CorpusSample)> = std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in mod_jars.chunks(chunk_size) {
             handles.push(scope.spawn(move || {
                 let mut checked = 0usize;
+                let mut skipped = 0usize;
                 let mut tally = LintTally::default();
                 let mut local_sample = CorpusSample::default();
                 for jp in chunk {
                     let jar_name = jp.file_name().unwrap_or_default().to_string_lossy();
                     let Ok(file) = std::fs::File::open(jp) else { continue };
                     let Ok(mut zip) = zip::ZipArchive::new(file) else { continue };
-                    for i in 0..zip.len() {
-                        let Ok(mut zf) = zip.by_index(i) else { continue };
-                        let Ok(name) = zf.name().map(|n| n.into_owned()) else { continue };
-                        if !name.starts_with("data/") || !name.ends_with(".json") {
+                    let files = ArchiveFiles::open(&mut zip);
+                    for name in files.data_json() {
+                        if !matches!(index_ref.file_load(&name, &files), crate::mcdoc::overlays::FileLoad::Loaded) {
+                            skipped += 1;
                             continue;
                         }
-                        let mut text = String::new();
-                        if std::io::Read::read_to_string(&mut zf, &mut text).is_err() {
-                            continue;
-                        }
+                        let Some(text) = files.text(&mut zip, &name) else { continue };
                         checked += 1;
                         let rel = format!("{jar_name}!{name}");
                         tally.lint(index_ref, &rel, &name, &text);
                         local_sample.offer(index_ref, &rel, &name, &text);
                     }
                 }
-                (checked, tally, local_sample)
+                (checked, skipped, tally, local_sample)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut jar_tally = LintTally::default();
     let mut jar_files = 0usize;
-    for (checked, tally, part) in partials {
+    for (checked, skipped, tally, part) in partials {
         jar_files += checked;
+        overlay_skips += skipped;
         jar_tally.merge(tally);
         sample.merge(part);
     }
     jar_tally.report(&format!("mod-jars ({} jars)", mod_jars.len()), jar_files, &index_ref.registries.mod_ids);
 
+    println!("[overlays] skipped {overlay_skips} files that an overlay replaces or that sit in an overlay this version doesn't apply");
     sample.sweep(index_ref);
+}
+
+/// The entry names and `pack.mcmeta` of one zipped pack, so we can tell which copy of a file loads.
+struct ArchiveFiles {
+    names: std::collections::HashSet<String>,
+    mcmeta: Option<String>,
+}
+
+impl ArchiveFiles {
+    fn open<R: std::io::Read + std::io::Seek>(zip: &mut zip::ZipArchive<R>) -> Self {
+        let names = zip.file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).collect();
+        let mcmeta = zip.by_name("pack.mcmeta").ok().and_then(|mut f| {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut f, &mut text).ok().map(|_| text)
+        });
+        Self { names, mcmeta }
+    }
+
+    /// JSON files under `data/`, or under `<overlay>/data/`.
+    fn data_json(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .names
+            .iter()
+            .filter(|n| n.ends_with(".json") && (n.starts_with("data/") || n.split_once('/').is_some_and(|(_, rest)| rest.starts_with("data/"))))
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn text<R: std::io::Read + std::io::Seek>(&self, zip: &mut zip::ZipArchive<R>, name: &str) -> Option<String> {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut zip.by_name(name).ok()?, &mut text).ok().map(|_| text)
+    }
+}
+
+impl crate::mcdoc::overlays::PackFiles for ArchiveFiles {
+    fn read(&self, relative: &str) -> Option<String> {
+        (relative == "pack.mcmeta").then(|| self.mcmeta.clone()).flatten()
+    }
+
+    fn exists(&self, relative: &str) -> bool {
+        self.names.contains(relative)
+    }
 }
 
 /// Errors and warnings from linting one source of files, grouped by message.

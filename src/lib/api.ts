@@ -720,6 +720,7 @@ export interface ProbejsCompletionItem {
   docs?: string | null
   insertText?: string | null
   cursorOffset?: number | null
+  selectLen?: number
   consumeClosingQuote?: boolean
   retrigger?: boolean
 }
@@ -901,6 +902,7 @@ export const api = {
   datapackComplete: (path: string, text: string, offset: number) => invoke<DatapackCompletionResult>('datapack_complete', { path, text, offset }),
   datapackHover: (path: string, text: string, offset: number) => invoke<ProbejsHover | null>('datapack_hover', { path, text, offset }),
   datapackProbe: () => invoke<void>('datapack_probe'),
+  datapackProbeStop: () => invoke<void>('datapack_probe_stop'),
   indexFiles: () => invoke<{ paths: string[]; truncated: boolean }>('index_files'),
   searchText: (query: TextQuery) => invoke<TextResults | null>('search_text', { query }),
   replaceText: (query: TextQuery, targets: { path: string; matches: [number, number][] }[]) => invoke<Replaced>('replace_text', { query, targets }),

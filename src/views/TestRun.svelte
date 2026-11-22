@@ -467,7 +467,7 @@
       </div>
     </div>
 
-    <Splitter value={serverWidth} min={logMin} max={splitTotal - logMin} total={splitTotal} label="Resize the server and client logs" controls="server-pane" onresize={(px) => logSplit.set(px / splitTotal)} onreset={() => logSplit.reset()} />
+    <Splitter value={serverWidth} min={logMin} max={splitTotal - logMin} label="Resize the server and client logs" controls="server-pane" onresize={(px) => logSplit.set(px / splitTotal)} onreset={() => logSplit.reset()} />
 
     <div class="pane">
       <div class="pane-head">

@@ -113,6 +113,9 @@ pub struct CheckEnv<'a> {
     /// 1.20.1 reads most data files with Gson helpers that turn any JSON number or boolean into a
     /// string where one is expected. Codecs (tags, world data, and everything from 1.20.5) don't.
     pub primitives_read_as_strings: bool,
+    /// Loaders whose keys the pack's loader skips, like `neoforge:conditions` in a Fabric pack. We
+    /// accept those keys without checking their values.
+    pub ignored_loaders: &'a [&'a str],
 }
 
 pub fn check_json_with_type(root: &JsonNode, root_type: &McdocType, env: &CheckEnv<'_>) -> CheckOutput {
@@ -379,6 +382,8 @@ enum RuntimeErrorKind {
     InvalidStringLength { ranges: Vec<NumericRange> },
     NumberOutOfRange { ranges: Vec<AnyRange> },
     Internal,
+    IntegerReadAs { read_as: i64 },
+    StateNeverMatches,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -559,11 +564,15 @@ impl<'a> Engine<'a> {
         let mut inferred = infer_json_type(node);
 
         let expected_kind = value_kind_of(type_def);
+        let mut lossy_integer = None;
         if value_kind_of(&inferred) != expected_kind {
             if let Some(converted) = self.read_primitive_as_string(node, expected_kind) {
                 inferred = converted;
             } else if let Some(converted) = try_convert_json(node, expected_kind) {
                 inferred = converted;
+            } else if let Some((converted, read_as)) = java_integer_conversion(node, expected_kind) {
+                inferred = converted;
+                lossy_integer = Some(read_as);
             } else {
                 return (
                     vec![RuntimeError {
@@ -577,6 +586,9 @@ impl<'a> Engine<'a> {
         }
 
         let mut errors = Vec::new();
+        if let Some(read_as) = lossy_integer {
+            errors.push(RuntimeError { node: node_id, kind: RuntimeErrorKind::IntegerReadAs { read_as }, conflicting_nodes: None });
+        }
         if !check_inferred_attributes(type_def.attributes(), &mut inferred) {
             errors.push(RuntimeError { node: node_id, kind: RuntimeErrorKind::Internal, conflicting_nodes: None });
         }
@@ -603,7 +615,9 @@ impl<'a> Engine<'a> {
                     }
                     _ => false,
                 };
-                if !matched {
+                if !matched && has_attr(attributes, STATE_PREDICATE_ATTR) && matches!(&inferred, McdocType::Literal { value: LiteralValue::String { .. }, .. }) {
+                    errors.push(RuntimeError { node: node_id, kind: RuntimeErrorKind::StateNeverMatches, conflicting_nodes: None });
+                } else if !matched {
                     return (
                         vec![RuntimeError {
                             node: node_id,
@@ -861,6 +875,15 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// Dispatcher names (`minecraft:feature_config`) don't name the registry their keys come from
+    /// (`worldgen/feature`), so we look in every registry. Our vanilla lists match the pack's version,
+    /// so a vanilla-namespace ID only shows up there when a mod registers it. Vanilla-mcdoc keys its
+    /// dispatchers without the `minecraft:` namespace.
+    fn registered_at_runtime(&self, key: &str) -> bool {
+        let id = super::registries::lengthen_id(key);
+        self.env.registries.entries.iter().any(|(category, ids)| !category.starts_with("tag/") && ids.binary_search(&id).is_ok())
+    }
+
     /// Vanilla-mcdoc lists only vanilla values for some sets that mods extend. An enum marked with a
     /// bare `#[id]` (dimension effects, loot context types, multiface blocks) is really a resource
     /// location, and mods register more, sometimes even in the `minecraft` namespace. NeoForge's enum
@@ -1034,14 +1057,15 @@ impl<'a> Engine<'a> {
             McdocType::Dispatcher { registry, parallel_indices, .. } => {
                 // Vanilla-mcdoc names these `mcdoc:*`. We answer them from the pack's block states.
                 match registry.as_str() {
-                    "minecraft:block_states" | "mcdoc:block_states" => return self.simplify_block_states(parallel_indices, node, is_member),
+                    "minecraft:block_states" | "mcdoc:block_states" => return self.simplify_block_states(parallel_indices, node, is_member, false),
+                    STATE_PREDICATE_DISPATCHER => return self.simplify_block_states(parallel_indices, node, is_member, true),
                     "mcdoc:block_state_keys" => return self.simplify_block_state_keys(parallel_indices, node, is_member),
                     _ => {}
                 }
                 let Some(entries) = self.env.tables.dispatchers.get(registry) else {
                     return McdocType::Any { attributes: Vec::new() };
                 };
-                self.resolve_indices(parallel_indices, entries, node, is_member, type_args, type_mapping, depth + 1)
+                self.resolve_indices(true, parallel_indices, entries, node, is_member, type_args, type_mapping, depth + 1)
             }
             McdocType::Indexed { parallel_indices, child, .. } => {
                 let simplified_child = self.simplify(child, node, is_member, &[], type_mapping, depth + 1);
@@ -1062,7 +1086,7 @@ impl<'a> Engine<'a> {
                         }
                     }
                 }
-                self.resolve_indices(parallel_indices, &map, node, is_member, type_args, type_mapping, depth + 1)
+                self.resolve_indices(false, parallel_indices, &map, node, is_member, type_args, type_mapping, depth + 1)
             }
             McdocType::Union { members, attributes } => {
                 let mut kept: Vec<&McdocType> = members.iter().filter(|m| self.env.version.keeps(m.attributes())).collect();
@@ -1097,6 +1121,7 @@ impl<'a> Engine<'a> {
                             }
                             let is_dep = *deprecated || self.env.version.is_deprecated(fattrs);
                             let mapped_val = match type_mapping {
+                                _ if loader_ignored(fattrs, self.env.ignored_loaders) => McdocType::Any { attributes: Vec::new() },
                                 Some(m) if !m.is_empty() => McdocType::Mapped {
                                     child: Box::new(field_type.clone()),
                                     mapping: m.clone(),
@@ -1268,8 +1293,10 @@ impl<'a> Engine<'a> {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_indices(
         &self,
+        dispatches_registry_ids: bool,
         parallel_indices: &[Index],
         entries: &HashMap<String, McdocType>,
         node: JsonId,
@@ -1310,6 +1337,11 @@ impl<'a> Engine<'a> {
             let mut resolved_targets = Vec::new();
             for key in &lookups {
                 if let Some(target) = entries.get(key) {
+                    if dispatches_registry_ids && !self.env.version.keeps(target.attributes()) && self.registered_at_runtime(key) {
+                        // A mod backports this vanilla type (like `minecraft:fallen_tree` on 1.21.1), and
+                        // the newer schema may not match the backport, so we treat it as an unknown type.
+                        return McdocType::Any { attributes: vec![Attribute { name: MODDED_TYPE_ATTR.into(), value: None }] };
+                    }
                     resolved_targets.push(target);
                 } else if key.contains(':') && !key.starts_with("minecraft:") {
                     // Schemaless modded codec (e.g. `apotheosis:affixed_item` in `minecraft:item_sub_predicate`):
@@ -1337,7 +1369,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn simplify_block_states(&self, parallel_indices: &[Index], node: JsonId, is_member: bool) -> McdocType {
+    fn simplify_block_states(&self, parallel_indices: &[Index], node: JsonId, is_member: bool, predicate: bool) -> McdocType {
         let mut lookups = Vec::new();
         for idx in parallel_indices {
             match idx {
@@ -1368,7 +1400,11 @@ impl<'a> Engine<'a> {
                         .collect();
                     fields.push(StructField::Pair {
                         key: StructKey::Literal(prop.clone()),
-                        field_type: McdocType::Enum { enum_kind: Some(EnumKind::String), values: enum_vals, attributes: Vec::new() },
+                        field_type: McdocType::Enum {
+                            enum_kind: Some(EnumKind::String),
+                            values: enum_vals,
+                            attributes: if predicate { vec![Attribute { name: STATE_PREDICATE_ATTR.into(), value: None }] } else { Vec::new() },
+                        },
                         optional: true,
                         deprecated: false,
                         desc: None,
@@ -1385,7 +1421,7 @@ impl<'a> Engine<'a> {
     }
 
     fn simplify_block_state_keys(&self, parallel_indices: &[Index], node: JsonId, is_member: bool) -> McdocType {
-        match self.simplify_block_states(parallel_indices, node, is_member) {
+        match self.simplify_block_states(parallel_indices, node, is_member, false) {
             McdocType::Struct { fields, .. } => McdocType::Union {
                 members: fields
                     .into_iter()
@@ -1819,6 +1855,28 @@ impl<'a> Engine<'a> {
                     message: format!("Expected string length in range {}.", list.join(" or ")),
                 });
             }
+            RuntimeErrorKind::StateNeverMatches => {
+                let value = match &node.kind {
+                    ArenaKind::String(s) => s.value.clone(),
+                    _ => String::new(),
+                };
+                self.diagnostics.push(Diagnostic {
+                    span,
+                    severity: Severity::Warning,
+                    message: format!("This block has no \"{value}\" state for this property, so this never matches."),
+                });
+            }
+            RuntimeErrorKind::IntegerReadAs { read_as } => {
+                let raw = match &node.kind {
+                    ArenaKind::Number { raw, .. } => raw.as_str(),
+                    _ => "this number",
+                };
+                self.diagnostics.push(Diagnostic {
+                    span,
+                    severity: Severity::Warning,
+                    message: format!("Expected an integer. Minecraft reads {raw} as {read_as}."),
+                });
+            }
             RuntimeErrorKind::NumberOutOfRange { ranges } => {
                 let list: Vec<String> = ranges.iter().map(|r| r.format()).collect();
                 self.diagnostics.push(Diagnostic {
@@ -1884,7 +1942,16 @@ fn condense_errors_and_filter_siblings(defs: &[(DefId, Vec<RuntimeError>)]) -> (
     valid = next;
     errors.extend(errs);
 
-    // 2. UnknownKey / UnknownTupleElement
+    // 2. UnknownKey / UnknownTupleElement. DFU's map codecs ignore keys they don't read, so when every
+    // member has some, a member whose only problems are extra keys still decodes (Nature's Spirit's
+    // `{"type": "minecraft:constant", "absolute": 80}` reads as an inline `absolute` anchor).
+    let is_extra = |e: &RuntimeError| matches!(e.kind, RuntimeErrorKind::UnknownKey | RuntimeErrorKind::UnknownTupleElement);
+    if !valid.iter().any(|(_, errs)| !errs.iter().any(is_extra)) {
+        let decodes: Vec<(DefId, Vec<RuntimeError>)> = valid.iter().filter(|(_, errs)| errs.iter().all(is_extra)).cloned().collect();
+        if !decodes.is_empty() {
+            valid = decodes;
+        }
+    }
     for check in [
         (|e: &RuntimeError| matches!(e.kind, RuntimeErrorKind::UnknownKey)) as fn(&RuntimeError) -> bool,
         |e| matches!(e.kind, RuntimeErrorKind::UnknownTupleElement),
@@ -2000,6 +2067,27 @@ fn condense_errors_and_filter_siblings(defs: &[(DefId, Vec<RuntimeError>)]) -> (
         |e| matches!(e.kind, RuntimeErrorKind::Internal),
         |_, _| false,
         None::<fn(&[RuntimeError]) -> RuntimeError>,
+    );
+    valid = next;
+    errors.extend(errs);
+
+    // 6. State predicate values the block doesn't have. These load but never match.
+    let (next, errs) = condense_layer(
+        &valid,
+        |e| matches!(e.kind, RuntimeErrorKind::StateNeverMatches),
+        |_, _| true,
+        None::<fn(&[RuntimeError]) -> RuntimeError>,
+    );
+    valid = next;
+    errors.extend(errs);
+
+    // 7. Integers vanilla truncates or wraps. These still load, so a member that reads the number
+    // exactly wins.
+    let (next, errs) = condense_layer(
+        &valid,
+        |e| matches!(e.kind, RuntimeErrorKind::IntegerReadAs { .. }),
+        |a, b| matches!((&a.kind, &b.kind), (RuntimeErrorKind::IntegerReadAs { read_as: x }, RuntimeErrorKind::IntegerReadAs { read_as: y }) if x == y),
+        Some(|group: &[RuntimeError]| group[0].clone()),
     );
     valid = next;
     errors.extend(errs);
@@ -2151,6 +2239,63 @@ pub fn loader_attr(loaders: &str) -> Attribute {
             value: LiteralValue::String { value: loaders.into() },
             attributes: Vec::new(),
         })),
+    }
+}
+
+fn loader_ignored(attributes: &[Attribute], ignored: &[&str]) -> bool {
+    attributes.iter().filter(|a| a.name == LOADER_ATTR).any(|a| match &a.value {
+        Some(super::types::AttributeValue::Type(McdocType::Literal { value: LiteralValue::String { value }, .. })) => {
+            value.split(',').all(|loader| ignored.contains(&loader))
+        }
+        _ => false,
+    })
+}
+
+/// Vanilla-mcdoc types state predicates (loot `block_state_property`, block predicates, and trigger
+/// `state` conditions) with the same `mcdoc:block_states` dispatcher as real block states. Vanilla reads
+/// predicate values as plain strings and a value the block lacks only fails to match, so we route
+/// those symbols through this dispatcher to warn instead of erroring.
+pub const STATE_PREDICATE_DISPATCHER: &str = "packraven:block_state_predicate";
+const STATE_PREDICATE_ATTR: &str = "packraven_state_predicate";
+
+/// Vanilla-mcdoc requires loot entry `weight` to be at least 1, but vanilla has never checked it
+/// (`GsonHelper.getAsInt` on 1.20.1, `Codec.INT` since), and an entry with weight 0 just never rolls.
+pub fn relax_loot_entry_weight(tables: &mut SymbolTables) {
+    let Some(McdocType::Struct { fields, .. }) = tables.mcdoc.get_mut("::java::data::loot::SingletonPoolEntry") else { return };
+    for field in fields {
+        if let StructField::Pair { key: StructKey::Literal(name), field_type: McdocType::Int { value_range, .. }, .. } = field
+            && name == "weight"
+        {
+            *value_range = None;
+        }
+    }
+}
+
+pub fn mark_block_state_predicates(tables: &mut SymbolTables) {
+    for symbol in [
+        "::java::data::loot::condition::BlockStateProperty",
+        "::java::data::advancement::predicate::BlockPredicateState",
+        "::java::data::advancement::trigger::BlockStateConditions",
+    ] {
+        let Some(ty) = tables.mcdoc.get_mut(symbol) else { continue };
+        let Ok(mut json) = serde_json::to_value(&*ty) else { continue };
+        retarget_dispatcher(&mut json, "mcdoc:block_states", STATE_PREDICATE_DISPATCHER);
+        if let Ok(patched) = serde_json::from_value(json) {
+            *ty = patched;
+        }
+    }
+}
+
+fn retarget_dispatcher(json: &mut serde_json::Value, from: &str, to: &str) {
+    match json {
+        serde_json::Value::Object(map) => {
+            if map.get("kind").and_then(|k| k.as_str()) == Some("dispatcher") && map.get("registry").and_then(|r| r.as_str()) == Some(from) {
+                map.insert("registry".into(), to.into());
+            }
+            map.values_mut().for_each(|v| retarget_dispatcher(v, from, to));
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|v| retarget_dispatcher(v, from, to)),
+        _ => {}
     }
 }
 
@@ -2343,7 +2488,10 @@ fn try_convert_json(node: &ArenaNode, target_kind: &str) -> Option<McdocType> {
             _ => None,
         },
         ArenaKind::Number { value, is_int, int_value, .. } => {
-            let allow_int = *is_int;
+            // Vanilla reads integers with `Number::intValue` (DFU's `Codec.INT`, Gson's `getAsInt`), so it
+            // accepts `1.0`, which vanilla's own datagen writes for loot table `rolls`.
+            let int_value = &if *is_int { *int_value } else { whole_number(*value) };
+            let allow_int = int_value.is_some();
             let lit = match target_kind {
                 "byte" if allow_int && int_value.is_some_and(|v| (-128..=127).contains(&v)) => Some(LiteralValue::Byte { value: *value }),
                 "short" if allow_int && int_value.is_some_and(|v| (-32768..=32767).contains(&v)) => Some(LiteralValue::Short { value: *value }),
@@ -2359,6 +2507,25 @@ fn try_convert_json(node: &ArenaNode, target_kind: &str) -> Option<McdocType> {
         }
         _ => None,
     }
+}
+
+/// Mirrors `Number.intValue()` and friends on Gson's `LazilyParsedNumber`, which vanilla's integer
+/// codecs call: Java truncates the fraction and keeps only the low bits that fit the target width.
+fn java_integer_conversion(node: &ArenaNode, target_kind: &str) -> Option<(McdocType, i64)> {
+    let ArenaKind::Number { value, int_value, .. } = &node.kind else { return None };
+    let whole = int_value.map(i128::from).unwrap_or_else(|| value.trunc() as i128);
+    let (read_as, value) = match target_kind {
+        "byte" => (whole as i8 as i64, LiteralValue::Byte { value: (whole as i8).into() }),
+        "short" => (whole as i16 as i64, LiteralValue::Short { value: (whole as i16).into() }),
+        "int" => (whole as i32 as i64, LiteralValue::Int { value: (whole as i32).into() }),
+        "long" => (whole as i64, LiteralValue::Long { value: whole as i64 }),
+        _ => return None,
+    };
+    Some((McdocType::Literal { value, attributes: Vec::new() }, read_as))
+}
+
+fn whole_number(value: f64) -> Option<i64> {
+    (value.fract() == 0.0 && value.abs() < i64::MAX as f64).then_some(value as i64)
 }
 
 fn inferred_number(ty: &McdocType) -> Option<f64> {
@@ -2541,7 +2708,7 @@ type Ingredient = (
         regs.finalize();
 
         let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: Some("21.1.265".into()) };
-        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
         let root_type = resource_root_type("recipe", &tables).unwrap();
 
         let ok_json = r##"{
@@ -2609,7 +2776,7 @@ dispatch minecraft:structure_type["minecraft:jigsaw"] to struct { size: int }
         regs.finalize();
         let check = |category: &str, json: &str, neoforge: Option<&str>| {
             let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: neoforge.map(String::from) };
-            let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+            let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
             let parsed = json_parser::parse(json, false);
             check_json_with_type(parsed.root.as_ref().unwrap(), &resource_root_type(category, &tables).unwrap(), &env).diagnostics
         };
@@ -2655,7 +2822,7 @@ dispatch minecraft:structure_type["minecraft:jigsaw"] to struct { size: int }
 
         // On NeoForge 21.1, `neoforge:item_exists` is valid.
         let v_old = VersionContext { minecraft: Some("1.21.1".into()), neoforge: Some("21.1.265".into()) };
-        let env_old = CheckEnv { tables: &tables, registries: &regs, version: &v_old, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+        let env_old = CheckEnv { tables: &tables, registries: &regs, version: &v_old, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
         let out_old = check_json_with_type(parsed.root.as_ref().unwrap(), &root_type, &env_old);
         assert!(
             !out_old.diagnostics.iter().any(|d| d.severity == Severity::Error),
@@ -2716,7 +2883,7 @@ dispatch minecraft:loot_function["minecraft:set_name"] to struct {
         )
         .unwrap();
         let im_root = resource_root_type("item_modifier", &im_tables).unwrap();
-        let im_env = CheckEnv { tables: &im_tables, registries: &regs, version: &v_old, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+        let im_env = CheckEnv { tables: &im_tables, registries: &regs, version: &v_old, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
 
         let missing_fn = json_parser::parse(r#"{ "function": "minecraft:sequence" }"#, false);
         let out_missing = check_json_with_type(missing_fn.root.as_ref().unwrap(), &im_root, &im_env);
@@ -2754,7 +2921,7 @@ dispatch minecraft:loot_function["minecraft:set_name"] to struct {
         regs.finalize();
 
         let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: Some("21.1.265".into()) };
-        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
 
         let recipe_type = resource_root_type("recipe", &tables).expect("recipe resource");
         let recipe_json = r#"{

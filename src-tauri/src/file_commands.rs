@@ -207,6 +207,7 @@ pub async fn datapack_status(state: State<'_, AppState>, force: bool) -> CmdResu
 #[tauri::command]
 pub async fn datapack_lint(state: State<'_, AppState>, path: String, text: String) -> CmdResult<Vec<crate::mcdoc::LintDiagnostic>> {
     let settings = state.settings();
+    let root = settings.instance_dir.clone();
     let cache = std::sync::Arc::clone(&state.datapack);
     let probe = std::sync::Arc::clone(&state.probejs);
     let index = match cache.get(&settings.instance_dir) {
@@ -214,7 +215,7 @@ pub async fn datapack_lint(state: State<'_, AppState>, path: String, text: Strin
         None => cache.ensure(settings.instance_dir, settings.install_dir, probe, false).await.1,
     };
     let Some(idx) = index else { return Ok(Vec::new()) };
-    tauri::async_runtime::spawn_blocking(move || idx.lint(&path, &text))
+    tauri::async_runtime::spawn_blocking(move || idx.lint_in_pack(&path, &text, &crate::mcdoc::overlays::InstanceFiles(&root)))
         .await
         .map_err(|e| e.to_string())
 }

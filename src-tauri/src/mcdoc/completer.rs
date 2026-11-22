@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use super::checker::{ArenaKind, CheckEnv, CheckOutput, JsonArena, JsonId};
 use super::registries::normalize_category;
-use super::types::{EnumValue, LiteralValue, McdocType, StructField, StructKey, SymbolTables};
+use super::types::{EnumValue, LiteralValue, McdocType, NumericRange, RangeKind, StructField, StructKey, SymbolTables};
 use super::version::{attr_string, parse_id_attribute, TagMode};
 
 const MAX_COMPLETIONS: usize = 100;
@@ -23,6 +23,9 @@ pub struct CompletionItem {
     /// UTF-16 offset relative to `CompletionResult::from` where the cursor should land after insertion.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor_offset: Option<usize>,
+    /// UTF-16 length to select, ending at the cursor, so typing replaces a placeholder like `0.0`.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub select_len: usize,
     /// When true, consume a closing `"` immediately following `to` so key scaffolding closes the string cleanly.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub consume_closing_quote: bool,
@@ -467,53 +470,110 @@ fn classify_value_kinds(ty: &McdocType, env: &CheckEnv<'_>, out: &mut ValueKinds
     }
 }
 
-/// Returns `(value_scaffold, cursor_back_from_end, retrigger)` for a field's mcdoc type.
-fn value_scaffold(ty: &McdocType, env: &CheckEnv<'_>) -> (&'static str, usize, bool) {
-    let mut k = ValueKinds::default();
-    classify_value_kinds(ty, env, &mut k, 0);
-    if k.any {
-        return ("", 0, false);
-    }
-    let count = usize::from(k.string) + usize::from(k.object) + usize::from(k.array) + usize::from(k.boolean) + usize::from(k.number);
-    if count != 1 {
-        return ("", 0, false);
-    }
-    if k.string {
-        ("\"\"", 1, true)
-    } else if k.object {
-        ("{}", 1, true)
-    } else if k.array {
-        ("[]", 1, false)
-    } else if k.boolean {
-        ("", 0, true)
-    } else {
-        ("", 0, false)
+/// What we type after a completed key: the value's skeleton, how far before its end the cursor
+/// goes, how much of the value to select, and whether to reopen completions there.
+struct ValueScaffold {
+    text: String,
+    back: usize,
+    select: usize,
+    retrigger: bool,
+}
+
+impl ValueScaffold {
+    fn new(text: &str, back: usize, select: usize, retrigger: bool) -> Self {
+        Self { text: text.to_string(), back, select, retrigger }
     }
 }
 
-fn format_key_insert(
-    name: &str,
-    field_type: &McdocType,
-    env: &CheckEnv<'_>,
-    mode: KeyInsertMode,
-) -> (Option<String>, Option<usize>, bool, bool) {
-    match mode {
-        KeyInsertMode::NameOnly => (None, None, false, false),
-        KeyInsertMode::CloseQuoteAndValue { consume_closing_quote, trailing_comma } => {
-            let (val, back, retrigger) = value_scaffold(field_type, env);
-            let comma = if trailing_comma { "," } else { "" };
-            let text = format!("{name}\": {val}{comma}");
-            let cursor = text.encode_utf16().count().saturating_sub(back + usize::from(trailing_comma));
-            (Some(text), Some(cursor), consume_closing_quote, retrigger)
-        }
-        KeyInsertMode::QuotedAndValue { trailing_comma } => {
-            let (val, back, retrigger) = value_scaffold(field_type, env);
-            let comma = if trailing_comma { "," } else { "" };
-            let text = format!("\"{name}\": {val}{comma}");
-            let cursor = text.encode_utf16().count().saturating_sub(back + usize::from(trailing_comma));
-            (Some(text), Some(cursor), false, retrigger)
-        }
+fn value_scaffold(ty: &McdocType, env: &CheckEnv<'_>) -> ValueScaffold {
+    let mut k = ValueKinds::default();
+    classify_value_kinds(ty, env, &mut k, 0);
+    let count = usize::from(k.string) + usize::from(k.object) + usize::from(k.array) + usize::from(k.boolean) + usize::from(k.number);
+    if k.any || count != 1 {
+        return ValueScaffold::new("", 0, 0, false);
     }
+    if k.string {
+        ValueScaffold::new("\"\"", 1, 0, true)
+    } else if k.object {
+        ValueScaffold::new("{}", 1, 0, true)
+    } else if k.array {
+        ValueScaffold::new("[]", 1, 0, false)
+    } else if k.boolean {
+        ValueScaffold::new("", 0, 0, true)
+    } else {
+        // We select the number so you can type over it.
+        let number = number_placeholder(ty, env, 0).unwrap_or_else(|| "0".into());
+        let len = number.len();
+        ValueScaffold { text: number, back: 0, select: len, retrigger: false }
+    }
+}
+
+/// Returns a number that fits the field: 0 (or 0.0 for floats), or the range's nearest end when 0 is outside it.
+fn number_placeholder(ty: &McdocType, env: &CheckEnv<'_>, depth: u8) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    let pick = |range: &Option<NumericRange>, float: bool| {
+        let mut value = 0.0_f64;
+        if let Some(r) = range {
+            let step = if float { 0.1 } else { 1.0 };
+            if let Some(min) = r.min.filter(|min| value < *min || (value == *min && r.kind.0 & RangeKind::LEFT_EXCLUSIVE.0 != 0)) {
+                value = if r.kind.0 & RangeKind::LEFT_EXCLUSIVE.0 != 0 { min + step } else { min };
+            } else if let Some(max) = r.max.filter(|max| value > *max || (value == *max && r.kind.0 & RangeKind::RIGHT_EXCLUSIVE.0 != 0)) {
+                value = if r.kind.0 & RangeKind::RIGHT_EXCLUSIVE.0 != 0 { max - step } else { max };
+            }
+        }
+        if float {
+            if value.fract() == 0.0 { format!("{value:.1}") } else { format!("{value}") }
+        } else {
+            format!("{}", value.round() as i64)
+        }
+    };
+    match ty {
+        McdocType::Byte { value_range, .. } | McdocType::Short { value_range, .. } | McdocType::Int { value_range, .. } => Some(pick(value_range, false)),
+        McdocType::Long { .. } => Some("0".into()),
+        McdocType::Float { value_range, .. } | McdocType::Double { value_range, .. } => Some(pick(value_range, true)),
+        McdocType::Union { members, .. } => members
+            .iter()
+            .filter(|m| env.version.keeps(m.attributes()))
+            .find_map(|m| number_placeholder(m, env, depth + 1)),
+        McdocType::Reference { path: Some(path), .. } => number_placeholder(env.tables.mcdoc.get(path)?, env, depth + 1),
+        McdocType::Concrete { child, .. } | McdocType::Template { child, .. } | McdocType::Mapped { child, .. } => number_placeholder(child, env, depth + 1),
+        _ => None,
+    }
+}
+
+struct KeyInsert {
+    insert_text: Option<String>,
+    cursor_offset: Option<usize>,
+    select_len: usize,
+    consume_closing_quote: bool,
+    retrigger: bool,
+}
+
+fn format_key_insert(name: &str, field_type: &McdocType, env: &CheckEnv<'_>, mode: KeyInsertMode) -> KeyInsert {
+    let (prefix, consume_closing_quote, trailing_comma) = match mode {
+        KeyInsertMode::NameOnly => {
+            return KeyInsert { insert_text: None, cursor_offset: None, select_len: 0, consume_closing_quote: false, retrigger: false };
+        }
+        KeyInsertMode::CloseQuoteAndValue { consume_closing_quote, trailing_comma } => ("", consume_closing_quote, trailing_comma),
+        KeyInsertMode::QuotedAndValue { trailing_comma } => ("\"", false, trailing_comma),
+    };
+    let value = value_scaffold(field_type, env);
+    let comma = if trailing_comma { "," } else { "" };
+    let text = format!("{prefix}{name}\": {}{comma}", value.text);
+    let cursor = text.encode_utf16().count().saturating_sub(value.back + usize::from(trailing_comma));
+    KeyInsert {
+        insert_text: Some(text),
+        cursor_offset: Some(cursor),
+        select_len: value.select,
+        consume_closing_quote,
+        retrigger: value.retrigger,
+    }
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 fn complete_object_keys(
@@ -606,7 +666,7 @@ fn collect_struct_fields(
                         } else {
                             type_label(field_type, env.tables)
                         });
-                        let (insert_text, cursor_offset, consume_closing_quote, retrigger) = format_key_insert(name, field_type, env, mode);
+                        let key = format_key_insert(name, field_type, env, mode);
                         out.push((
                             *optional,
                             CompletionItem {
@@ -615,10 +675,11 @@ fn collect_struct_fields(
                                 detail,
                                 signature: Some(format!("\"{name}\": {}", type_label(field_type, env.tables))),
                                 docs: desc.clone(),
-                                insert_text,
-                                cursor_offset,
-                                consume_closing_quote,
-                                retrigger,
+                                insert_text: key.insert_text,
+                                cursor_offset: key.cursor_offset,
+                                select_len: key.select_len,
+                                consume_closing_quote: key.consume_closing_quote,
+                                retrigger: key.retrigger,
                             },
                         ));
                     }
@@ -627,8 +688,7 @@ fn collect_struct_fields(
                             if filter.existing.contains(&item.label) || !seen.insert(item.label.clone()) {
                                 continue;
                             }
-                            let (insert_text, cursor_offset, consume_closing_quote, retrigger) =
-                                format_key_insert(&item.label, field_type, env, mode);
+                            let key = format_key_insert(&item.label, field_type, env, mode);
                             out.push((
                                 true,
                                 CompletionItem {
@@ -637,10 +697,11 @@ fn collect_struct_fields(
                                     detail: Some(type_label(field_type, env.tables)),
                                     signature: item.signature,
                                     docs: desc.clone().or(item.docs),
-                                    insert_text,
-                                    cursor_offset,
-                                    consume_closing_quote,
-                                    retrigger,
+                                    insert_text: key.insert_text,
+                                    cursor_offset: key.cursor_offset,
+                                    select_len: key.select_len,
+                                    consume_closing_quote: key.consume_closing_quote,
+                                    retrigger: key.retrigger,
                                 },
                             ));
                         }
@@ -668,6 +729,7 @@ fn complete_values(ty: &McdocType, env: &CheckEnv<'_>, typed: &str, in_string: b
                 docs: None,
                 insert_text: Some("{}".into()),
                 cursor_offset: Some(1),
+                select_len: 0,
                 consume_closing_quote: false,
                 retrigger: true,
             });
@@ -681,6 +743,7 @@ fn complete_values(ty: &McdocType, env: &CheckEnv<'_>, typed: &str, in_string: b
                 docs: None,
                 insert_text: Some("[]".into()),
                 cursor_offset: Some(1),
+                select_len: 0,
                 consume_closing_quote: false,
                 retrigger: false,
             });
@@ -694,6 +757,7 @@ fn complete_values(ty: &McdocType, env: &CheckEnv<'_>, typed: &str, in_string: b
                 docs: None,
                 insert_text: Some("\"\"".into()),
                 cursor_offset: Some(1),
+                select_len: 0,
                 consume_closing_quote: false,
                 retrigger: true,
             });
@@ -740,6 +804,7 @@ fn collect_value_completions(
                         docs: None,
                         insert_text: insert,
                         cursor_offset: None,
+                        select_len: 0,
                         consume_closing_quote: false,
                         retrigger: false,
                     });
@@ -770,6 +835,7 @@ fn collect_value_completions(
                         docs: None,
                         insert_text: insert,
                         cursor_offset: None,
+                        select_len: 0,
                         consume_closing_quote: false,
                         retrigger: false,
                     });
@@ -813,6 +879,7 @@ fn collect_value_completions(
                     docs: None,
                     insert_text: insert,
                     cursor_offset: None,
+                    select_len: 0,
                     consume_closing_quote: false,
                     retrigger: false,
                 });
@@ -838,6 +905,7 @@ fn collect_value_completions(
                         docs: v.desc.clone(),
                         insert_text: insert,
                         cursor_offset: None,
+                        select_len: 0,
                         consume_closing_quote: false,
                         retrigger: false,
                     });
@@ -855,6 +923,7 @@ fn collect_value_completions(
                         docs: None,
                         insert_text: None,
                         cursor_offset: None,
+                        select_len: 0,
                         consume_closing_quote: false,
                         retrigger: false,
                     });
@@ -891,6 +960,7 @@ dispatch minecraft:recipe_serializer["minecraft:crafting_shapeless"] to struct S
 		id: #[id="item"] string,
 		count?: int @ 1..99,
 	},
+	experience?: float,
 	show_notification?: boolean,
 	ingredients?: [#[id="item"] string],
 	#[packraven_loader="fabric"] "fabric:only"?: boolean,
@@ -906,7 +976,7 @@ dispatch minecraft:recipe_serializer["minecraft:crafting_shapeless"] to struct S
         regs.insert_entries("item", ["minecraft:diamond".into(), "create:brass_ingot".into()]);
         regs.finalize();
         let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: None };
-        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
         let root_type = resource_root_type("recipe", &tables).unwrap();
         let recheck = |edited: &str| json_parser::parse(edited, false).root.map(|r| check_json_with_type(&r, &root_type, &env));
         let opts = CompleteOptions { recheck: &recheck, ignored_loaders: &[] };
@@ -934,6 +1004,17 @@ dispatch minecraft:recipe_serializer["minecraft:crafting_shapeless"] to struct S
         assert_eq!(res_item.insert_text.as_deref(), Some("\"result\": {}"));
         assert_eq!(res_item.cursor_offset, Some("\"result\": {".len()));
         assert!(res_item.retrigger);
+
+        // A number field gets a placeholder that fits its type and range, selected so typing replaces it.
+        let xp = bare_comp.items.iter().find(|i| i.label == "experience").expect("experience completion");
+        assert_eq!(xp.insert_text.as_deref(), Some("\"experience\": 0.0"));
+        assert_eq!((xp.cursor_offset, xp.select_len), (Some("\"experience\": 0.0".len()), 3));
+        let in_result = "{\n  \"type\": \"minecraft:crafting_shapeless\",\n  \"result\": {\n    \n  }\n}";
+        let in_result_check = check_json_with_type(json_parser::parse(in_result, false).root.as_ref().unwrap(), &root_type, &env);
+        let count_comp = complete(in_result, in_result.find("{\n    ").unwrap() + 6, &in_result_check, &env, &opts);
+        let count = count_comp.items.iter().find(|i| i.label == "count").expect("count completion");
+        assert_eq!(count.insert_text.as_deref(), Some("\"count\": 1"), "int @ 1..99 starts at its minimum");
+        assert_eq!(count.select_len, 1);
 
         // Typing a new key inside quotes without a following colon keeps `to == pos` (so CodeMirror matches `"res"`,
         // never `"res\""`) and sets `consume_closing_quote` so apply consumes the auto-closed quote cleanly.

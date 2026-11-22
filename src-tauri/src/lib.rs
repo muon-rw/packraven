@@ -148,6 +148,7 @@ pub fn run() {
                 mod_list: Mutex::default(),
                 minecraft: Arc::default(),
                 minecraft_sign_in: Mutex::default(),
+                datapack_probe_stop: Mutex::default(),
                 probejs: Arc::default(),
                 datapack: Arc::default(),
             });
@@ -319,6 +320,7 @@ pub fn run() {
             file_commands::datapack_complete,
             file_commands::datapack_hover,
             commands::datapack_probe,
+            commands::datapack_probe_stop,
             file_commands::decompile_class,
             file_commands::extract_archive,
             file_commands::compress_paths,

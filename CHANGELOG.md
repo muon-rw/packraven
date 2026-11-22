@@ -8,9 +8,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 - - Vanilla datapack and `pack.mcmeta` schemas for each Minecraft version
 - - NeoForge, Forge, and Fabric load conditions, NeoForge biome/structure modifiers and data maps, and `fabric.mod.json`
 - - Various modded schemas (maintained in [muon-rw/mcdocs](https://github.com/muon-rw/mcdocs)), plus [misode's partner schemas](https://misode.github.io/partners/) for installed mods like Apotheosis, Create, Ars Nouveau, and Lychee
-- - Modded registries (IDs, tags, and block states) from your mod jars, pack data, and ProbeJS or ProbeRaven dumps. Click `Schemas` in the Files toolbar to reload them
 - New companion mod `proberaven` bundled, covers 1.20.1 Forge/Fabric and 1.21.1, 1.21.11, 26.1.2, 26.2, and 26.3 NeoForge/Fabric:
-- - Click `Dump registries` in the Files toolbar to export modded registries, tags, and block states from your pack, and validate against registry ids actually present in your instance! 
+- - Click `Dump registries` in the editor toolbar to export modded registries, tags, and block states from your pack, and validate against registry ids actually present in your instance! 
 - - packraven will refresh this registry dump on every Test Server launch and `/reload`, or you can run `/proberaven dump` yourself
 - - `.proberaven/` is automatically gitignored
 

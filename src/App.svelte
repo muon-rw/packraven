@@ -909,7 +909,7 @@
         </Pane>
         <!-- The divider sits between the panes in the DOM too, so Tab reaches it where you see it. -->
         {#if index === 0 && paneMode === 'split'}
-          <Splitter value={leftWidth} min={PANE_MIN} max={splitTotal - PANE_MIN} total={splitTotal} label="Resize the panes" controls="pane-0" onresize={(px) => paneSplit.set(px / splitTotal)} onreset={() => paneSplit.reset()} />
+          <Splitter value={leftWidth} min={PANE_MIN} max={splitTotal - PANE_MIN} label="Resize the panes" controls="pane-0" onresize={(px) => paneSplit.set(px / splitTotal)} onreset={() => paneSplit.reset()} />
         {/if}
       {/each}
       {#if dropSide !== null}

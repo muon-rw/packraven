@@ -36,8 +36,52 @@ test('datapack JSON files show Schemas toolbar reload, lint errors, completion a
   const dumpBtn = page.getByRole('button', { name: 'Dump registries', exact: true })
   await expect(dumpBtn).toBeVisible()
   await dumpBtn.click()
-  await expect(page.locator('.toolbar-note', { hasText: /Dumped 117 registries/ })).toBeVisible({ timeout: 5000 })
+
+  // The dump log opens with the current stage, elapsed time, and the server's output.
+  const dumpPanel = page.getByRole('region', { name: 'Registry dump' })
+  await expect(dumpPanel).toBeVisible()
+  await expect(dumpPanel.getByRole('status')).toContainText('Launching headless server', { timeout: 5000 })
+  await expect(dumpPanel).toContainText('Found 312 mods', { timeout: 5000 })
+  await expect(dumpPanel.locator('.elapsed')).toHaveText(/^0:0\d$/)
+
+  // Escape hides the log while the dump keeps running, and the toolbar button brings it back.
+  await page.keyboard.press('Escape')
+  await expect(dumpPanel).toBeHidden()
+  const dumpingBtn = page.getByRole('button', { name: 'Dumping…', exact: true })
+  await expect(dumpingBtn).toHaveAttribute('aria-expanded', 'false')
+  await dumpingBtn.click()
+  await expect(dumpPanel).toBeVisible()
+
+  // The handle under the log resizes it, and Enter puts it back.
+  const dumpHandle = page.getByRole('separator', { name: 'Resize the registry dump log' })
+  const startHeight = (await dumpPanel.boundingBox())!.height
+  await dumpHandle.focus()
+  await page.keyboard.press('Shift+ArrowDown')
+  expect((await dumpPanel.boundingBox())!.height).toBeGreaterThan(startHeight)
+  await page.keyboard.press('Enter')
+  await expect.poll(async () => (await dumpPanel.boundingBox())!.height).toBe(startHeight)
+
+  // Stop ends the run quietly instead of reporting a failure.
+  await dumpPanel.getByRole('button', { name: 'Stop' }).click()
+  await expect(dumpPanel.getByRole('status')).toHaveText(/^Stopped the registry dump\./)
+  await expect(dumpPanel.locator('.summary.failed')).toHaveCount(0)
+  await expect(dumpPanel.getByRole('button', { name: 'Dump again' })).toBeVisible()
+  await expect(dumpBtn).toBeVisible()
+  await expect(schemasBtn).not.toHaveAttribute('title', /ProbeRaven dump/)
+
+  // A full run upgrades the source and leaves the summary in the panel.
+  await dumpBtn.click()
+  await expect(dumpPanel.getByRole('status')).toContainText('Dumped 117 registries', { timeout: 10000 })
   await expect(schemasBtn).toHaveAttribute('title', /ProbeRaven dump/)
+  await dumpPanel.getByRole('button', { name: 'Close' }).click()
+  await expect(dumpPanel).toBeHidden()
+
+  // The last run's log stays reachable, and closing the panel hands focus back to its toggle.
+  const dumpLogBtn = page.getByRole('button', { name: 'Dump log', exact: true })
+  await expect(dumpLogBtn).toBeFocused()
+  await dumpLogBtn.click()
+  await expect(dumpPanel.getByRole('status')).toContainText('Dumped 117 registries')
+  await dumpPanel.getByRole('button', { name: 'Close' }).click()
 
   // Edit the recipe to trigger a datapack lint error ("count": 0).
   const content = page.locator('.cm-content')

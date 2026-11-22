@@ -15,6 +15,8 @@ class JobRecord {
   phase = $state<JobPhase>('idle')
   message = $state<string | null>(null)
   lines = $state.raw<LogLine[]>([])
+  startedAt = $state<number | null>(null)
+  endedAt = $state<number | null>(null)
   // The phase stays 'done' or 'failed' until the next run starts, so effects that react to a run
   // ending compare this count instead.
   finishedRuns = $state(0)
@@ -150,8 +152,11 @@ function register(): Promise<UnlistenFn[]> {
       pending.delete(payload.job)
       entry.lines = []
       entry.pack = scope.pack
+      entry.startedAt = Date.now()
+      entry.endedAt = null
     } else {
       flushLogs()
+      entry.endedAt = Date.now()
     }
     entry.phase = payload.state
     entry.message = payload.message

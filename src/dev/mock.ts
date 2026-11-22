@@ -856,6 +856,7 @@ function mockServerIcon() {
 let serverIcon: string | null = scenario === 'empty' ? null : 'pending'
 let serverReadme = false
 let datapackProbed = false
+let stopMockProbe: (() => void) | null = null
 
 // We fill the default template the app ships, the way the backend does, so the preview can't drift from it.
 function mockServerReadme() {
@@ -1494,14 +1495,34 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     error: null,
   }),
   datapack_probe: () => {
-    mockJob(
-      'datapack-probe',
-      ['Preparing headless registry dump for Minecraft 1.21.1 (NeoForge 21.1.265)', 'ProbeRaven dump complete: 117 registries'],
-      'Dumped 117 registries (18420 entries), 1004 tags, and 1060 block states.',
-      () => {
+    const job = 'datapack-probe'
+    emit('job-state', { job, state: 'running', message: null })
+    const steps: [string, string][] = [
+      ['info', 'Preparing headless registry dump for Minecraft 1.21.1 (NeoForge 21.1.265)'],
+      ['info', 'Synced 412 files (38 changed)'],
+      ['info', 'Launching headless server to dump registries, tags, and block states'],
+      ['out', '[main/INFO] [cpw.mods.modlauncher.Launcher/MODLAUNCHER]: ModLauncher running'],
+      ['out', '[main/INFO] [net.neoforged.fml.loading.moddiscovery.ModDiscoverer/SCAN]: Found 312 mods'],
+      ['out', '[modloading-worker-0/INFO] [Create/]: Create 6.0.4 initializing'],
+      ['err', '[modloading-worker-3/WARN] [mixin/]: @Mixin target net.minecraft.Foo was not found'],
+      ['out', '[main/INFO] [proberaven/]: Dumping 117 registries'],
+      ['out', '[main/INFO] [proberaven/]: Wrote .proberaven/dump.json.next'],
+    ]
+    const timers = steps.map(([stream, text], i) => setTimeout(() => emit('job-log', { job, stream, text }), 700 * (i + 1)))
+    timers.push(
+      setTimeout(() => {
         datapackProbed = true
-      },
+        emit('job-state', { job, state: 'done', message: 'Dumped 117 registries (18420 entries), 1004 tags, and 1060 block states.' })
+      }, 700 * (steps.length + 2)),
     )
+    stopMockProbe = () => {
+      timers.forEach(clearTimeout)
+      setTimeout(() => emit('job-state', { job, state: 'failed', message: 'Stopped the registry dump.' }), 300)
+    }
+  },
+  datapack_probe_stop: () => {
+    stopMockProbe?.()
+    stopMockProbe = null
   },
   datapack_lint: (a) => {
     const text = String(a.text ?? '')

@@ -22,6 +22,7 @@ fn run_case(mcdoc_def: &str, json_src: &str) -> Vec<Diagnostic> {
         require_canonical: false,
         allow_missing_keys: false,
         primitives_read_as_strings: false,
+        ignored_loaders: &[],
     };
     let parsed = json_parser::parse(json_src, false);
     assert!(parsed.diagnostics.is_empty(), "invalid test JSON `{json_src}`: {:?}", parsed.diagnostics);
@@ -63,6 +64,32 @@ fn spyglass_golden_string_byte_int_double() {
     assert_ok("int", "-2147483648");
     assert_has_msg("int", "2147483648", "Expected an integer");
     assert_has_msg("int", "-2147483649", "Expected an integer");
+    // Vanilla reads integers through `Number::intValue`, and its datagen writes `"rolls": 1.0`.
+    assert_ok("int", "1.0");
+    assert_ok("int @ 1..", "2e1");
+    assert_ok("(string | int | struct {})", "1.0");
+    assert_has_msg("int", "1.5", "Expected an integer");
+    assert_has_msg("byte", "128.0", "Expected an integer");
+}
+
+#[test]
+fn integers_vanilla_truncates_or_wraps_load_with_a_warning() {
+    let only = |def: &str, json: &str| {
+        let diags = run_case(def, json);
+        assert_eq!(diags.len(), 1, "`{def}` with `{json}`: {diags:?}");
+        assert_eq!(diags[0].severity, Severity::Warning, "`{def}` with `{json}`: {diags:?}");
+        diags[0].message.clone()
+    };
+    assert_eq!(only("int", "2.5"), "Expected an integer. Minecraft reads 2.5 as 2.");
+    assert_eq!(only("int", "-2.5"), "Expected an integer. Minecraft reads -2.5 as -2.");
+    // A structure set salt that Gson parses as a long and vanilla narrows to an int.
+    assert_eq!(only("int @ 0..", "5004938900"), "Expected an integer. Minecraft reads 5004938900 as 709971604.");
+    assert_eq!(only("byte", "255"), "Expected an integer. Minecraft reads 255 as -1.");
+    // Vanilla checks ranges against the narrowed value, so that check still applies.
+    assert!(run_case("int @ 1..", "0.5").iter().any(|d| d.severity == Severity::Error && d.message.contains("range 1..")));
+    // A union member that reads the number exactly wins.
+    assert_ok("(int | float)", "2.5");
+    assert_eq!(only("(string | int)", "2.5"), "Expected an integer. Minecraft reads 2.5 as 2.");
 
     // double @ 3..6.2
     assert_has_msg("double @ 3..6.2", r#""hello""#, "Expected a number");
@@ -271,7 +298,7 @@ struct Holder { label: #[text_component] string }
     .unwrap();
     let regs = RegistryIndex::default();
     let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: None };
-    let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+    let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
     let holder_ty = McdocType::Reference { path: Some("::test::Holder".into()), attributes: Vec::new() };
 
     let good_tc = json_parser::parse(r#"{"label": "{\"text\":\"hi\",\"bold\":true}"}"#, false);
@@ -304,7 +331,7 @@ dispatch create:recipes[create:cutting] to struct Cutting {
     pregs.insert_entries("recipe_serializer", ["create:cutting".into()]);
     pregs.insert_entries("fabric:condition_codec", ["fabric:all_mods_loaded".into()]);
     pregs.finalize();
-    let penv = CheckEnv { tables: &partner_tables, registries: &pregs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+    let penv = CheckEnv { tables: &partner_tables, registries: &pregs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
     let rty = resource_root_type("recipe", &partner_tables).unwrap();
 
     let valid_create = json_parser::parse(
@@ -424,7 +451,7 @@ fn check_apotheosis_file(tables: &SymbolTables, regs: &RegistryIndex, mc: &str, 
     let parsed = json_parser::parse(json_src, false);
     assert!(parsed.diagnostics.is_empty(), "invalid JSON for {path}: {:?}", parsed.diagnostics);
     let version = VersionContext { minecraft: Some(mc.into()), neoforge: Some("21.1.265".into()) };
-    let env = CheckEnv { tables, registries: regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false };
+    let env = CheckEnv { tables, registries: regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
     check_json_with_type(parsed.root.as_ref().unwrap(), &root_type, &env).diagnostics
 }
 
@@ -885,4 +912,148 @@ fn vanilla_registries() -> KnownRegistries {
         known.insert(name);
     }
     known
+}
+
+#[test]
+fn neoforge_custom_ingredients_use_the_key_each_version_reads() {
+    let mut tables = SymbolTables::default();
+    parse_and_bind("type Ingredient = struct { item: string }", "::java::data::recipe", &mut tables).unwrap();
+    bridge_partner_dispatchers(&mut tables, &[]);
+    let regs = RegistryIndex::default();
+    let check = |minecraft: &str, json: &str| {
+        let version = VersionContext { minecraft: Some(minecraft.into()), neoforge: Some("21.1.265".into()) };
+        let env = CheckEnv {
+            tables: &tables,
+            registries: &regs,
+            version: &version,
+            require_canonical: false,
+            allow_missing_keys: false,
+            primitives_read_as_strings: false,
+            ignored_loaders: &[],
+        };
+        let parsed = json_parser::parse(json, false);
+        let root = McdocType::Reference { path: Some("::java::data::recipe::Ingredient".into()), attributes: Vec::new() };
+        check_json_with_type(parsed.root.as_ref().unwrap(), &root, &env)
+            .diagnostics
+            .into_iter()
+            .filter(|d| d.severity == Severity::Error)
+            .count()
+    };
+    let old = r#"{ "type": "neoforge:components", "items": "x:y", "components": {} }"#;
+    let new = r#"{ "neoforge:ingredient_type": "neoforge:components", "items": "x:y", "components": {} }"#;
+    assert_eq!(check("1.21.1", old), 0);
+    assert_eq!(check("26.1.2", new), 0);
+    assert_eq!(check("1.21.1", new), 1);
+}
+
+#[test]
+fn accepts_vanilla_types_a_mod_backports() {
+    let mut tables = SymbolTables::default();
+    parse_and_bind(
+        r#"
+type Feature = struct { type: #[id="worldgen/feature"] string, config: minecraft:feature_config[[type]] }
+dispatch minecraft:feature_config[minecraft:fallen_tree] to #[since="1.21.5"] struct { log_length: int }
+dispatch minecraft:feature_config[%unknown] to ()
+"#,
+        "::test",
+        &mut tables,
+    )
+    .unwrap();
+    let check = |backported: bool| {
+        let mut regs = RegistryIndex::default();
+        if backported {
+            regs.insert_entries("worldgen/feature", ["minecraft:fallen_tree".into()]);
+        }
+        regs.finalize();
+        let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: None };
+        let env = CheckEnv {
+            tables: &tables,
+            registries: &regs,
+            version: &version,
+            require_canonical: false,
+            allow_missing_keys: false,
+            primitives_read_as_strings: false,
+            ignored_loaders: &[],
+        };
+        let parsed = json_parser::parse(r#"{ "type": "minecraft:fallen_tree", "config": { "trunk": 1 } }"#, false);
+        let root = McdocType::Reference { path: Some("::test::Feature".into()), attributes: Vec::new() };
+        check_json_with_type(parsed.root.as_ref().unwrap(), &root, &env).diagnostics.into_iter().filter(|d| d.severity == Severity::Error).count()
+    };
+    assert!(check(false) > 0, "1.21.1 has no fallen_tree unless a mod adds it");
+    assert_eq!(check(true), 0);
+}
+
+#[test]
+fn picks_the_union_member_dfu_decodes_despite_extra_keys() {
+    // Vanilla's HeightProvider: an inline vertical anchor, or a typed provider.
+    let height = r#"(struct { absolute: int } | struct { above_bottom: int } | struct { type: "minecraft:constant", value: struct { absolute: int } })"#;
+    let diags = run_case(height, r#"{ "type": "minecraft:constant", "absolute": 80 }"#);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].severity, Severity::Warning);
+    assert_eq!(diags[0].message, "Unknown key \"type\".");
+    // With no member that decodes, the keys still conflict.
+    assert_has_msg(height, r#"{ "absolute": 80, "above_bottom": 2 }"#, "Invalid key combination");
+}
+
+#[test]
+fn state_predicates_with_values_a_block_lacks_load_but_never_match() {
+    let mut tables = SymbolTables::default();
+    parse_and_bind(
+        "type BlockStateProperty = struct { block: string, properties?: mcdoc:block_states[[block]] }",
+        "::java::data::loot::condition",
+        &mut tables,
+    )
+    .unwrap();
+    parse_and_bind("type BlockState = struct { Name: string, Properties?: mcdoc:block_states[[Name]] }", "::java::util", &mut tables).unwrap();
+    super::checker::mark_block_state_predicates(&mut tables);
+    let mut regs = RegistryIndex::default();
+    regs.apply_vanilla_block_states(
+        [("aether_ii:skyroot_twig".to_string(), [("twig_amount".to_string(), vec!["1".to_string(), "2".to_string()])].into_iter().collect())]
+            .into_iter()
+            .collect(),
+    );
+    let version = VersionContext { minecraft: Some("26.1.2".into()), neoforge: None };
+    let env = CheckEnv {
+        tables: &tables,
+        registries: &regs,
+        version: &version,
+        require_canonical: false,
+        allow_missing_keys: false,
+        primitives_read_as_strings: false,
+        ignored_loaders: &[],
+    };
+    let check = |path: &str, json: &str| {
+        let parsed = json_parser::parse(json, false);
+        check_json_with_type(parsed.root.as_ref().unwrap(), &McdocType::Reference { path: Some(path.into()), attributes: Vec::new() }, &env).diagnostics
+    };
+    // Aether II's skyroot_twig loot table still tests the twig amounts it used to have.
+    let predicate = check("::java::data::loot::condition::BlockStateProperty", r#"{ "block": "aether_ii:skyroot_twig", "properties": { "twig_amount": "3" } }"#);
+    assert_eq!(predicate.len(), 1, "{predicate:?}");
+    assert_eq!(predicate[0].severity, Severity::Warning);
+    assert_eq!(predicate[0].message, "This block has no \"3\" state for this property, so this never matches.");
+    let state = check("::java::util::BlockState", r#"{ "Name": "aether_ii:skyroot_twig", "Properties": { "twig_amount": "3" } }"#);
+    assert!(state.iter().any(|d| d.severity == Severity::Error), "{state:?}");
+}
+
+#[test]
+fn loot_entries_accept_any_weight_like_vanilla() {
+    let mut tables = SymbolTables::default();
+    parse_and_bind("type SingletonPoolEntry = struct { weight?: int @ 1.., quality?: int }", "::java::data::loot", &mut tables).unwrap();
+    super::checker::relax_loot_entry_weight(&mut tables);
+    let regs = RegistryIndex::default();
+    let version = VersionContext { minecraft: Some("26.1.2".into()), neoforge: None };
+    let env = CheckEnv {
+        tables: &tables,
+        registries: &regs,
+        version: &version,
+        require_canonical: false,
+        allow_missing_keys: false,
+        primitives_read_as_strings: false,
+        ignored_loaders: &[],
+    };
+    // Repurposed Structures disables an entry this way in its icy pyramid chests.
+    let parsed = json_parser::parse(r#"{ "weight": 0 }"#, false);
+    let root = McdocType::Reference { path: Some("::java::data::loot::SingletonPoolEntry".into()), attributes: Vec::new() };
+    let diags = check_json_with_type(parsed.root.as_ref().unwrap(), &root, &env).diagnostics;
+    assert!(diags.is_empty(), "{diags:?}");
 }

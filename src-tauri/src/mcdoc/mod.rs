@@ -4,6 +4,7 @@ pub mod fetch;
 #[cfg(test)]
 mod golden_tests;
 pub mod json_parser;
+pub mod overlays;
 pub mod parser;
 pub mod proberaven;
 pub mod registries;
@@ -58,13 +59,16 @@ pub struct DatapackIndex {
     pub version: VersionContext,
     pub path_rules: Vec<fetch::PathRule>,
     pub ignored_loaders: Vec<&'static str>,
+    /// Loader folders (`data/<ns>/<loader>/`) that the pack's loader never reads, with display names.
+    pub foreign_loader_folders: &'static [(&'static str, &'static str)],
+    pub data_pack_format: Option<overlays::PackFormat>,
 }
 
 /// Returns the loaders whose fields this pack can't use (see `checker::LOADER_ATTR`). We still accept
 /// those fields when validating, since mods built for several loaders ship all of them.
 fn loaders_the_pack_ignores(loader: Option<&ModLoader<'_>>, mod_ids: &std::collections::HashSet<String>) -> Vec<&'static str> {
     // Forgified Fabric API (which Sinytra Connector requires) ports Fabric's resource conditions and custom ingredients.
-    let fabric_api = ["fabric_api", "fabric_resource_conditions_api_v1", "connector"].iter().any(|m| mod_ids.contains(*m));
+    let fabric_api = ["fabric-api", "fabric_api", "fabric-resource-conditions-api-v1", "connector"].iter().any(|m| mod_ids.contains(*m));
     let mut ignored = match loader {
         Some(ModLoader::Fabric(_)) => vec!["forge", "neoforge"],
         Some(ModLoader::NeoForge(_)) => vec!["forge", "fabric"],
@@ -117,13 +121,49 @@ impl DatapackIndex {
             && !category.as_deref().is_some_and(|c| c.starts_with("tag/") || loads_through_registry_data_loader(c))
     }
 
+    /// Lints a file only when Minecraft would load it, so a copy that one of the pack's overlays
+    /// replaces, or one in an overlay this version skips, gets a note instead of a check.
+    pub fn lint_in_pack(&self, path: &str, text: &str, files: &dyn overlays::PackFiles) -> Vec<LintDiagnostic> {
+        let mc = self.version.minecraft.as_deref().unwrap_or("this version");
+        let message = match self.file_load(path, files) {
+            overlays::FileLoad::Loaded => return self.lint(path, text),
+            overlays::FileLoad::Replaced { overlay, .. } => {
+                format!("Minecraft {mc} loads the copy in this pack's {overlay} overlay instead, so we don't check this file.")
+            }
+            overlays::FileLoad::OverlayInactive { overlay } => {
+                format!("Minecraft {mc} doesn't apply this pack's {overlay} overlay here, so we don't check this file.")
+            }
+            overlays::FileLoad::Unlisted { folder } => {
+                format!("Minecraft doesn't load {folder}/, since this pack's pack.mcmeta doesn't list it as an overlay, so we don't check this file.")
+            }
+        };
+        vec![LintDiagnostic { from: 0, to: text.chars().next().map_or(0, |_| 1), severity: "info", message }]
+    }
+
+    pub fn file_load(&self, path: &str, files: &dyn overlays::PackFiles) -> overlays::FileLoad {
+        let (Some(minecraft), Some(format)) = (self.version.minecraft.as_deref(), self.data_pack_format) else {
+            return overlays::FileLoad::Loaded;
+        };
+        let env = overlays::OverlayEnv {
+            minecraft,
+            format,
+            neoforge: self.version.neoforge.is_some(),
+            fabric_api: !self.ignored_loaders.contains(&"fabric"),
+            mods: &self.registries.mod_ids,
+        };
+        overlays::file_load(path, files, &env)
+    }
+
     pub fn lint(&self, path: &str, text: &str) -> Vec<LintDiagnostic> {
         let allow_ext = path.to_lowercase().ends_with(".jsonc");
         let parsed = json_parser::parse_as(text, allow_ext, self.json_dialect(path));
         let mut diagnostics = parsed.diagnostics;
 
+        let file_start = json_parser::Span::new(0, text.len().min(1));
         if let Some(message) = self.version.minecraft.as_deref().and_then(|mc| unloaded_folder_message(path, mc)) {
-            diagnostics.push(json_parser::Diagnostic { span: json_parser::Span::new(0, text.len().min(1)), severity: Severity::Warning, message });
+            diagnostics.push(json_parser::Diagnostic { span: file_start, severity: Severity::Warning, message });
+        } else if let Some(message) = foreign_loader_folder_message(path, self.foreign_loader_folders) {
+            diagnostics.push(json_parser::Diagnostic { span: file_start, severity: Severity::Info, message });
         } else if let Some(root) = &parsed.root
             && let Some(category) = self.resolve_category(path)
             && let Some(root_type) = resource_root_type(&category, &self.tables)
@@ -135,6 +175,7 @@ impl DatapackIndex {
                 require_canonical: false,
                 allow_missing_keys: false,
                 primitives_read_as_strings: self.reads_primitives_as_strings(path),
+                ignored_loaders: &self.ignored_loaders,
             };
             let checked = check_json_with_type(root, &root_type, &env);
             let gated_on_missing_mod = requires_missing_mod(root, &self.registries.mod_ids);
@@ -173,6 +214,7 @@ impl DatapackIndex {
             require_canonical: false,
             allow_missing_keys: false,
             primitives_read_as_strings: self.reads_primitives_as_strings(path),
+                ignored_loaders: &self.ignored_loaders,
         };
         let checked = check_json_with_type(root, &root_type, &env);
         let recheck = |edited: &str| json_parser::parse_as(edited, allow_ext, dialect).root.map(|r| check_json_with_type(&r, &root_type, &env));
@@ -192,6 +234,7 @@ impl DatapackIndex {
             require_canonical: false,
             allow_missing_keys: false,
             primitives_read_as_strings: self.reads_primitives_as_strings(path),
+                ignored_loaders: &self.ignored_loaders,
         };
         let checked = check_json_with_type(root, &root_type, &env);
         completer::hover(text, utf16_offset, &checked, &self.tables)
@@ -299,14 +342,15 @@ impl DatapackCache {
         let muon_manifest = muon_manifest_res.ok();
         let misode_config = misode_cfg_res.ok();
 
-        let (vanilla_regs, vanilla_blocks) = if let Some(mc) = minecraft.as_deref() {
-            let (r, b) = tokio::join!(
+        let (vanilla_regs, vanilla_blocks, data_pack_format) = if let Some(mc) = minecraft.as_deref() {
+            let (r, b, f) = tokio::join!(
                 fetch::load_mcmeta_registries(mc, force),
                 fetch::load_mcmeta_block_states(mc, force),
+                fetch::load_mcmeta_data_pack_format(mc, force),
             );
-            (r.ok(), b.ok())
+            (r.ok(), b.ok(), f.ok())
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let root_for_scan = root.clone();
@@ -340,6 +384,11 @@ impl DatapackCache {
                 reg.apply_probejs(&probe);
             }
             if let Some(dump) = dump {
+                // The loader's own list covers every nested mod and `provides` alias, so it replaces
+                // our jar scan unless you've changed the mods since the dump.
+                if dump_postdates_mod_changes(&root_for_scan) {
+                    reg.mod_ids.clear();
+                }
                 reg.apply_proberaven(dump);
             }
             reg.finalize();
@@ -398,6 +447,7 @@ impl DatapackCache {
             }
             while let Some(joined) = set.join_next().await {
                 if let Ok((name, Ok(src))) = joined {
+                    let src = fetch::patch_partner_mcdoc(&name, src);
                     let module_path = format!("::partner::{name}");
                     let _ = parser::parse_and_bind(&src, &module_path, &mut tables);
                 }
@@ -405,11 +455,15 @@ impl DatapackCache {
         }
         let extra_bridges = muon_manifest.as_ref().map(|m| m.recipe_dispatcher_bridges.as_slice()).unwrap_or(&[]);
         fetch::bridge_partner_dispatchers(&mut tables, extra_bridges);
+        checker::mark_block_state_predicates(&mut tables);
+        checker::relax_loot_entry_weight(&mut tables);
 
         let version = VersionContext { minecraft: minecraft.clone(), neoforge };
         let mut registries = registries;
         seed_condition_registries(&mut registries, &tables, &version);
-        let ignored_loaders = loaders_the_pack_ignores(lock.as_ref().and_then(|l| l.mod_loader().ok()).as_ref(), &registries.mod_ids);
+        let mod_loader = lock.as_ref().and_then(|l| l.mod_loader().ok());
+        let ignored_loaders = loaders_the_pack_ignores(mod_loader.as_ref(), &registries.mod_ids);
+        let foreign_loader_folders = foreign_loader_folders(mod_loader.as_ref());
 
         let symbol_count = tables.mcdoc.len();
         let registry_entries: usize = registries.entries.values().map(Vec::len).sum();
@@ -420,6 +474,8 @@ impl DatapackCache {
             version,
             path_rules,
             ignored_loaders,
+            foreign_loader_folders,
+            data_pack_format,
         });
         let status = DatapackStatus {
             available: true,
@@ -502,6 +558,27 @@ const RENAMED_DATA_FOLDERS: &[(&str, &str)] = &[
 const RENAMED_TAG_FOLDERS: &[(&str, &str)] =
     &[("blocks", "block"), ("entity_types", "entity_type"), ("fluids", "fluid"), ("functions", "function"), ("game_events", "game_event"), ("items", "item")];
 
+// NeoForge reads only its own `neoforge/` folders from 1.20.2 on, but it began as a Forge fork and
+// still reads `forge/` on 1.20.1, so we leave NeoForge packs alone.
+fn foreign_loader_folders(loader: Option<&ModLoader<'_>>) -> &'static [(&'static str, &'static str)] {
+    match loader {
+        Some(ModLoader::Fabric(_)) => &[("forge", "Forge"), ("neoforge", "NeoForge")],
+        Some(ModLoader::Forge(_)) => &[("neoforge", "NeoForge")],
+        _ => &[],
+    }
+}
+
+/// Explains why we skip a multi-loader jar's data for a loader the pack doesn't run, like
+/// `data/ecologics/neoforge/biome_modifier/` in a Fabric pack.
+fn foreign_loader_folder_message(path: &str, folders: &[(&str, &str)]) -> Option<String> {
+    let norm = path.replace('\\', "/");
+    let after_data = norm.strip_prefix("data/").or_else(|| norm.find("/data/").map(|i| &norm[i + 6..]))?;
+    let (_, rest) = after_data.split_once('/')?;
+    let (folder, _) = rest.split_once('/')?;
+    let (_, label) = folders.iter().find(|(name, _)| *name == folder)?;
+    Some(format!("Only {label} loads files in {folder}/, so we don't check this file."))
+}
+
 /// Explains why Minecraft won't load a data file that sits in the other version's folder name.
 fn unloaded_folder_message(path: &str, minecraft: &str) -> Option<String> {
     let norm = path.replace('\\', "/");
@@ -522,10 +599,9 @@ fn unloaded_folder_message(path: &str, minecraft: &str) -> Option<String> {
     })
 }
 
-/// Returns whether the file's top-level load conditions require a mod the pack doesn't have. We read
-/// only conditions that check for mods directly; nested `not` / `or` logic could invert them.
+/// Returns whether the file's top-level load conditions fail for this pack's mods. We only decide
+/// conditions about installed mods (and constants), so `item_exists` and the like count as passing.
 fn requires_missing_mod(root: &json_parser::JsonNode, mod_ids: &std::collections::HashSet<String>) -> bool {
-    let missing = |id: &str| !mod_ids.contains(id);
     // Fabric conditions can also be a single object rather than a list.
     let conditions = |key: &str| -> Vec<&json_parser::JsonNode> {
         match root.get(key).map(|v| (v, &v.kind)) {
@@ -534,27 +610,9 @@ fn requires_missing_mod(root: &json_parser::JsonNode, mod_ids: &std::collections
             _ => Vec::new(),
         }
     };
-    let string_list = |node: &json_parser::JsonNode, key: &str| -> Vec<String> {
-        match node.get(key).map(|v| &v.kind) {
-            Some(json_parser::JsonKind::Array(items)) => items.iter().filter_map(|i| i.as_str().map(str::to_string)).collect(),
-            _ => Vec::new(),
-        }
-    };
-    let forge_style = |key: &str| {
-        conditions(key).into_iter().any(|c| {
-            matches!(c.get("type").and_then(|t| t.as_str()), Some("neoforge:mod_loaded" | "forge:mod_loaded"))
-                && c.get("modid").and_then(|m| m.as_str()).is_some_and(missing)
-        })
-    };
-    let fabric = conditions("fabric:load_conditions").into_iter().any(|c| {
-        let mods = string_list(c, "values");
-        match c.get("condition").and_then(|t| t.as_str()) {
-            Some("fabric:all_mods_loaded") => mods.iter().any(|m| missing(m)),
-            Some("fabric:any_mod_loaded") => !mods.is_empty() && mods.iter().all(|m| missing(m)),
-            _ => false,
-        }
-    });
-    forge_style("neoforge:conditions") || forge_style("conditions") || fabric
+    let neoforge_fails = |key: &str| conditions(key).into_iter().any(|c| overlays::neoforge_condition(c, mod_ids) == Some(false));
+    let fabric_fails = conditions("fabric:load_conditions").into_iter().any(|c| overlays::fabric_condition(c, mod_ids) == Some(false));
+    neoforge_fails("neoforge:conditions") || neoforge_fails("conditions") || fabric_fails
 }
 
 fn is_unknown_id_warning(diagnostic: &json_parser::Diagnostic) -> bool {
@@ -577,6 +635,14 @@ fn seed_condition_registries(registries: &mut RegistryIndex, tables: &SymbolTabl
         registries.insert_entries(registry, ids);
     }
     registries.finalize();
+}
+
+fn dump_postdates_mod_changes(root: &Path) -> bool {
+    let modified = |path: PathBuf| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    let Some(dumped) = [".proberaven/dump.json", "proberaven/dump.json"].iter().find_map(|rel| modified(root.join(rel))) else {
+        return false;
+    };
+    [root.join(LOCKFILE), root.join("mods")].into_iter().filter_map(modified).all(|changed| changed <= dumped)
 }
 
 fn fingerprint_pack(root: &Path) -> String {
@@ -609,7 +675,7 @@ mod tests {
         let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: Some("21.1.265".into()) };
         let mut registries = registries;
         seed_condition_registries(&mut registries, &tables, &version);
-        DatapackIndex { tables, registries, version, path_rules: Vec::new(), ignored_loaders: Vec::new() }
+        DatapackIndex { tables, registries, version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None }
     }
 
     #[test]
@@ -634,7 +700,7 @@ mod tests {
             parser::parse_and_bind(fetch::PACKRAVEN_MCDOC, "::packraven", &mut tables).unwrap();
             parser::parse_and_bind(r#"dispatch minecraft:resource["recipe"] to struct { result: string }"#, "::test", &mut tables).unwrap();
             let version = VersionContext { minecraft: Some(minecraft.into()), neoforge: None };
-            DatapackIndex { tables, registries: RegistryIndex::default(), version, path_rules: Vec::new(), ignored_loaders: Vec::new() }
+            DatapackIndex { tables, registries: RegistryIndex::default(), version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None }
         };
         let single = r#"{"fabric:load_conditions": {"condition": "fabric:all_mods_loaded", "values": ["create"]}, "result": "x"}"#;
         let list = r#"{"fabric:load_conditions": [{"condition": "fabric:all_mods_loaded", "values": ["create"]}], "result": "x"}"#;
@@ -664,7 +730,7 @@ mod tests {
         let mut registries = RegistryIndex { code_source: CodeRegistrySource::ProbeRaven, ..Default::default() };
         registries.mod_ids.insert("create".into());
         seed_condition_registries(&mut registries, &tables, &version);
-        let index = DatapackIndex { tables, registries, version, path_rules: Vec::new(), ignored_loaders: Vec::new() };
+        let index = DatapackIndex { tables, registries, version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None };
         let path = "data/x/recipe/a.json";
 
         let absent = r#"{"neoforge:conditions": [{"type": "neoforge:mod_loaded", "modid": "malum"}], "result": "malum:spirit"}"#;
@@ -673,6 +739,91 @@ mod tests {
         assert!(index.lint(path, fabric_absent).is_empty(), "{:?}", index.lint(path, fabric_absent));
         let present = r#"{"neoforge:conditions": [{"type": "neoforge:mod_loaded", "modid": "create"}], "result": "create:nothing"}"#;
         assert_eq!(index.lint(path, present).len(), 1);
+    }
+
+    #[test]
+    fn trusts_the_dumped_mod_list_only_after_the_last_mod_change() {
+        let root = std::env::temp_dir().join(format!("packraven-dump-age-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("mods")).unwrap();
+        std::fs::create_dir_all(root.join(".proberaven")).unwrap();
+        let now = std::time::SystemTime::now();
+        let at = |rel: &str, offset_secs: i64| {
+            let shift = std::time::Duration::from_secs(offset_secs.unsigned_abs());
+            let time = if offset_secs < 0 { now - shift } else { now + shift };
+            let path = root.join(rel);
+            if !path.exists() {
+                std::fs::write(&path, "{}").unwrap();
+            }
+            std::fs::File::options().write(true).open(&path).unwrap().set_modified(time).unwrap();
+        };
+        assert!(!dump_postdates_mod_changes(&root), "no dump yet");
+        at(LOCKFILE, -100);
+        at(".proberaven/dump.json", -50);
+        assert!(!dump_postdates_mod_changes(&root), "the mods folder changed after the dump");
+        at(".proberaven/dump.json", 100);
+        assert!(dump_postdates_mod_changes(&root));
+        at(LOCKFILE, 200);
+        assert!(!dump_postdates_mod_changes(&root), "the lockfile changed after the dump");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn notes_files_an_overlay_replaces_instead_of_checking_them() {
+        struct Jar;
+        impl overlays::PackFiles for Jar {
+            fn read(&self, relative: &str) -> Option<String> {
+                (relative == "mods/geo.jar/pack.mcmeta")
+                    .then(|| r#"{"overlays": {"entries": [{"formats": [41, 512], "min_format": 41, "max_format": 512, "directory": "f41data"}]}}"#.into())
+            }
+            fn exists(&self, relative: &str) -> bool {
+                relative == "mods/geo.jar/f41data/data/x/recipe/a.json"
+            }
+        }
+        let mut tables = SymbolTables::default();
+        parser::parse_and_bind(r#"dispatch minecraft:resource["recipe"] to struct { result: string }"#, "::test", &mut tables).unwrap();
+        let index = DatapackIndex {
+            tables,
+            registries: RegistryIndex::default(),
+            version: VersionContext { minecraft: Some("1.21.1".into()), neoforge: None },
+            path_rules: Vec::new(),
+            ignored_loaders: Vec::new(),
+            foreign_loader_folders: &[],
+            data_pack_format: Some(overlays::PackFormat { major: 48, minor: 0 }),
+        };
+        let broken = r#"{"result": 1}"#;
+        let base = index.lint_in_pack("mods/geo.jar/data/x/recipe/a.json", broken, &Jar);
+        assert_eq!(base.len(), 1);
+        assert_eq!(base[0].severity, "info");
+        assert_eq!(base[0].message, "Minecraft 1.21.1 loads the copy in this pack's f41data overlay instead, so we don't check this file.");
+        let overlay = index.lint_in_pack("mods/geo.jar/f41data/data/x/recipe/a.json", broken, &Jar);
+        assert_eq!(overlay.len(), 1);
+        assert_eq!(overlay[0].severity, "error");
+    }
+
+    #[test]
+    fn leaves_conditions_for_other_loaders_unchecked() {
+        let mut tables = SymbolTables::default();
+        parser::parse_and_bind(fetch::PACKRAVEN_MCDOC, "::packraven", &mut tables).unwrap();
+        parser::parse_and_bind(r#"dispatch minecraft:resource["recipe"] to struct { result: string }"#, "::test", &mut tables).unwrap();
+        let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: None };
+        let mut registries = RegistryIndex::default();
+        seed_condition_registries(&mut registries, &tables, &version);
+        let index = |ignored_loaders: Vec<&'static str>| DatapackIndex {
+            tables: tables.clone(),
+            registries: registries.clone(),
+            version: version.clone(),
+            path_rules: Vec::new(),
+            ignored_loaders,
+            foreign_loader_folders: &[],
+            data_pack_format: None,
+        };
+        // lne_wizards ships this in its Fabric jar for its NeoForge build.
+        let text = r#"{"neoforge:conditions": [{"type": "neoforge:and", "conditions": [{"type": "neoforge:mod_loaded", "modid": "a"}]}], "result": "x"}"#;
+        let path = "data/x/recipe/a.json";
+        assert!(!index(Vec::new()).lint(path, text).is_empty(), "the test needs a value we'd otherwise flag");
+        let fabric = index(vec!["forge", "neoforge"]).lint(path, text);
+        assert!(fabric.is_empty(), "{fabric:?}");
     }
 
     #[test]
@@ -693,6 +844,8 @@ dispatch minecraft:resource["worldgen/noise"] to struct { name: string }
             version: VersionContext { minecraft: Some(minecraft.into()), neoforge: None },
             path_rules: Vec::new(),
             ignored_loaders: Vec::new(),
+            foreign_loader_folders: &[],
+            data_pack_format: None,
         };
         let text = r#"{"name": true}"#;
         assert!(index("1.20.1").lint("data/x/loot_tables/a.json", text).is_empty());
@@ -748,6 +901,27 @@ dispatch minecraft:resource["worldgen/noise"] to struct { name: string }
         assert_eq!(unloaded_folder_message("data/x/recipe/a.json", "26.1.2"), None);
         assert_eq!(unloaded_folder_message("data/x/recipes/a.json", "1.20.1"), None);
         assert_eq!(unloaded_folder_message("data/x/tags/worldgen/biome/a.json", "1.21.1"), None);
+    }
+
+    #[test]
+    fn skips_data_for_loaders_the_pack_doesnt_run() {
+        let fabric = foreign_loader_folders(Some(&ModLoader::Fabric("0.16.0")));
+        assert_eq!(
+            foreign_loader_folder_message("data/ecologics/neoforge/biome_modifier/a.json", fabric).as_deref(),
+            Some("Only NeoForge loads files in neoforge/, so we don't check this file.")
+        );
+        assert_eq!(
+            foreign_loader_folder_message("data/x/forge/biome_modifier/a.json", fabric).as_deref(),
+            Some("Only Forge loads files in forge/, so we don't check this file.")
+        );
+        assert_eq!(foreign_loader_folder_message("data/x/recipe/a.json", fabric), None);
+        // A namespace named after a loader is ordinary data.
+        assert_eq!(foreign_loader_folder_message("data/neoforge/tags/item/a.json", fabric), None);
+        let forge = foreign_loader_folders(Some(&ModLoader::Forge("47.4.0")));
+        assert!(foreign_loader_folder_message("data/x/neoforge/biome_modifier/a.json", forge).is_some());
+        assert_eq!(foreign_loader_folder_message("data/x/forge/biome_modifier/a.json", forge), None);
+        let neoforge = foreign_loader_folders(Some(&ModLoader::NeoForge("47.1.106")));
+        assert_eq!(foreign_loader_folder_message("data/x/forge/biome_modifier/a.json", neoforge), None);
     }
 
     #[test]

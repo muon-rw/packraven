@@ -816,7 +816,7 @@
   </div>
 
   {#if !stacked}
-    <Splitter value={sideWidth} min={SIDE_MIN} max={sideMax} total={splitTotal} label="Resize the changes list" controls="git-side" onresize={(px) => sideSplit.set(px)} onreset={() => sideSplit.reset()} />
+    <Splitter value={sideWidth} min={SIDE_MIN} max={sideMax} label="Resize the changes list" controls="git-side" onresize={(px) => sideSplit.set(px)} onreset={() => sideSplit.reset()} />
   {/if}
 
   <section class="diff" aria-label="Diff">

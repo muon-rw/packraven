@@ -105,6 +105,26 @@ pub fn ensure_gitignored(pack_dir: &Path) -> bool {
     std::fs::write(&gitignore, updated).is_ok()
 }
 
+/// ProbeRaven exits partway through creating the world, and the next server to start in the same
+/// directory fails on what it left ("Overworld settings missing"), so each dump starts fresh.
+pub fn clear_last_dump_world(server_dir: &Path) -> Result<()> {
+    let world = server_dir.join(level_name(server_dir));
+    if world.exists() {
+        std::fs::remove_dir_all(&world).with_context(|| format!("clearing the last dump's world at {}", world.display()))?;
+    }
+    Ok(())
+}
+
+fn level_name(server_dir: &Path) -> String {
+    std::fs::read_to_string(server_dir.join("server.properties"))
+        .ok()
+        .and_then(|text| text.lines().find_map(|line| line.trim().strip_prefix("level-name=").map(|name| name.trim().to_string())))
+        .filter(|name| !name.is_empty() && !name.contains("..") && !name.contains(['/', '\\']))
+        .unwrap_or_else(|| "world".into())
+}
+
+const STOPPED: &str = "Stopped the registry dump.";
+
 /// Stages a throwaway server directory with ProbeRaven injected, runs a headless dump that halts
 /// before world load, validates the output JSON, and invalidates `datapack_cache`.
 #[allow(clippy::too_many_arguments)]
@@ -117,6 +137,7 @@ pub async fn run_headless_dump(
     pack_data: PathBuf,
     run_args: RunArgs,
     datapack_cache: Arc<DatapackCache>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
     log: Log,
 ) -> Result<String> {
     let mc = pack.lock.minecraft()?.to_string();
@@ -127,12 +148,16 @@ pub async fn run_headless_dump(
 
     let version = pack.version().unwrap_or_else(|| "dev".into());
     log.info(format!("Preparing headless registry dump for Minecraft {mc} ({loader_label})"));
-    let mut plan = export::test_server_plan(&pack, &sides, &version, &java, &data_dir, &log).await?;
+    let mut plan = tokio::select! {
+        plan = export::test_server_plan(&pack, &sides, &version, &java, &data_dir, &log) => plan?,
+        Ok(()) = &mut stop => bail!(STOPPED),
+    };
     plan.insert(format!("mods/{jar_name}"), Planned::Copy(jar_path));
 
     let probe_dir = pack_data.join("proberaven-probe");
     let report = testrun::sync_server_dir(plan, &pack, &probe_dir, false, &log)?;
     log.info(report.to_string());
+    clear_last_dump_world(&probe_dir)?;
 
     if ensure_gitignored(&pack.dir) {
         log.info("Added .proberaven/ to .gitignore");
@@ -164,6 +189,11 @@ pub async fn run_headless_dump(
     let mut child = spawn_watched(command, &log, false, Some(hook))?;
     let status = tokio::select! {
         res = child.wait() => res.context("waiting for headless ProbeRaven process")?,
+        Ok(()) = &mut stop => {
+            let _ = child.kill().await;
+            let _ = std::fs::remove_file(&staged_output);
+            bail!(STOPPED);
+        }
         _ = startup_failed.notified() => {
             // Give the server a moment to flush the crash stack trace and exit on its own;
             // mods with non-daemon worker threads otherwise keep the JVM alive indefinitely.
@@ -172,7 +202,7 @@ pub async fn run_headless_dump(
                 Err(_) => {
                     let _ = child.kill().await;
                     let _ = std::fs::remove_file(&staged_output);
-                    bail!("Headless registry dump failed: the dedicated server crashed during startup (see log above).");
+                    bail!("Headless registry dump failed: the dedicated server crashed during startup. Check the dump log for the cause.");
                 }
             }
         }

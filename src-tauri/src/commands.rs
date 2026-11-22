@@ -39,6 +39,7 @@ pub struct AppState {
     pub minecraft_sign_in: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     pub probejs: Arc<crate::probejs::ProbeCache>,
     pub datapack: Arc<crate::mcdoc::DatapackCache>,
+    pub datapack_probe_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl AppState {
@@ -956,10 +957,20 @@ pub fn datapack_probe(app: AppHandle, state: State<'_, AppState>) -> CmdResult<(
     let run_args = settings.combined_run_args(&settings.instance_dir);
     let datapack_cache = state.datapack.clone();
     let job_app = app.clone();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     state.jobs.start(&app, "datapack-probe", move |log| async move {
         let sides = classify_cached(&cache_path, &pack).await?;
-        crate::mcdoc::proberaven::run_headless_dump(job_app, pack, sides, java, data_dir, pack_data, run_args, datapack_cache, log).await
-    })
+        crate::mcdoc::proberaven::run_headless_dump(job_app, pack, sides, java, data_dir, pack_data, run_args, datapack_cache, stop_rx, log).await
+    })?;
+    *state.datapack_probe_stop.lock().unwrap() = Some(stop_tx);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn datapack_probe_stop(state: State<'_, AppState>) {
+    if let Some(stop) = state.datapack_probe_stop.lock().unwrap().take() {
+        let _ = stop.send(());
+    }
 }
 
 fn already_running(slot: Slot) -> &'static str {

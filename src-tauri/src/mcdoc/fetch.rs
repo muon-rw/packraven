@@ -362,6 +362,18 @@ pub async fn load_partner_mcdoc(name: &str, force: bool) -> Result<String> {
     load_cached(&path, &url, force, |bytes| parse_mcdoc_bytes(bytes, name)).await
 }
 
+/// Fixes fields that misode's partner schemas get wrong for the loader's own codecs. NeoForge reads
+/// `steps` with `optionalFieldOf` (defaulting to every step) on both removal modifiers, and names the
+/// carver field `steps`, not `step`.
+pub fn patch_partner_mcdoc(name: &str, src: String) -> String {
+    match name {
+        "neoforge" => src
+            .replace("steps: (DecorationStep | [DecorationStep])", "steps?: (DecorationStep | [DecorationStep])")
+            .replace("step: (CarveStep | [CarveStep])", "steps?: (CarveStep | [CarveStep])"),
+        _ => src,
+    }
+}
+
 /// Bridges partner recipe dispatchers (e.g. `create:recipes`, `ars_nouveau:recipes`) into
 /// `minecraft:recipe_serializer` so vanilla `data/<ns>/recipe/*.json` files validate modded recipes,
 /// and widens vanilla/Create ingredient types to accept custom loader ingredients (`forge:nbt`, `neoforge:components`, etc.).
@@ -380,8 +392,15 @@ pub fn bridge_partner_dispatchers(tables: &mut SymbolTables, extra_bridges: &[St
         }
     }
 
-    // Allow Forge/NeoForge (`{ "type": ... }`) and Fabric (`{ "fabric:type": ... }`) custom ingredients inside vanilla and Create recipes.
-    let make_custom_ingredient = |key_name: &str, desc: &str, loaders: &str| super::types::McdocType::Struct {
+    // Allow Forge/NeoForge and Fabric (`{ "fabric:type": ... }`) custom ingredients inside vanilla and Create recipes.
+    let version_attr = |name: &str, version: &str| super::types::Attribute {
+        name: name.into(),
+        value: Some(super::types::AttributeValue::Type(super::types::McdocType::Literal {
+            value: super::types::LiteralValue::String { value: version.into() },
+            attributes: Vec::new(),
+        })),
+    };
+    let make_custom_ingredient = |key_name: &str, desc: &str, loaders: &str, versions: Vec<super::types::Attribute>| super::types::McdocType::Struct {
         fields: vec![
             super::types::StructField::Pair {
                 key: super::types::StructKey::Literal(key_name.into()),
@@ -403,10 +422,16 @@ pub fn bridge_partner_dispatchers(tables: &mut SymbolTables, extra_bridges: &[St
                 attributes: Vec::new(),
             },
         ],
-        attributes: Vec::new(),
+        attributes: versions,
     };
-    let custom_forge = make_custom_ingredient("type", "Custom Forge/NeoForge ingredient serializer ID.", "forge,neoforge");
-    let custom_fabric = make_custom_ingredient("fabric:type", "Custom Fabric ingredient serializer ID.", "fabric");
+    // NeoForge 1.21.1 reads custom ingredients with `dispatchMapOrElse`'s default `type` key, and from
+    // 1.21.2 on with `neoforge:ingredient_type`, which Forge never adopted.
+    let custom_ingredients = [
+        make_custom_ingredient("type", "Custom Forge ingredient serializer ID.", "forge", Vec::new()),
+        make_custom_ingredient("type", "Custom NeoForge ingredient serializer ID.", "neoforge", vec![version_attr("until", "1.21.2")]),
+        make_custom_ingredient("neoforge:ingredient_type", "Custom NeoForge ingredient serializer ID.", "neoforge", vec![version_attr("since", "1.21.2")]),
+        make_custom_ingredient("fabric:type", "Custom Fabric ingredient serializer ID.", "fabric", Vec::new()),
+    ];
     for symbol in [
         "::java::data::recipe::Ingredient",
         "::java::data::recipe::IngredientValue",
@@ -415,14 +440,11 @@ pub fn bridge_partner_dispatchers(tables: &mut SymbolTables, extra_bridges: &[St
     ] {
         if let Some(existing) = tables.mcdoc.get_mut(symbol) {
             match existing {
-                super::types::McdocType::Union { members, .. } => {
-                    members.push(custom_forge.clone());
-                    members.push(custom_fabric.clone());
-                }
+                super::types::McdocType::Union { members, .. } => members.extend(custom_ingredients.iter().cloned()),
                 other => {
                     let prev = std::mem::replace(other, super::types::McdocType::Any { attributes: Vec::new() });
                     *other = super::types::McdocType::Union {
-                        members: vec![prev, custom_forge.clone(), custom_fabric.clone()],
+                        members: std::iter::once(prev).chain(custom_ingredients.iter().cloned()).collect(),
                         attributes: Vec::new(),
                     };
                 }
@@ -468,6 +490,21 @@ pub async fn load_vanilla_symbols(force: bool) -> Result<SymbolTables> {
     let path = cache_dir().join("vanilla-mcdoc-symbols.json");
     load_cached(&path, VANILLA_MCDOC_SYMBOLS_URL, force, |bytes| {
         serde_json::from_slice(bytes).context("parsing vanilla-mcdoc symbols.json")
+    })
+    .await
+}
+
+/// Loads the data pack format (`data_pack_version`, plus `data_pack_version_minor` from 1.21.9) that
+/// `mc_version` reports in its `version.json`, from persistent local storage.
+pub async fn load_mcmeta_data_pack_format(mc_version: &str, force: bool) -> Result<super::overlays::PackFormat> {
+    let safe_ver = sanitize_version(mc_version);
+    let path = cache_dir().join("mcmeta").join(&safe_ver).join("version.json");
+    let url = format!("https://raw.githubusercontent.com/misode/mcmeta/{mc_version}-summary/version.json");
+    load_cached(&path, &url, force, |bytes| {
+        let version: serde_json::Value = serde_json::from_slice(bytes).with_context(|| format!("parsing mcmeta version.json for {mc_version}"))?;
+        let number = |key: &str| version.get(key).and_then(serde_json::Value::as_u64).and_then(|n| u32::try_from(n).ok());
+        let major = number("data_pack_version").with_context(|| format!("mcmeta version.json for {mc_version} has no data_pack_version"))?;
+        Ok(super::overlays::PackFormat { major, minor: number("data_pack_version_minor").unwrap_or(0) })
     })
     .await
 }
@@ -579,6 +616,17 @@ fn sanitize_version(version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn makes_neoforge_removal_steps_optional() {
+        // Excerpts from misode's `neoforge.mcdoc`.
+        let src = "struct RemoveFeatures {\n\tsteps: (DecorationStep | [DecorationStep]),\n}\nstruct AddCarvers {\n\t#[until=\"1.21.2\"]\n\tstep: CarveStep,\n}\nstruct RemoveCarvers {\n\t#[until=\"1.21.2\"]\n\tstep: (CarveStep | [CarveStep]),\n}\n";
+        let patched = patch_partner_mcdoc("neoforge", src.into());
+        assert!(patched.contains("\tsteps?: (DecorationStep | [DecorationStep]),"));
+        assert!(patched.contains("\tstep: CarveStep,"), "add_carvers keeps its required single step");
+        assert!(patched.contains("\t#[until=\"1.21.2\"]\n\tsteps?: (CarveStep | [CarveStep]),"));
+        assert_eq!(patch_partner_mcdoc("create", src.into()), src);
+    }
 
     #[test]
     fn parses_mcmeta_block_state_summary() {

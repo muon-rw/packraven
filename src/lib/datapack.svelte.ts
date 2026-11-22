@@ -137,7 +137,7 @@ function completionSource(path: string) {
     const suffix = Math.max(0, (res.replaceTo ?? res.to) - res.to)
     const options: Completion[] = res.items.map((item) => {
       const insert = item.insertText ?? item.label
-      const customApply = suffix > 0 || item.cursorOffset != null || item.consumeClosingQuote || item.retrigger
+      const customApply = suffix > 0 || item.cursorOffset != null || !!item.selectLen || item.consumeClosingQuote || item.retrigger
       return {
         label: item.label,
         type: item.kind,
@@ -151,7 +151,8 @@ function completionSource(path: string) {
               const anchor = from + (item.cursorOffset ?? insert.length)
               view.dispatch({
                 changes: { from, to: end, insert },
-                selection: { anchor },
+                // A selected placeholder (like `0.0`) lets you type over it.
+                selection: { anchor: anchor - (item.selectLen ?? 0), head: anchor },
               })
               if (item.retrigger) queueMicrotask(() => startCompletion(view))
             }

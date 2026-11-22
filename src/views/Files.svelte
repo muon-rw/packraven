@@ -33,6 +33,7 @@
   import ContextMenu from '../components/ContextMenu.svelte'
   import type { MenuItem } from '../lib/menu'
   import Notice from '../components/Notice.svelte'
+  import RegistryDumpPanel from '../components/RegistryDumpPanel.svelte'
   import PackOverrideDialog, { type OverrideItem } from '../components/PackOverrideDialog.svelte'
   import Splitter from '../components/Splitter.svelte'
   import { StoredSplit, clamp } from '../lib/storedSplit.svelte'
@@ -394,6 +395,12 @@
   })
 
   useBack(BACK_PRIORITY.detail, () => {
+    if (!inFocusedPane() || !dumpLogOpen) return false
+    hideDumpLog()
+    return true
+  })
+
+  useBack(BACK_PRIORITY.detail, () => {
     if (!inFocusedPane() || !toolbarNote) return false
     toolbarNote = null
     return true
@@ -720,6 +727,7 @@
   const PREVIEW_DELAY_MS = 200
 
   let editorWidth = $state(0)
+  let editorHeight = $state(0)
   let filesWidth = $state(0)
   const TREE_GAP = 20
   const TREE_MIN = 160
@@ -906,7 +914,10 @@
   })
 
   let probingRegistries = $derived(job('datapack-probe').phase === 'running')
+  let dumpLogOpen = $state(false)
+  let dumpStopped = $state(false)
 
+  // The panel shows how a run ended, so we only add a toolbar note when you've hidden it.
   onJobEnd('datapack-probe', async (phase) => {
     const path = current?.path
     if (phase === 'done') {
@@ -914,20 +925,46 @@
       if (path && current?.path === path) {
         if (ok && view) checkNow()
         const msg = job('datapack-probe').message ?? `Updated modded registries (${datapackSourceLabel(datapack.codeSource)}).`
-        showToolbarNote(path, msg, { warn: false, lingers: false })
+        if (!dumpLogOpen) showToolbarNote(path, msg, { warn: false, lingers: false })
       }
-    } else if (phase === 'failed' && path) {
-      const msg = job('datapack-probe').message ?? "Couldn't dump pack registries."
-      showToolbarNote(path, msg, { warn: true, lingers: true })
+    } else if (phase === 'failed' && !dumpStopped) {
+      dumpLogOpen = true
+    } else if (path && !dumpLogOpen) {
+      showToolbarNote(path, 'Stopped the registry dump.', { warn: false, lingers: false })
     }
   })
+
+  // Hiding the panel would drop keyboard focus to the page, so we hand it to the toolbar toggle.
+  function hideDumpLog() {
+    const focusWasInPanel = !!document.getElementById('registry-dump')?.contains(document.activeElement)
+    dumpLogOpen = false
+    if (!focusWasInPanel) return
+    tick().then(() => {
+      const toggle = document.querySelector<HTMLElement>('button[aria-controls="registry-dump"]')
+      if (toggle) toggle.focus({ preventScroll: true })
+      else view?.focus()
+    })
+  }
+
+  async function stopDatapackProbe() {
+    dumpStopped = true
+    try {
+      await api.datapackProbeStop()
+    } catch (e) {
+      dumpStopped = false
+      if (current) showToolbarNote(current.path, errorText(e), { warn: true, lingers: true })
+    }
+  }
 
   async function runDatapackProbe() {
     const path = current?.path
     if (!path || probingRegistries) return
     try {
       await api.datapackProbe()
-      showToolbarNote(path, 'Dumping pack registries in the background…', { warn: false, lingers: false })
+      dumpStopped = false
+      toolbarNote = null
+      overrideNote = null
+      dumpLogOpen = true
     } catch (e) {
       showToolbarNote(path, errorText(e), { warn: true, lingers: true })
     }
@@ -1013,9 +1050,9 @@
     <FileTree bind:this={tree} hidden={searching || textSearch.open} selected={workspace.active} {status} {selection} onopen={openFile} ondelete={remove} onremoved={closeRemoved} ongitchange={loadChanges} onoverride={(items) => (overriding = items)} />
   </aside>
 
-  <Splitter value={browserWidth} min={TREE_MIN} max={textSearch.open ? searchMax : treeMax} total={splitTotal} label="Resize the file browser" controls="file-browser" onresize={(px) => treeSplit.set(px)} onreset={() => treeSplit.reset()} />
+  <Splitter value={browserWidth} min={TREE_MIN} max={textSearch.open ? searchMax : treeMax} label="Resize the file browser" controls="file-browser" onresize={(px) => treeSplit.set(px)} onreset={() => treeSplit.reset()} />
 
-  <section class="editor" bind:clientWidth={editorWidth}>
+  <section class="editor" bind:clientWidth={editorWidth} bind:clientHeight={editorHeight}>
     {#if workspace.tabs.length}
       <div class="tabs" role="tablist" aria-label="Open files" tabindex="-1" onwheel={scrollTabs} oncontextmenu={(e) => onTabContextMenu(e, null)}>
         {#each workspace.tabs as tab, index (tab.path)}
@@ -1078,15 +1115,31 @@
               onclick={reloadDatapack}
             >{datapackControl.label}</button>
             {#if datapack.probeAvailable}
-              <button
-                class="ghost action"
-                aria-busy={probingRegistries}
-                aria-disabled={probingRegistries}
-                title={probingRegistries
-                  ? 'Running a headless server to dump all modded registries, tags, and block states.'
-                  : 'Launch a quick headless server once to extract all modded items, blocks, tags, and block states for this pack.'}
-                onclick={runDatapackProbe}
-              >{probingRegistries ? 'Dumping…' : 'Dump registries'}</button>
+              {#if probingRegistries}
+                <button
+                  class="ghost action"
+                  aria-busy="true"
+                  aria-expanded={dumpLogOpen}
+                  aria-controls="registry-dump"
+                  title="{dumpLogOpen ? 'Hide' : 'Show'} the registry dump's progress and server log"
+                  onclick={() => (dumpLogOpen ? hideDumpLog() : (dumpLogOpen = true))}
+                >Dumping…</button>
+              {:else}
+                <button
+                  class="ghost action"
+                  title="Launch a quick headless server once to extract all modded items, blocks, tags, and block states for this pack."
+                  onclick={runDatapackProbe}
+                >Dump registries</button>
+                {#if job('datapack-probe').phase !== 'idle' && !dumpLogOpen}
+                  <button
+                    class="ghost action muted"
+                    aria-expanded="false"
+                    aria-controls="registry-dump"
+                    title="Show the last registry dump's result and server log"
+                    onclick={() => (dumpLogOpen = true)}
+                  >Dump log</button>
+                {/if}
+              {/if}
             {/if}
           {/if}
           {#if current.state && current.large}
@@ -1126,6 +1179,10 @@
           <p class="toolbar-note warn" aria-hidden="true">{blockedText}</p>
         {/if}
       </div>
+    {/if}
+
+    {#if dumpLogOpen}
+      <RegistryDumpPanel stopped={dumpStopped} maxHeight={Math.floor(editorHeight * 0.7)} onstop={stopDatapackProbe} onretry={runDatapackProbe} onclose={hideDumpLog} />
     {/if}
 
     {#if current?.conflict === 'changed'}

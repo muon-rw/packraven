@@ -16,6 +16,7 @@ import { forEachDiagnostic, lintKeymap } from '@codemirror/lint'
 import { lintFor } from './lint'
 import { probejsExtensions } from './probejs.svelte'
 import { datapackExtensions } from './datapack.svelte'
+import { splitter, type SplitterConfig } from './splitter'
 
 const highlight = HighlightStyle.define([
   { tag: [tags.keyword, tags.bool, tags.null, tags.atom], color: 'var(--forest)', fontWeight: '700' },
@@ -113,28 +114,6 @@ const theme = EditorView.theme({
     cursor: 'pointer',
   },
   '.cm-panel.cm-panel-lint [name=close]:hover': { color: 'var(--text)', backgroundColor: 'var(--control)' },
-  '.cm-lint-resize': {
-    position: 'relative',
-    height: '7px',
-    cursor: 'row-resize',
-    touchAction: 'none',
-    backgroundColor: 'var(--surface)',
-  },
-  '.cm-lint-resize::before': {
-    content: '""',
-    position: 'absolute',
-    left: '0',
-    right: '0',
-    top: '50%',
-    height: '1px',
-    transform: 'translateY(-50%)',
-    backgroundColor: 'var(--line)',
-    transition: 'background-color 0.12s ease, height 0.12s ease',
-  },
-  '.cm-lint-resize:hover::before': { backgroundColor: 'var(--edge)', height: '2px' },
-  '.cm-lint-resize:focus-visible': { outline: 'none' },
-  '.cm-lint-resize.dragging::before, .cm-lint-resize:focus-visible::before': { height: '2px', backgroundColor: 'var(--forest)' },
-  '@media (prefers-reduced-motion: reduce)': { '.cm-lint-resize::before': { transition: 'none' } },
   '.cm-tooltip-autocomplete': { backgroundColor: 'var(--surface)', color: 'var(--text)', border: '1px solid var(--line-strong)', borderRadius: 'var(--radius-control)', boxShadow: '0 6px 20px var(--shadow)' },
   '.cm-tooltip-autocomplete > ul': { fontFamily: 'var(--font-log)', fontSize: 'var(--step--1)', maxHeight: '16em' },
   '.cm-tooltip-autocomplete > ul > li': { padding: '3px 8px', display: 'flex', alignItems: 'center', gap: '8px' },
@@ -237,8 +216,6 @@ export interface EditorOptions {
 const LINT_HEIGHT_KEY = 'packraven.lintPanelHeight'
 const LINT_MIN_HEIGHT = 72
 const LINT_DEFAULT_HEIGHT = 140
-const LINT_STEP = 16
-const LINT_BIG_STEP = 64
 
 function readLintHeight(): number | null {
   try {
@@ -260,6 +237,7 @@ function lintPanelResize(): Extension {
   return ViewPlugin.fromClass(
     class {
       private observer: MutationObserver
+      private handle: { destroy(): void } | null = null
 
       constructor(private view: EditorView) {
         this.enhance()
@@ -267,95 +245,54 @@ function lintPanelResize(): Extension {
         this.observer.observe(view.dom, { childList: true, subtree: true })
       }
 
+      // CodeMirror builds the problems panel itself, so we add the handle once it appears.
       private enhance() {
         const panel = this.view.dom.querySelector<HTMLElement>('.cm-panel.cm-panel-lint')
-        if (!panel || panel.querySelector('.cm-lint-resize')) return
+        if (!panel || panel.querySelector('.splitter')) return
         const list = panel.querySelector<HTMLElement>('ul')
         if (!list) return
 
+        let height = readLintHeight()
         const maxHeight = () => Math.max(180, Math.floor(this.view.dom.clientHeight * 0.7))
-        const clampHeight = (px: number) => Math.min(Math.max(px, LINT_MIN_HEIGHT), maxHeight())
-
-        const handle = document.createElement('div')
-        handle.className = 'cm-lint-resize'
-        handle.setAttribute('role', 'separator')
-        handle.setAttribute('tabindex', '0')
-        handle.setAttribute('aria-orientation', 'horizontal')
-        handle.setAttribute('aria-label', 'Resize the problems panel')
-        handle.title = 'Drag to resize. Double-click to reset.'
-
-        const syncAria = (px: number) => {
-          const max = maxHeight()
-          handle.setAttribute('aria-valuemin', String(LINT_MIN_HEIGHT))
-          handle.setAttribute('aria-valuemax', String(max))
-          handle.setAttribute('aria-valuenow', String(Math.round(px)))
-        }
-
-        const apply = (px: number | null) => {
-          if (px === null) {
-            list.style.height = ''
-            list.style.maxHeight = `${LINT_DEFAULT_HEIGHT}px`
-            syncAria(list.getBoundingClientRect().height || LINT_DEFAULT_HEIGHT)
-          } else {
-            const clamped = clampHeight(px)
-            list.style.height = `${clamped}px`
-            list.style.maxHeight = 'none'
-            syncAria(clamped)
-          }
+        const current = () => height ?? (list.getBoundingClientRect().height || LINT_DEFAULT_HEIGHT)
+        const apply = () => {
+          list.style.height = height === null ? '' : `${height}px`
+          list.style.maxHeight = height === null ? `${LINT_DEFAULT_HEIGHT}px` : 'none'
           this.view.requestMeasure()
+          control.update(config)
         }
 
-        let drag: { y: number; height: number } | null = null
-
-        handle.addEventListener('pointerdown', (event) => {
-          if (event.button !== 0) return
-          event.preventDefault()
-          handle.setPointerCapture(event.pointerId)
-          handle.classList.add('dragging')
-          drag = { y: event.clientY, height: list.getBoundingClientRect().height || LINT_DEFAULT_HEIGHT }
-        })
-
-        handle.addEventListener('pointermove', (event) => {
-          if (!drag) return
-          const next = clampHeight(drag.height + (drag.y - event.clientY))
-          apply(next)
-          saveLintHeight(next)
-        })
-
-        const endDrag = () => {
-          if (!drag) return
-          drag = null
-          handle.classList.remove('dragging')
+        const element = document.createElement('div')
+        element.classList.add('ruled')
+        const config: SplitterConfig = {
+          orientation: 'horizontal',
+          after: true,
+          label: 'Resize the problems panel',
+          value: current,
+          min: () => LINT_MIN_HEIGHT,
+          max: maxHeight,
+          onresize: (px) => {
+            height = px
+            saveLintHeight(px)
+            apply()
+          },
+          onreset: () => {
+            height = null
+            saveLintHeight(null)
+            apply()
+          },
         }
-        handle.addEventListener('pointerup', endDrag)
-        handle.addEventListener('pointercancel', endDrag)
-
-        handle.addEventListener('dblclick', () => {
-          saveLintHeight(null)
-          apply(null)
-        })
-
-        handle.addEventListener('keydown', (event) => {
-          const step = event.shiftKey ? LINT_BIG_STEP : LINT_STEP
-          const current = list.getBoundingClientRect().height || LINT_DEFAULT_HEIGHT
-          let next: number | null | undefined
-          if (event.key === 'ArrowUp') next = clampHeight(current + step)
-          else if (event.key === 'ArrowDown') next = clampHeight(current - step)
-          else if (event.key === 'Home') next = LINT_MIN_HEIGHT
-          else if (event.key === 'End') next = maxHeight()
-          else if (event.key === 'Enter') next = null
-          else return
-          event.preventDefault()
-          saveLintHeight(next)
-          apply(next)
-        })
-
-        panel.prepend(handle)
-        apply(readLintHeight())
+        const control = splitter(element, config)
+        this.handle?.destroy()
+        this.handle = control
+        panel.prepend(element)
+        if (height !== null) height = Math.min(Math.max(height, LINT_MIN_HEIGHT), maxHeight())
+        apply()
       }
 
       destroy() {
         this.observer.disconnect()
+        this.handle?.destroy()
       }
     },
   )

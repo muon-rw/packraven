@@ -84,7 +84,8 @@ pub struct RegistryIndex {
     pub entries: HashMap<String, Vec<String>>,
     /// Block ID (`ns:path`) -> property name -> allowed values.
     pub block_states: HashMap<String, BTreeMap<String, Vec<String>>>,
-    /// Installed mod IDs (from ProbeRaven dump or jar namespaces).
+    /// Installed mod IDs, from a ProbeRaven dump or the IDs in a mod jar's metadata. Data namespaces explicitly don't
+    /// count! Plenty of mods ship `data/create/` compat files without Create installed, for example.
     pub mod_ids: HashSet<String>,
     pub code_source: CodeRegistrySource,
     pub known: KnownRegistries,
@@ -247,7 +248,7 @@ impl RegistryIndex {
     }
 }
 
-/// Scans `mods/*.jar` in parallel for `data/<ns>/<category>/...json` entries and discovered mod namespaces.
+/// Scans `mods/*.jar` in parallel for `data/<ns>/<category>/...json` entries and the mod IDs the jars declare.
 pub fn scan_mod_jars_data(root: &Path, known: &KnownRegistries) -> (HashMap<String, Vec<String>>, HashSet<String>) {
     let jars: Vec<PathBuf> = std::fs::read_dir(root.join("mods"))
         .into_iter()
@@ -267,11 +268,11 @@ pub fn scan_mod_jars_data(root: &Path, known: &KnownRegistries) -> (HashMap<Stri
         for slice in jars.chunks(chunk_size) {
             handles.push(scope.spawn(move || {
                 let mut local: HashMap<String, Vec<String>> = HashMap::new();
-                let mut namespaces: HashSet<String> = HashSet::new();
+                let mut mod_ids: HashSet<String> = HashSet::new();
                 for jar_path in slice {
-                    scan_single_jar(jar_path, known, &mut local, Some(&mut namespaces));
+                    scan_single_jar(jar_path, known, &mut local, Some(&mut mod_ids));
                 }
-                (local, namespaces)
+                (local, mod_ids)
             }));
         }
         handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
@@ -324,24 +325,21 @@ pub fn scan_loader_jars_data(install_dir: &Path, lock: Option<&Lockfile>, known:
     out
 }
 
-fn scan_single_jar(path: &Path, known: &KnownRegistries, out: &mut HashMap<String, Vec<String>>, mut namespaces: Option<&mut HashSet<String>>) {
+fn scan_single_jar(path: &Path, known: &KnownRegistries, out: &mut HashMap<String, Vec<String>>, mut mod_ids: Option<&mut HashSet<String>>) {
     let Ok(file) = File::open(path) else { return };
     let Ok(mut zip) = ZipArchive::new(file) else { return };
-    if let Some(ns_set) = namespaces.as_deref_mut() {
-        ns_set.extend(crate::mod_manifest::declared_ids(&mut zip));
+    if let Some(ids) = mod_ids.as_deref_mut() {
+        ids.extend(crate::mod_manifest::declared_ids(&mut zip));
     }
+    let mut bundled = Vec::new();
     for i in 0..zip.len() {
         let Ok(entry) = zip.by_index_raw(i) else { continue };
         let Ok(name) = entry.name() else { continue };
-        if let Some(ns_set) = namespaces.as_deref_mut()
-            && let Some(rest) = name.strip_prefix("data/").or_else(|| name.strip_prefix("assets/"))
-            && let Some((ns, _)) = rest.split_once('/')
-            && !ns.is_empty()
-            && ns != "minecraft"
-            && ns != "c"
-            && ns != "forge"
-        {
-            ns_set.insert(ns.to_string());
+        // Fabric bundles mods in META-INF/jars/ and NeoForge in META-INF/jarjar/, and both load them
+        // as mods of their own (Fabric API's modules, for one).
+        if mod_ids.is_some() && (name.starts_with("META-INF/jars/") || name.starts_with("META-INF/jarjar/")) && name.ends_with(".jar") {
+            bundled.push(i);
+            continue;
         }
         // Data files like painting variants name textures that ship in the same jar's assets.
         if let Some(texture) = name.strip_prefix("assets/").and_then(|rest| {
@@ -357,6 +355,45 @@ fn scan_single_jar(path: &Path, known: &KnownRegistries, out: &mut HashMap<Strin
         if let Some((cat, id)) = parse_data_file_path(&name, known).or_else(|| parse_non_json_data_path(&name)) {
             out.entry(cat).or_default().push(id);
         }
+    }
+    if let Some(ids) = mod_ids {
+        for index in bundled {
+            ids.extend(bundled_mod_ids(&mut zip, index));
+        }
+    }
+}
+
+fn bundled_mod_ids<R: std::io::Read + std::io::Seek>(zip: &mut ZipArchive<R>, index: usize) -> Vec<String> {
+    let mut ids = Vec::new();
+    collect_bundled_mod_ids(zip, index, 1, &mut ids);
+    ids
+}
+
+// Fabric and NeoForge both load jars nested inside nested jars, so we follow them a few levels down.
+fn collect_bundled_mod_ids<R: std::io::Read + std::io::Seek>(zip: &mut ZipArchive<R>, index: usize, depth: u8, ids: &mut Vec<String>) {
+    const MAX_BUNDLED_JAR_BYTES: u64 = 64 * 1024 * 1024;
+    const MAX_DEPTH: u8 = 4;
+    let Ok(mut entry) = zip.by_index(index) else { return };
+    if entry.size() > MAX_BUNDLED_JAR_BYTES {
+        return;
+    }
+    let mut bytes = Vec::with_capacity(entry.size() as usize);
+    if std::io::Read::read_to_end(&mut entry, &mut bytes).is_err() {
+        return;
+    }
+    drop(entry);
+    let Ok(mut inner) = ZipArchive::new(std::io::Cursor::new(bytes)) else { return };
+    ids.extend(crate::mod_manifest::declared_ids(&mut inner));
+    if depth >= MAX_DEPTH {
+        return;
+    }
+    let nested: Vec<usize> = (0..inner.len())
+        .filter(|&i| {
+            inner.by_index_raw(i).ok().and_then(|e| e.name().ok().map(|n| (n.starts_with("META-INF/jars/") || n.starts_with("META-INF/jarjar/")) && n.ends_with(".jar"))).unwrap_or(false)
+        })
+        .collect();
+    for i in nested {
+        collect_bundled_mod_ids(&mut inner, i, depth + 1, ids);
     }
 }
 
@@ -761,21 +798,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("mods")).unwrap();
 
+        let jar = |id: &str, nested: Option<&[u8]>| {
+            let mut jar = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+            jar.start_file("fabric.mod.json", SimpleFileOptions::default()).unwrap();
+            std::io::Write::write_all(&mut jar, format!(r#"{{"id": "{id}"}}"#).as_bytes()).unwrap();
+            if let Some(nested) = nested {
+                jar.start_file("META-INF/jars/inner.jar", SimpleFileOptions::default()).unwrap();
+                std::io::Write::write_all(&mut jar, nested).unwrap();
+            }
+            jar.finish().unwrap().into_inner()
+        };
+        let bundled = jar("bundled_lib", Some(&jar("deeper_lib", None)));
+
         let jar_path = root.join("mods/example.jar");
         let mut zip = ZipWriter::new(File::create(&jar_path).unwrap());
-        for name in [
-            "data/create/recipe/brass_ingot.json",
-            "data/c/tags/item/ingots/brass.json",
-            "assets/create/models/item/brass_ingot.json",
+        for (name, body) in [
+            ("fabric.mod.json", br#"{"id": "example"}"#.as_slice()),
+            ("data/create/recipe/brass_ingot.json", b"{}"),
+            ("data/c/tags/item/ingots/brass.json", b"{}"),
+            ("assets/create/models/item/brass_ingot.json", b"{}"),
+            ("META-INF/jars/bundled_lib.jar", &bundled),
         ] {
             zip.start_file(name, SimpleFileOptions::default()).unwrap();
-            std::io::Write::write_all(&mut zip, b"{}").unwrap();
+            std::io::Write::write_all(&mut zip, body).unwrap();
         }
         zip.finish().unwrap();
 
         let mut index = RegistryIndex::default();
         let (jar_entries, jar_mods) = scan_mod_jars_data(&root, &KnownRegistries::default());
-        assert!(jar_mods.contains("create"));
+        assert!(["example", "bundled_lib", "deeper_lib"].iter().all(|id| jar_mods.contains(*id)), "{jar_mods:?}");
+        assert!(!jar_mods.contains("create"), "a jar's compat data for Create doesn't install Create");
         for (cat, ids) in jar_entries {
             index.insert_entries(&cat, ids);
         }

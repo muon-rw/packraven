@@ -44,16 +44,20 @@ pub struct CompletionResult {
     pub replace_to: Option<usize>,
     pub items: Vec<CompletionItem>,
     pub in_string: bool,
+    /// True when the string under the cursor is a key or a value with a fixed set of choices, even if
+    /// nothing matches what you've typed. The editor only opens completions on caret moves into such strings.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub slot_has_choices: bool,
 }
 
 impl CompletionResult {
     pub fn empty(utf16_offset: usize) -> Self {
-        Self { from: utf16_offset, to: utf16_offset, replace_to: None, items: Vec::new(), in_string: false }
+        Self { from: utf16_offset, to: utf16_offset, replace_to: None, items: Vec::new(), in_string: false, slot_has_choices: false }
     }
 
     fn new(text: &str, from: usize, to: usize, replace_to: usize, items: Vec<CompletionItem>, in_string: bool) -> Self {
         let replace_to = (replace_to > to).then(|| byte_to_utf16(text, replace_to));
-        Self { from: byte_to_utf16(text, from), to: byte_to_utf16(text, to), replace_to, items, in_string }
+        Self { from: byte_to_utf16(text, from), to: byte_to_utf16(text, to), replace_to, items, in_string, slot_has_choices: false }
     }
 }
 
@@ -122,13 +126,22 @@ pub fn complete(text: &str, utf16_offset: usize, check: &CheckOutput, env: &Chec
                         trailing_comma: needs_trailing_comma(text, after_key),
                     }
                 };
-                let items = complete_object_keys(parent_id, Some(target_id), check, env, typed, mode, opts);
-                return CompletionResult::new(text, s.map.content_start, pos, content_end, items, true);
+                let without_key = recheck_without_pair(text, check, parent_id, target_id, opts);
+                let items = match &without_key {
+                    Some((probe_check, probe_obj)) => complete_object_keys(*probe_obj, None, probe_check, env, typed, mode, opts),
+                    None => complete_object_keys(parent_id, Some(target_id), check, env, typed, mode, opts),
+                };
+                let mut result = CompletionResult::new(text, s.map.content_start, pos, content_end, items, true);
+                result.slot_has_choices = true;
+                return result;
             }
 
             if let Some(info) = check.attached.get(&target_id) {
                 let items = complete_values(&info.type_def, env, typed, true);
-                return CompletionResult::new(text, s.map.content_start, pos, content_end, items, true);
+                let slot_has_choices = !items.is_empty() || (!typed.is_empty() && !complete_values(&info.type_def, env, "", true).is_empty());
+                let mut result = CompletionResult::new(text, s.map.content_start, pos, content_end, items, true);
+                result.slot_has_choices = slot_has_choices;
+                return result;
             }
         }
     }
@@ -164,6 +177,30 @@ pub fn complete(text: &str, utf16_offset: usize, check: &CheckOutput, env: &Chec
     }
 
     empty
+}
+
+// The key you're still typing is already in the document, and the checker narrows unions by it: a
+// partial `"ite"` rules out `{ item }` but not a member with dynamic keys, so we'd only offer that
+// member's keys. We re-check without the pair to get the object's type from the other keys alone.
+fn recheck_without_pair(text: &str, check: &CheckOutput, obj_id: JsonId, key_id: JsonId, opts: &CompleteOptions<'_>) -> Option<(CheckOutput, JsonId)> {
+    let ArenaKind::Object(pairs) = &check.arena.get(obj_id).kind else { return None };
+    let &(_, value_id) = pairs.iter().find(|(kid, _)| *kid == key_id)?;
+    let key_span = check.arena.get(key_id).span;
+    let end = match value_id {
+        Some(v) => check.arena.get(v).span.end,
+        None if colon_follows_key(text, key_span.end) => key_span.end + text[key_span.end..].find(':')? + 1,
+        None => key_span.end,
+    };
+    let probe = format!("{}{}", &text[..key_span.start], &text[end.min(text.len())..]);
+    let probe_check = (opts.recheck)(&probe)?;
+    let obj_start = check.arena.get(obj_id).span.start;
+    let probe_obj = probe_check
+        .arena
+        .nodes
+        .iter()
+        .position(|n| n.span.start == obj_start && matches!(n.kind, ArenaKind::Object(_)))
+        .map(JsonId)?;
+    Some((probe_check, probe_obj))
 }
 
 /// Completes an unquoted value. We quote the typed word, re-check the document, and complete against
@@ -205,6 +242,19 @@ pub fn hover(text: &str, utf16_offset: usize, check: &CheckOutput, tables: &Symb
             .and_then(|i| i.desc.clone())
             .or_else(|| val_info.and_then(|i| i.desc.clone()))
             .unwrap_or_default();
+        let desc = match val_info.filter(|i| super::checker::has_crafting_keys(&i.type_def)) {
+            Some(_) => {
+                let symbols = super::checker::pattern_symbols(check);
+                let note = if symbols.is_empty() {
+                    "Keys are single characters from `pattern`.".to_string()
+                } else {
+                    let list: Vec<String> = symbols.iter().map(|c| format!("`{c}`")).collect();
+                    format!("Keys are single characters from `pattern`: {}.", list.join(", "))
+                };
+                if desc.is_empty() { note } else { format!("{desc}\n\n{note}") }
+            }
+            None => desc,
+        };
         let deprecated = key_info.is_some_and(|i| i.deprecated) || val_info.is_some_and(|i| i.deprecated);
         let key_label = match &node.kind {
             ArenaKind::String(s) => format!("\"{}\"", s.value),
@@ -603,7 +653,8 @@ fn complete_object_keys(
 
     let mut raw_fields: Vec<(bool, CompletionItem)> = Vec::new();
     let mut seen = HashSet::new();
-    let filter = KeyFilter { existing: &existing, ignored_loaders: opts.ignored_loaders };
+    let pattern_symbols = super::checker::pattern_symbols(check);
+    let filter = KeyFilter { existing: &existing, ignored_loaders: opts.ignored_loaders, pattern_symbols: &pattern_symbols };
     collect_struct_fields(&info.type_def, env, typed, mode, &filter, &mut seen, &mut raw_fields);
 
     let needle = typed.to_lowercase();
@@ -622,6 +673,7 @@ fn complete_object_keys(
 struct KeyFilter<'a> {
     existing: &'a HashSet<String>,
     ignored_loaders: &'a [&'a str],
+    pattern_symbols: &'a [char],
 }
 
 impl KeyFilter<'_> {
@@ -682,6 +734,29 @@ fn collect_struct_fields(
                                 retrigger: key.retrigger,
                             },
                         ));
+                    }
+                    StructKey::Dynamic(kty) if super::checker::crafting_role(kty) == Some(super::checker::CraftingRole::Reference) => {
+                        for symbol in filter.pattern_symbols.iter().map(char::to_string) {
+                            if filter.existing.contains(&symbol) || !seen.insert(symbol.clone()) {
+                                continue;
+                            }
+                            let key = format_key_insert(&symbol, field_type, env, mode);
+                            out.push((
+                                false,
+                                CompletionItem {
+                                    label: symbol.clone(),
+                                    kind: "property",
+                                    detail: Some(format!("used in pattern, {}", type_label(field_type, env.tables))),
+                                    signature: Some(format!("\"{symbol}\": {}", type_label(field_type, env.tables))),
+                                    docs: desc.clone(),
+                                    insert_text: key.insert_text,
+                                    cursor_offset: key.cursor_offset,
+                                    select_len: key.select_len,
+                                    consume_closing_quote: key.consume_closing_quote,
+                                    retrigger: key.retrigger,
+                                },
+                            ));
+                        }
                     }
                     StructKey::Dynamic(kty) => {
                         for item in complete_values(kty, env, typed, true) {
@@ -943,6 +1018,121 @@ mod tests {
     use crate::mcdoc::registries::RegistryIndex;
     use crate::mcdoc::types::SymbolTables;
     use crate::mcdoc::version::VersionContext;
+
+    #[test]
+    fn empty_ingredient_offers_keys_from_every_union_member() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+type Ingredient = (IngredientValue | [IngredientValue])
+type IngredientValue = (struct { item: #[id="item"] string } | struct { tag: #[id(registry="item",tags="implicit")] string })
+"#,
+            "::java::data::recipe",
+            &mut tables,
+        )
+        .unwrap();
+        parse_and_bind(
+            r#"
+use ::java::data::recipe::Ingredient
+dispatch minecraft:resource["recipe"] to struct { key: struct { [string]: Ingredient } }
+"#,
+            "::test",
+            &mut tables,
+        )
+        .unwrap();
+        crate::mcdoc::fetch::bridge_partner_dispatchers(&mut tables, &[]);
+        let regs = RegistryIndex::default();
+        let version = VersionContext { minecraft: Some("1.20.1".into()), neoforge: None };
+        let ignored: &[&str] = &["forge", "neoforge"];
+        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: ignored };
+        let root_type = resource_root_type("recipe", &tables).unwrap();
+        let recheck = |edited: &str| json_parser::parse(edited, false).root.map(|r| check_json_with_type(&r, &root_type, &env));
+        let opts = CompleteOptions { recheck: &recheck, ignored_loaders: ignored };
+
+        let labels_at = |src: &str, cursor: usize| -> Vec<String> {
+            let check = check_json_with_type(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env);
+            complete(src, cursor, &check, &env, &opts).items.into_iter().map(|i| i.label).collect()
+        };
+        let empty = "{\"key\": {\"#\": {\n  \n}}}";
+        let labels = labels_at(empty, empty.find("\n  ").unwrap() + 3);
+        for key in ["item", "tag", "fabric:type"] {
+            assert!(labels.iter().any(|l| l == key), "missing {key} in {labels:?}");
+        }
+        // The key you're typing is already in the document, and only the custom ingredient's dynamic
+        // keys accept it, so it must not narrow the union.
+        for src in ["{\"key\": {\"#\": {\"\"}}}", "{\"key\": {\"#\": {\"i\"}}}", "{\"key\": {\"#\": {\"i\": \"\"}}}"] {
+            let cursor = src.rfind("{\"").unwrap() + 2 + usize::from(src.contains("\"i\""));
+            let labels = labels_at(src, cursor);
+            assert!(labels.iter().any(|l| l == "item"), "missing item in {labels:?} for {src}");
+        }
+    }
+
+    #[test]
+    fn shaped_key_completes_and_checks_pattern_symbols() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+dispatch minecraft:resource["recipe"] to struct {
+	pattern: [#[crafting_ingredient(definition=true)] string @ 1..3] @ 1..3,
+	key: struct {
+		[#[crafting_ingredient] string]: struct { item: string },
+	},
+}
+"#,
+            "::test",
+            &mut tables,
+        )
+        .unwrap();
+        let regs = RegistryIndex::default();
+        let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: None };
+        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
+        let root_type = resource_root_type("recipe", &tables).unwrap();
+        let recheck = |edited: &str| json_parser::parse(edited, false).root.map(|r| check_json_with_type(&r, &root_type, &env));
+        let opts = CompleteOptions { recheck: &recheck, ignored_loaders: &[] };
+        let check_of = |src: &str| check_json_with_type(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env);
+
+        let src = "{\"pattern\": [\"#X#\", \" S \"], \"key\": {\"X\": {\"item\": \"a\"},\n  \n}}";
+        let check = check_of(src);
+        let comp = complete(src, src.find("\n  ").unwrap() + 3, &check, &env, &opts);
+        let labels: Vec<&str> = comp.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["#", "S"], "pattern order, minus the space and the existing X");
+        assert_eq!(comp.items[0].insert_text.as_deref(), Some("\"#\": {}"));
+
+        let h = hover(src, src.find("\"key\"").unwrap() + 2, &check, &tables).unwrap();
+        assert!(h.docs.contains("`#`, `X`, `S`"), "{h:?}");
+
+        let bad = r##"{"pattern": ["#X"], "key": {"#": {"item": "a"}, "Q": {"item": "b"}, "ab": {"item": "c"}, " ": {"item": "d"}}}"##;
+        let messages: Vec<String> = check_of(bad).diagnostics.into_iter().map(|d| d.message).collect();
+        for needle in ["doesn't use \"Q\"", "\"ab\" isn't a valid key", "A space marks an empty slot", "doesn't define \"X\""] {
+            assert!(messages.iter().any(|m| m.contains(needle)), "missing {needle} in {messages:?}");
+        }
+        let good = r##"{"pattern": ["# #"], "key": {"#": {"item": "a"}}}"##;
+        assert!(check_of(good).diagnostics.is_empty(), "{:?}", check_of(good).diagnostics);
+    }
+
+    #[test]
+    fn reports_whether_a_string_slot_has_choices() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(r#"dispatch minecraft:resource["recipe"] to struct { group: string, result: #[id="item"] string }"#, "::test", &mut tables).unwrap();
+        let mut regs = RegistryIndex::default();
+        regs.insert_entries("item", ["minecraft:diamond".into()]);
+        regs.finalize();
+        let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: None };
+        let env = CheckEnv { tables: &tables, registries: &regs, version: &version, require_canonical: false, allow_missing_keys: false, primitives_read_as_strings: false, ignored_loaders: &[] };
+        let root_type = resource_root_type("recipe", &tables).unwrap();
+        let recheck = |edited: &str| json_parser::parse(edited, false).root.map(|r| check_json_with_type(&r, &root_type, &env));
+        let opts = CompleteOptions { recheck: &recheck, ignored_loaders: &[] };
+
+        let src = r#"{"group": "free text", "result": "zzz"}"#;
+        let check = check_json_with_type(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env);
+        let at = |needle: &str| complete(src, src.find(needle).unwrap() + 2, &check, &env, &opts);
+
+        let plain = at("free text");
+        assert!(plain.items.is_empty() && !plain.slot_has_choices, "{plain:?}");
+        let unmatched_id = at("zzz");
+        assert!(unmatched_id.items.is_empty() && unmatched_id.slot_has_choices, "{unmatched_id:?}");
+        assert!(at("group").slot_has_choices);
+    }
 
     #[test]
     fn completes_keys_modded_ids_and_hover_docs() {

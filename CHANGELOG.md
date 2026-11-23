@@ -2,6 +2,13 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Changed
+- Greatly improve the responsiveness of autocomplete, especially for very large packs with a lot of registry entries
+- Minor improvements to recipe autocomplete
+### Fixed
+- Autocomplete not working for some keys that were valid until you had already typed the full key.
+
 ## [0.7.2] - 2026-11-22
 ### Fixed
 - New mcdocs not working in the editor until you clicked **Schemas**. (They're now downloaded on app startup and periodically checked)

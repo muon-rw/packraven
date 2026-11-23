@@ -7,7 +7,7 @@ use regex::Regex;
 use super::json_parser::{Diagnostic, JsonKind, JsonNode, JsonString, Severity, Span};
 use super::registries::{lengthen_id, normalize_category, IdLookup, RegistryIndex};
 use super::types::{
-    AccessorKey, Attribute, DynamicKeyword, EnumField, EnumKind, EnumValue, Index, LiteralValue, LongRange, McdocType, NumericRange, RangeKind,
+    AccessorKey, Attribute, AttributeValue, DynamicKeyword, EnumField, EnumKind, EnumValue, Index, LiteralValue, LongRange, McdocType, NumericRange, RangeKind,
     StructField, StructKey, SymbolTables,
 };
 use super::version::{attr_number, attr_string, parse_id_attribute, parse_integer_attribute, TagMode, VersionContext};
@@ -501,6 +501,7 @@ impl<'a> Engine<'a> {
 
         // Attach resolved type info and run leaf attribute/registry checks.
         self.attach_and_check_attributes(root_id);
+        self.check_crafting_symbols();
 
         // Emit condensed diagnostics from the root group(s).
         let root_errors: Vec<RuntimeError> = self.node_groups[root_id.0]
@@ -1548,6 +1549,45 @@ impl<'a> Engine<'a> {
         }
     }
 
+    // Vanilla rejects a shaped recipe whose pattern and key disagree, so we report each mismatch.
+    fn check_crafting_symbols(&mut self) {
+        let mut rows: Vec<(Span, String)> = Vec::new();
+        let mut keys: Vec<(Span, String)> = Vec::new();
+        let mut has_key_object = false;
+        for (id, info) in &self.attached {
+            let node = self.arena.get(*id);
+            match (&node.kind, crafting_role(&info.type_def)) {
+                (ArenaKind::String(s), Some(CraftingRole::Definition)) => rows.push((s.span, s.value.clone())),
+                (ArenaKind::String(s), Some(CraftingRole::Reference)) => keys.push((s.span, s.value.clone())),
+                (ArenaKind::Object(_), _) if has_crafting_keys(&info.type_def) => has_key_object = true,
+                _ => {}
+            }
+        }
+        rows.sort_by_key(|(span, _)| span.start);
+        keys.sort_by_key(|(span, _)| span.start);
+        let used: HashSet<char> = rows.iter().flat_map(|(_, row)| row.chars()).filter(|c| *c != ' ').collect();
+        let defined: HashSet<char> = keys.iter().filter_map(|(_, k)| single_char(k)).collect();
+
+        for (span, key) in &keys {
+            let message = match single_char(key) {
+                None => format!("\"{key}\" isn't a valid key. Keys must be exactly one character."),
+                Some(' ') => "A space marks an empty slot in the pattern, so it can't be a key.".into(),
+                Some(c) if !rows.is_empty() && !used.contains(&c) => format!("The pattern doesn't use \"{c}\"."),
+                Some(_) => continue,
+            };
+            self.diagnostics.push(Diagnostic { span: *span, severity: Severity::Error, message });
+        }
+        if has_key_object {
+            for (span, row) in &rows {
+                let mut missing: Vec<char> = row.chars().filter(|c| *c != ' ' && !defined.contains(c)).collect();
+                missing.dedup();
+                for c in missing {
+                    self.diagnostics.push(Diagnostic { span: *span, severity: Severity::Error, message: format!("The key doesn't define \"{c}\".") });
+                }
+            }
+        }
+    }
+
     fn check_leaf_attributes(&mut self, node_id: JsonId, type_def: &McdocType) {
         let node = self.arena.get(node_id);
         for attr in type_def.attributes() {
@@ -2353,6 +2393,66 @@ fn prepend_attrs(ty: &mut McdocType, attrs: &[Attribute]) {
     let mut merged = attrs.to_vec();
     merged.extend(ty.attributes().iter().cloned());
     *ty.attributes_mut() = merged;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CraftingRole {
+    Definition,
+    Reference,
+}
+
+// vanilla-mcdoc marks pattern strings with `#[crafting_ingredient(definition=true)]`, where each
+// character defines a symbol, and the key's dynamic keys with `#[crafting_ingredient]`.
+pub(crate) fn crafting_role(ty: &McdocType) -> Option<CraftingRole> {
+    if let McdocType::Union { members, .. } = ty {
+        return members.iter().find_map(crafting_role);
+    }
+    let attr = ty.attributes().iter().find(|a| a.name == "crafting_ingredient")?;
+    let defines = match &attr.value {
+        Some(AttributeValue::Tree(tree)) => matches!(
+            tree.values.get("definition"),
+            Some(AttributeValue::Type(McdocType::Literal { value: LiteralValue::Boolean { value: true }, .. }))
+        ),
+        _ => false,
+    };
+    Some(if defines { CraftingRole::Definition } else { CraftingRole::Reference })
+}
+
+pub(crate) fn has_crafting_keys(ty: &McdocType) -> bool {
+    match ty {
+        McdocType::Struct { fields, .. } => fields.iter().any(|f| {
+            matches!(f, StructField::Pair { key: StructKey::Dynamic(k), .. } if crafting_role(k) == Some(CraftingRole::Reference))
+        }),
+        McdocType::Union { members, .. } => members.iter().any(has_crafting_keys),
+        _ => false,
+    }
+}
+
+/// Returns each distinct symbol the document's patterns use, in the order they first appear.
+pub(crate) fn pattern_symbols(check: &CheckOutput) -> Vec<char> {
+    let mut rows: Vec<(usize, &str)> = check
+        .attached
+        .iter()
+        .filter(|(_, info)| crafting_role(&info.type_def) == Some(CraftingRole::Definition))
+        .filter_map(|(id, _)| match &check.arena.get(*id).kind {
+            ArenaKind::String(s) => Some((s.span.start, s.value.as_str())),
+            _ => None,
+        })
+        .collect();
+    rows.sort_by_key(|(start, _)| *start);
+    let mut symbols = Vec::new();
+    for c in rows.iter().flat_map(|(_, row)| row.chars()) {
+        if c != ' ' && !symbols.contains(&c) {
+            symbols.push(c);
+        }
+    }
+    symbols
+}
+
+fn single_char(s: &str) -> Option<char> {
+    let mut chars = s.chars();
+    let c = chars.next()?;
+    chars.next().is_none().then_some(c)
 }
 
 fn has_attr(attrs: &[Attribute], name: &str) -> bool {

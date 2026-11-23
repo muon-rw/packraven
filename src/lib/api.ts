@@ -741,6 +741,7 @@ export interface ProbejsHover {
 
 export interface DatapackCompletionResult extends ProbejsCompletionResult {
   replaceTo?: number
+  slotHasChoices?: boolean
 }
 
 export interface DatapackStatusInfo {

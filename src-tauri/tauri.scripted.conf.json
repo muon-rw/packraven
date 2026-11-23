@@ -1,0 +1,22 @@
+{
+  "build": {
+    "devUrl": "http://localhost:5199",
+    "beforeDevCommand": "npm run dev -- --port 5199 --strictPort"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "packraven (scripted)",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 960,
+        "minHeight": 640,
+        "resizable": true,
+        "zoomHotkeysEnabled": true,
+        "visible": false,
+        "create": false
+      }
+    ]
+  }
+}

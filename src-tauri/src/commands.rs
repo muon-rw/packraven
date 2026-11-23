@@ -49,13 +49,23 @@ impl AppState {
 
     pub(crate) fn rewatch(&self, app: &AppHandle) {
         self.update_presence();
-        let dir = self.settings().instance_dir;
+        let settings = self.settings();
+        let dir = settings.instance_dir;
         if crate::setup::has_hooks(&dir) {
             let _ = crate::setup::link_hooks(&dir);
         }
-        let watched = (!dir.as_os_str().is_empty()).then(|| crate::watcher::watch(app.clone(), dir));
+        let watched = (!dir.as_os_str().is_empty()).then(|| crate::watcher::watch(app.clone(), dir.clone()));
         *self.watch_error.lock().unwrap() = watched.as_ref().and_then(|w| w.as_ref().err()).map(|e| format!("{e:#}"));
         *self.watcher.lock().unwrap() = watched.and_then(Result::ok);
+        if dir.is_dir() {
+            crate::mcdoc::DatapackCache::spawn_warm(
+                Arc::clone(&self.datapack),
+                dir,
+                settings.install_dir,
+                Arc::clone(&self.probejs),
+                Some(app.clone()),
+            );
+        }
     }
 
     pub(crate) fn update_presence(&self) {

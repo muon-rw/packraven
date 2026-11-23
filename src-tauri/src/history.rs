@@ -52,6 +52,17 @@ pub struct Outcome {
     changed: Vec<String>,
 }
 
+impl Outcome {
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.moved
+            .iter()
+            .flat_map(|(from, to)| [from.as_str(), to.as_str()])
+            .chain(self.removed.iter().map(String::as_str))
+            .chain(self.added.iter().map(String::as_str))
+            .chain(self.changed.iter().map(String::as_str))
+    }
+}
+
 #[derive(Default)]
 struct Changes {
     moved: Vec<(PathBuf, PathBuf)>,

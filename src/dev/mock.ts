@@ -1546,10 +1546,13 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
     if (strMatch) {
       const typed = strMatch[1]
       const from = offset - typed.length
+      const after = text.slice(offset)
+      const closeIdx = after.indexOf('"')
+      const replaceTo = closeIdx > 0 ? offset + closeIdx : undefined
       const items = ['minecraft:diamond', 'minecraft:stick', 'create:brass_ingot', '#c:ingots/iron']
         .filter((id) => id.toLowerCase().includes(typed.toLowerCase()))
         .map((label) => ({ label, kind: 'constant', detail: 'item', signature: null, docs: null, insertText: null }))
-      return { from, to: offset, items, inString: true }
+      return { from, to: offset, replaceTo, items, inString: true, slotHasChoices: true }
     }
     return { from: offset, to: offset, items: [], inString: false }
   },

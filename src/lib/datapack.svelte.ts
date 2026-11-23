@@ -1,4 +1,5 @@
-import type { Extension } from '@codemirror/state'
+import type { EditorState, Extension, Text } from '@codemirror/state'
+import { syntaxTree } from '@codemirror/language'
 import { ViewPlugin, hoverTooltip, type EditorView, type Tooltip, type ViewUpdate } from '@codemirror/view'
 import { autocompletion, completionStatus, startCompletion, type Completion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
 import { api, errorText, type DatapackStatusInfo } from './api'
@@ -121,8 +122,75 @@ function renderDocTooltip(signature: string, docs: string): HTMLElement {
   return box
 }
 
+interface StringContext {
+  from: number
+  to: number
+  isValue: boolean
+}
+
+function stringContextAt(state: EditorState): StringContext | null {
+  const sel = state.selection.main
+  const tree = syntaxTree(state)
+  const check = (pos: number, side: -1 | 1): StringContext | null => {
+    for (let node: ReturnType<typeof tree.resolveInner> | null = tree.resolveInner(pos, side); node; node = node.parent) {
+      if (node.name === 'String') {
+        if (sel.from > node.from && sel.to < node.to) {
+          return { from: node.from, to: node.to, isValue: true }
+        }
+        return null
+      }
+      if (node.name === 'PropertyName') {
+        if (sel.empty && sel.from === node.from + 1 && node.to === node.from + 2) {
+          return { from: node.from, to: node.to, isValue: false }
+        }
+        return null
+      }
+    }
+    return null
+  }
+
+  const found = check(sel.from, 1) ?? check(sel.from, -1)
+  if (found) return found
+
+  // Fallback when Lezer hasn't parsed an empty `""` pair yet.
+  if (sel.empty && sel.head > 0 && state.sliceDoc(sel.head - 1, sel.head) === '"' && state.sliceDoc(sel.head, sel.head + 1) === '"') {
+    return { from: sel.head - 1, to: sel.head + 1, isValue: true }
+  }
+  return null
+}
+
+// Tracks completions opened automatically by cursor placement (not Ctrl+Space or editing) so we
+// can suppress a redundant 1-item popup when the cursor sits at the end of an already-valid ID.
+const autoTriggeredViews = new WeakSet<EditorView>()
+
+// Strings the backend said have no choices (plain text like a name or description), by start offset.
+// Caret moves inside them don't ask again until the document changes.
+const stringsWithoutChoices = new WeakMap<EditorView, { doc: Text; starts: Set<number> }>()
+
+function rememberStringWithoutChoices(view: EditorView, doc: Text, from: number) {
+  let known = stringsWithoutChoices.get(view)
+  if (!known || known.doc !== doc) {
+    known = { doc, starts: new Set() }
+    stringsWithoutChoices.set(view, known)
+  }
+  known.starts.add(from)
+}
+
+function stringLacksChoices(view: EditorView, state: EditorState, str: StringContext): boolean {
+  const known = stringsWithoutChoices.get(view)
+  return !!known && known.doc === state.doc && known.starts.has(str.from)
+}
+
+function autoTriggerCompletion(view: EditorView) {
+  const str = stringContextAt(view.state)
+  if (!str || stringLacksChoices(view, view.state, str)) return
+  autoTriggeredViews.add(view)
+  startCompletion(view)
+}
+
 function completionSource(path: string) {
   return async (context: CompletionContext): Promise<CompletionResult | null> => {
+    const isAuto = context.view ? autoTriggeredViews.delete(context.view) : false
     const trigger = triggerCharAt(context)
     if (!context.explicit && !trigger) {
       const word = context.matchBefore(/[A-Za-z0-9_./:#-]+/)
@@ -133,11 +201,24 @@ function completionSource(path: string) {
       if (!ok) return null
     }
     const text = context.state.doc.toString()
-    const res = await api.datapackComplete(path, text, context.pos).catch(() => null)
+    const sel = context.state.selection.main
+    const str = stringContextAt(context.state)
+    const queryPos = !sel.empty && str?.isValue ? sel.from : context.pos
+    const res = await api.datapackComplete(path, text, queryPos).catch(() => null)
+    if (isAuto && context.view && str && res && !res.slotHasChoices) {
+      rememberStringWithoutChoices(context.view, context.state.doc, str.from)
+    }
     if (context.aborted || !res || !res.items.length) return null
 
+    if (isAuto && sel.empty && res.inString && res.items.length === 1) {
+      const fullContent = text.slice(res.from, res.replaceTo ?? res.to)
+      if (res.items[0].label === fullContent) return null
+    }
+
     // Accepting replaces the rest of the word or string after the cursor too, which stays the same length while you type.
-    const suffix = Math.max(0, (res.replaceTo ?? res.to) - res.to)
+    const resultTo = Math.max(res.to, !sel.empty && str?.isValue ? sel.to : res.to)
+    const replaceEnd = Math.max(res.replaceTo ?? res.to, resultTo)
+    const suffix = Math.max(0, replaceEnd - resultTo)
     const options: Completion[] = res.items.map((item) => {
       const insert = item.insertText ?? item.label
       const customApply = suffix > 0 || item.cursorOffset != null || !!item.selectLen || item.consumeClosingQuote || item.retrigger
@@ -167,10 +248,10 @@ function completionSource(path: string) {
     // The backend filters and ranks by substring and caps the list, so we ask it again on every keystroke
     // instead of letting CodeMirror refilter. CodeMirror's fuzzy matcher would also drop every namespaced ID
     // after one typed letter, since it matches a single character only at the start of a label.
-    const typed = text.slice(res.from, context.pos).toLowerCase()
+    const typed = text.slice(res.from, queryPos).toLowerCase()
     return {
       from: res.from,
-      to: res.to,
+      to: resultTo,
       options,
       filter: false,
       getMatch: (completion) => {
@@ -199,22 +280,56 @@ export function datapackExtensions(path: string): Extension[] {
   if (!isDatapackJson(path)) return []
   const warmPlugin = ViewPlugin.fromClass(
     class {
-      constructor() {
-        queueMicrotask(() => ensureDatapack())
+      private destroyed = false
+      private dismissedString: { from: number; to: number } | null = null
+
+      constructor(private view: EditorView) {
+        queueMicrotask(() => {
+          ensureDatapack().then((ok) => {
+            if (!ok || this.destroyed || !this.view.hasFocus || completionStatus(this.view.state) != null) return
+            autoTriggerCompletion(this.view)
+          })
+        })
       }
 
       update(update: ViewUpdate) {
-        if (datapack.status !== 'ready' || completionStatus(update.state) != null) return
-        const sel = update.state.selection.main
-        if (!sel.empty) return
-        const pos = sel.head
-        const before = pos > 0 ? update.state.sliceDoc(pos - 1, pos) : ''
-        const after = update.state.sliceDoc(pos, pos + 1)
-        const deleted = update.docChanged && update.transactions.some((tr) => tr.isUserEvent('delete.backward'))
-        const placedInEmptyQuotes = !update.docChanged && update.selectionSet && before === '"' && after === '"'
-        if (placedInEmptyQuotes || (deleted && (before === '"' || after === '"' || /[A-Za-z0-9_./:#-]/.test(before)))) {
-          queueMicrotask(() => startCompletion(update.view))
+        // An auto-trigger whose source never ran must not mark your next request as automatic too.
+        if (update.docChanged || update.selectionSet) autoTriggeredViews.delete(update.view)
+        if (update.docChanged) {
+          this.dismissedString = null
+        } else if (!update.selectionSet && update.view.hasFocus && completionStatus(update.startState) === 'active' && completionStatus(update.state) == null) {
+          const str = stringContextAt(update.state)
+          if (str) this.dismissedString = { from: str.from, to: str.to }
         }
+
+        const str = stringContextAt(update.state)
+        if (this.dismissedString && (!str || str.from !== this.dismissedString.from || str.to !== this.dismissedString.to)) {
+          this.dismissedString = null
+        }
+
+        if (datapack.status !== 'ready' || completionStatus(update.state) != null) return
+
+        const deleted = update.docChanged && update.transactions.some((tr) => tr.isUserEvent('delete'))
+        if (deleted) {
+          const sel = update.state.selection.main
+          if (!sel.empty) return
+          const pos = sel.head
+          const before = pos > 0 ? update.state.sliceDoc(pos - 1, pos) : ''
+          const after = update.state.sliceDoc(pos, pos + 1)
+          if (str || before === '"' || after === '"' || /[A-Za-z0-9_./:#-]/.test(before)) {
+            queueMicrotask(() => !this.destroyed && startCompletion(update.view))
+          }
+          return
+        }
+
+        if (!update.docChanged && update.selectionSet && str) {
+          if (this.dismissedString && this.dismissedString.from === str.from && this.dismissedString.to === str.to) return
+          queueMicrotask(() => !this.destroyed && autoTriggerCompletion(update.view))
+        }
+      }
+
+      destroy() {
+        this.destroyed = true
       }
     },
   )
@@ -224,6 +339,7 @@ export function datapackExtensions(path: string): Extension[] {
     autocompletion({
       override: [completionSource(path)],
       activateOnTyping: true,
+      activateOnTypingDelay: 25,
       interactionDelay: 0,
       maxRenderedOptions: 100,
     }),

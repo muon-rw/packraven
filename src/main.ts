@@ -6,9 +6,18 @@ import './app.css'
 import App from './App.svelte'
 import { applyTheme } from './lib/theme.svelte'
 
-if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) {
-  const { installMock } = await import('./dev/mock')
-  installMock()
+if (import.meta.env.DEV) {
+  const bridge = await import('./dev/bridge')
+  if (bridge.isBridgeHost()) {
+    bridge.startBridgeHost()
+  } else if (!('__TAURI_INTERNALS__' in window)) {
+    if (bridge.wantsRealBackend()) {
+      await bridge.installBridgeClient()
+    } else {
+      const { installMock } = await import('./dev/mock')
+      installMock()
+    }
+  }
 }
 
 applyTheme()

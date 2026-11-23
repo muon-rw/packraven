@@ -55,7 +55,7 @@ pub struct LintDiagnostic {
 }
 
 pub struct DatapackIndex {
-    pub tables: SymbolTables,
+    pub tables: Arc<SymbolTables>,
     pub registries: RegistryIndex,
     pub version: VersionContext,
     pub path_rules: Vec<fetch::PathRule>,
@@ -251,9 +251,27 @@ impl DatapackIndex {
 pub const SCHEMAS_UPDATED_EVENT: &str = "datapack-schemas-updated";
 const SCHEMA_REFRESH_EVERY: Duration = Duration::from_secs(5 * 60);
 
+struct CachedBase {
+    root: PathBuf,
+    fingerprint: String,
+    tables: Arc<SymbolTables>,
+    registries: RegistryIndex,
+    version: VersionContext,
+    path_rules: Vec<fetch::PathRule>,
+    ignored_loaders: Vec<&'static str>,
+    foreign_loader_folders: &'static [(&'static str, &'static str)],
+    data_pack_format: Option<overlays::PackFormat>,
+    minecraft: Option<String>,
+    loader_label: Option<String>,
+    probe_available: bool,
+    active_muon_files: Vec<String>,
+    active_partners: Vec<String>,
+}
+
 struct CachedDatapack {
     root: PathBuf,
     fingerprint: String,
+    built_generation: u64,
     build_started: Instant,
     status: DatapackStatus,
     index: Option<Arc<DatapackIndex>>,
@@ -262,8 +280,15 @@ struct CachedDatapack {
 }
 
 #[derive(Default)]
+struct CacheState {
+    current: Option<CachedDatapack>,
+    base: Option<CachedBase>,
+    pack_data_generation: u64,
+}
+
+#[derive(Default)]
 pub struct DatapackCache {
-    inner: Mutex<Option<CachedDatapack>>,
+    inner: Mutex<CacheState>,
     // Lint, completion and status requests can all arrive while the cache is empty, so we build one index at a time.
     building: tokio::sync::Mutex<()>,
 }
@@ -304,17 +329,17 @@ async fn refresh_in_background(app: &AppHandle) {
 impl DatapackCache {
     pub fn get(&self, root: &Path) -> Option<Arc<DatapackIndex>> {
         let guard = self.inner.lock().unwrap();
-        guard.as_ref().filter(|c| c.root == root).and_then(|c| c.index.clone())
+        guard.current.as_ref().filter(|c| c.root == root).and_then(|c| c.index.clone())
     }
 
     pub fn has_cached(&self, root: &Path) -> bool {
         let guard = self.inner.lock().unwrap();
-        guard.as_ref().is_some_and(|c| c.root == root && c.index.is_some())
+        guard.current.as_ref().is_some_and(|c| c.root == root && c.index.is_some())
     }
 
     pub fn cached_schema_inputs(&self) -> (Vec<String>, Vec<String>) {
         let guard = self.inner.lock().unwrap();
-        match guard.as_ref() {
+        match guard.current.as_ref() {
             Some(c) => (c.active_muon_files.clone(), c.active_partners.clone()),
             None => (Vec::new(), Vec::new()),
         }
@@ -322,22 +347,63 @@ impl DatapackCache {
 
     pub fn invalidate(&self, root: &Path) {
         let mut guard = self.inner.lock().unwrap();
-        if guard.as_ref().is_some_and(|c| c.root == root) {
-            *guard = None;
+        if guard.current.as_ref().is_some_and(|c| c.root == root) {
+            guard.current = None;
         }
+        if guard.base.as_ref().is_some_and(|b| b.root == root) {
+            guard.base = None;
+        }
+    }
+
+    // We keep serving the stale index until the rebuild lands so completions don't stall. The bump is
+    // unconditional because a build that's still running has no cache entry yet, and it must not
+    // record its pre-edit scan as current.
+    pub fn mark_pack_data_dirty(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.pack_data_generation = guard.pack_data_generation.wrapping_add(1);
+    }
+
+    pub fn spawn_warm(
+        cache: Arc<Self>,
+        root: PathBuf,
+        install_dir: PathBuf,
+        probe: Arc<ProbeCache>,
+        app: Option<AppHandle>,
+    ) {
+        tauri::async_runtime::spawn(async move {
+            let (status, _) = cache.ensure(root.clone(), install_dir, probe, false).await;
+            // You may have switched packs while this build ran, and the event carries no root.
+            if status.available
+                && let Some(app) = app
+                && app.state::<crate::commands::AppState>().settings().instance_dir == root
+            {
+                let _ = app.emit(SCHEMAS_UPDATED_EVENT, &status);
+            }
+        });
     }
 
     pub async fn ensure(&self, root: PathBuf, install_dir: PathBuf, probe_cache: Arc<ProbeCache>, force: bool) -> (DatapackStatus, Option<Arc<DatapackIndex>>) {
         let requested = Instant::now();
         let _building = self.building.lock().await;
-        let fingerprint = fingerprint_pack(&root);
+        let root_for_fp = root.clone();
+        let fingerprint = tokio::task::spawn_blocking(move || fingerprint_pack(&root_for_fp))
+            .await
+            .unwrap_or_default();
+        let generation = self.inner.lock().unwrap().pack_data_generation;
         // A forced reload that waited on another build is already satisfied if that build started after we asked.
         let force = force
-            && !self.inner.lock().unwrap().as_ref().is_some_and(|c| c.root == root && c.build_started >= requested);
+            && !self
+                .inner
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .is_some_and(|c| c.root == root && c.build_started >= requested);
         if !force
-            && let Some(cached) = self.inner.lock().unwrap().as_ref()
+            && let Some(cached) = self.inner.lock().unwrap().current.as_ref()
             && cached.root == root
             && cached.fingerprint == fingerprint
+            && cached.built_generation == generation
         {
             return (cached.status.clone(), cached.index.clone());
         }
@@ -346,6 +412,98 @@ impl DatapackCache {
         let lock = std::fs::read_to_string(root.join(LOCKFILE))
             .ok()
             .and_then(|s| Lockfile::parse(&s).ok());
+
+        // Fast path: when only loose/zipped pack data changed, reuse the cached schemas, mod jar
+        // scan, and ProbeRaven dump instead of rebuilding everything from scratch.
+        if !force {
+            let reusable_base = {
+                let guard = self.inner.lock().unwrap();
+                guard
+                    .base
+                    .as_ref()
+                    .filter(|b| b.root == root && b.fingerprint == fingerprint)
+                    .map(|b| {
+                        (
+                            Arc::clone(&b.tables),
+                            b.registries.clone(),
+                            b.version.clone(),
+                            b.path_rules.clone(),
+                            b.ignored_loaders.clone(),
+                            b.foreign_loader_folders,
+                            b.data_pack_format,
+                            b.minecraft.clone(),
+                            b.loader_label.clone(),
+                            b.probe_available,
+                            b.active_muon_files.clone(),
+                            b.active_partners.clone(),
+                        )
+                    })
+            };
+            if let Some((
+                tables,
+                mut registries,
+                version,
+                path_rules,
+                ignored_loaders,
+                foreign_loader_folders,
+                data_pack_format,
+                minecraft,
+                loader_label,
+                probe_available,
+                active_muon_files,
+                active_partners,
+            )) = reusable_base
+            {
+                let root_for_scan = root.clone();
+                let lock_for_scan = lock.clone();
+                let registries = tokio::task::spawn_blocking(move || {
+                    let known = registries.known.clone();
+                    for (cat, ids) in scan_pack_data(&root_for_scan, lock_for_scan.as_ref(), &known) {
+                        registries.insert_entries(&cat, ids);
+                    }
+                    registries.finalize();
+                    registries
+                })
+                .await
+                .unwrap_or_default();
+
+                let symbol_count = tables.mcdoc.len();
+                let registry_entries: usize = registries.entries.values().map(Vec::len).sum();
+                let code_source = registries.code_source;
+                let index = Arc::new(DatapackIndex {
+                    tables,
+                    registries,
+                    version,
+                    path_rules,
+                    ignored_loaders,
+                    foreign_loader_folders,
+                    data_pack_format,
+                });
+                let status = DatapackStatus {
+                    available: true,
+                    minecraft,
+                    loader: loader_label,
+                    symbol_count,
+                    registry_entries,
+                    code_source,
+                    probe_available,
+                    load_ms: started.elapsed().as_millis() as u64,
+                    error: None,
+                };
+                self.inner.lock().unwrap().current = Some(CachedDatapack {
+                    root,
+                    fingerprint,
+                    built_generation: generation,
+                    build_started: started,
+                    status: status.clone(),
+                    index: Some(index.clone()),
+                    active_muon_files,
+                    active_partners,
+                });
+                return (status, Some(index));
+            }
+        }
+
         let minecraft = lock.as_ref().and_then(|l| l.minecraft.clone());
         let neoforge = lock.as_ref().and_then(|l| match l.mod_loader().ok() {
             Some(ModLoader::NeoForge(v)) => Some(v.to_string()),
@@ -371,7 +529,7 @@ impl DatapackCache {
             Err(e) => {
                 // Keep any already-loaded in-memory index for this pack rather than wiping it on a transient fetch error.
                 let mut guard = self.inner.lock().unwrap();
-                if let Some(existing) = guard.as_ref()
+                if let Some(existing) = guard.current.as_ref()
                     && existing.root == root
                     && existing.index.is_some()
                 {
@@ -386,9 +544,10 @@ impl DatapackCache {
                     load_ms: started.elapsed().as_millis() as u64,
                     ..Default::default()
                 };
-                *guard = Some(CachedDatapack {
+                guard.current = Some(CachedDatapack {
                     root,
                     fingerprint,
+                    built_generation: generation,
                     build_started: started,
                     status: status.clone(),
                     index: None,
@@ -415,7 +574,7 @@ impl DatapackCache {
 
         let root_for_scan = root.clone();
         let lock_for_scan = lock.clone();
-        let registries = tokio::task::spawn_blocking(move || {
+        let (base_registries, pack_entries) = tokio::task::spawn_blocking(move || {
             let mut reg = RegistryIndex::default();
             if let Some(v) = vanilla_regs {
                 reg.apply_vanilla_registries(v);
@@ -423,8 +582,10 @@ impl DatapackCache {
             if let Some(b) = vanilla_blocks {
                 reg.apply_vanilla_block_states(b);
             }
-            // We read the dump first because its registry names tell us how to read modded tag folders.
+            // We read the dump first because its registry names tell us how to read modded tag folders,
+            // and a fresh dump already has the full mod list so we don't need to decompress nested jars.
             let dump = read_proberaven_dump(&root_for_scan);
+            let dump_is_fresh = dump.is_some() && dump_postdates_mod_changes(&root_for_scan);
             for name in dump.iter().flat_map(|d| d.registries.keys()) {
                 reg.known.insert(name);
             }
@@ -432,27 +593,26 @@ impl DatapackCache {
             for (cat, ids) in scan_loader_jars_data(&install_dir, lock_for_scan.as_ref(), &known) {
                 reg.insert_entries(&cat, ids);
             }
-            let (jar_entries, jar_mods) = scan_mod_jars_data(&root_for_scan, &known);
+            let (jar_entries, jar_mods) = scan_mod_jars_data(&root_for_scan, &known, !dump_is_fresh);
             reg.mod_ids.extend(jar_mods);
             for (cat, ids) in jar_entries {
                 reg.insert_entries(&cat, ids);
             }
-            for (cat, ids) in scan_pack_data(&root_for_scan, lock_for_scan.as_ref(), &known) {
-                reg.insert_entries(&cat, ids);
-            }
-            if let Some(probe) = probe_cache.get(&root_for_scan).or_else(|| probe_cache.ensure(&root_for_scan, false).1) {
+            // A fresh ProbeRaven dump already covers every code registry. A stale one misses mods you added
+            // since, so we still merge ProbeJS typings for those.
+            if !dump_is_fresh
+                && let Some(probe) = probe_cache.get(&root_for_scan).or_else(|| probe_cache.ensure(&root_for_scan, false).1)
+            {
                 reg.apply_probejs(&probe);
             }
             if let Some(dump) = dump {
-                // The loader's own list covers every nested mod and `provides` alias, so it replaces
-                // our jar scan unless you've changed the mods since the dump.
-                if dump_postdates_mod_changes(&root_for_scan) {
+                if dump_is_fresh {
                     reg.mod_ids.clear();
                 }
                 reg.apply_proberaven(dump);
             }
-            reg.finalize();
-            reg
+            let pack_entries = scan_pack_data(&root_for_scan, lock_for_scan.as_ref(), &known);
+            (reg, pack_entries)
         })
         .await
         .unwrap_or_default();
@@ -470,7 +630,7 @@ impl DatapackCache {
                 let loader_match = loader_kind
                     .as_deref()
                     .is_some_and(|l| entry.loaders.iter().any(|allowed| allowed.eq_ignore_ascii_case(l)));
-                let mod_match = entry.mod_ids.iter().any(|m| registries.mod_ids.contains(m));
+                let mod_match = entry.mod_ids.iter().any(|m| base_registries.mod_ids.contains(m));
                 if !entry.always_load && !loader_match && !mod_match {
                     continue;
                 }
@@ -488,7 +648,7 @@ impl DatapackCache {
         }
 
         // Fetch and bind misode partner `.mcdoc` schemas dynamically from `misode/misode.github.io`.
-        let partner_names = fetch::partner_schemas_for_pack(loader_kind.as_deref(), &registries.mod_ids, misode_config.as_ref());
+        let partner_names = fetch::partner_schemas_for_pack(loader_kind.as_deref(), &base_registries.mod_ids, misode_config.as_ref());
         let active_partners = partner_names.clone();
         if let Some(cfg) = &misode_config {
             path_rules.extend(fetch::misode_partner_path_rules(cfg, &partner_names, minecraft.as_deref()));
@@ -515,28 +675,35 @@ impl DatapackCache {
         checker::relax_loot_entry_weight(&mut tables);
 
         let version = VersionContext { minecraft: minecraft.clone(), neoforge };
-        let mut registries = registries;
-        seed_condition_registries(&mut registries, &tables, &version);
+        let mut base_registries = base_registries;
+        seed_condition_registries(&mut base_registries, &tables, &version);
         let mod_loader = lock.as_ref().and_then(|l| l.mod_loader().ok());
-        let ignored_loaders = loaders_the_pack_ignores(mod_loader.as_ref(), &registries.mod_ids);
+        let ignored_loaders = loaders_the_pack_ignores(mod_loader.as_ref(), &base_registries.mod_ids);
         let foreign_loader_folders = foreign_loader_folders(mod_loader.as_ref());
+
+        let tables = Arc::new(tables);
+        let mut registries = base_registries.clone();
+        for (cat, ids) in pack_entries {
+            registries.insert_entries(&cat, ids);
+        }
+        registries.finalize();
 
         let symbol_count = tables.mcdoc.len();
         let registry_entries: usize = registries.entries.values().map(Vec::len).sum();
         let code_source = registries.code_source;
         let index = Arc::new(DatapackIndex {
-            tables,
+            tables: Arc::clone(&tables),
             registries,
-            version,
-            path_rules,
-            ignored_loaders,
+            version: version.clone(),
+            path_rules: path_rules.clone(),
+            ignored_loaders: ignored_loaders.clone(),
             foreign_loader_folders,
             data_pack_format,
         });
         let status = DatapackStatus {
             available: true,
-            minecraft,
-            loader: loader_label,
+            minecraft: minecraft.clone(),
+            loader: loader_label.clone(),
             symbol_count,
             registry_entries,
             code_source,
@@ -544,9 +711,27 @@ impl DatapackCache {
             load_ms: started.elapsed().as_millis() as u64,
             error: None,
         };
-        *self.inner.lock().unwrap() = Some(CachedDatapack {
+        let mut guard = self.inner.lock().unwrap();
+        guard.base = Some(CachedBase {
+            root: root.clone(),
+            fingerprint: fingerprint.clone(),
+            tables,
+            registries: base_registries,
+            version,
+            path_rules,
+            ignored_loaders,
+            foreign_loader_folders,
+            data_pack_format,
+            minecraft,
+            loader_label,
+            probe_available,
+            active_muon_files: active_muon_files.clone(),
+            active_partners: active_partners.clone(),
+        });
+        guard.current = Some(CachedDatapack {
             root,
             fingerprint,
+            built_generation: generation,
             build_started: started,
             status: status.clone(),
             index: Some(index.clone()),
@@ -703,6 +888,37 @@ fn fingerprint_pack(root: &Path) -> String {
             }
         }
     }
+    // We hash mod jar metadata so that changing mods rebuilds the base layer. Edits under `data/` and
+    // `datapacks/` stay out of the hash and only trigger the pack data rescan.
+    let mut jars: Vec<(String, u64, u64)> = std::fs::read_dir(root.join("mods"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("jar")) {
+                return None;
+            }
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            Some((e.file_name().to_string_lossy().into_owned(), meta.len(), mtime))
+        })
+        .collect();
+    jars.sort_unstable();
+    hasher.update(b"mods:");
+    for (name, len, mtime) in jars {
+        hasher.update(name.as_bytes());
+        hasher.update([0]);
+        hasher.update(len.to_le_bytes());
+        hasher.update(mtime.to_le_bytes());
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -719,7 +935,7 @@ mod tests {
         let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: Some("21.1.265".into()) };
         let mut registries = registries;
         seed_condition_registries(&mut registries, &tables, &version);
-        DatapackIndex { tables, registries, version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None }
+        DatapackIndex { tables: Arc::new(tables), registries, version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None }
     }
 
     #[test]
@@ -744,7 +960,7 @@ mod tests {
             parser::parse_and_bind(fetch::PACKRAVEN_MCDOC, "::packraven", &mut tables).unwrap();
             parser::parse_and_bind(r#"dispatch minecraft:resource["recipe"] to struct { result: string }"#, "::test", &mut tables).unwrap();
             let version = VersionContext { minecraft: Some(minecraft.into()), neoforge: None };
-            DatapackIndex { tables, registries: RegistryIndex::default(), version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None }
+            DatapackIndex { tables: Arc::new(tables), registries: RegistryIndex::default(), version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None }
         };
         let single = r#"{"fabric:load_conditions": {"condition": "fabric:all_mods_loaded", "values": ["create"]}, "result": "x"}"#;
         let list = r#"{"fabric:load_conditions": [{"condition": "fabric:all_mods_loaded", "values": ["create"]}], "result": "x"}"#;
@@ -774,7 +990,7 @@ mod tests {
         let mut registries = RegistryIndex { code_source: CodeRegistrySource::ProbeRaven, ..Default::default() };
         registries.mod_ids.insert("create".into());
         seed_condition_registries(&mut registries, &tables, &version);
-        let index = DatapackIndex { tables, registries, version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None };
+        let index = DatapackIndex { tables: Arc::new(tables), registries, version, path_rules: Vec::new(), ignored_loaders: Vec::new(), foreign_loader_folders: &[], data_pack_format: None };
         let path = "data/x/recipe/a.json";
 
         let absent = r#"{"neoforge:conditions": [{"type": "neoforge:mod_loaded", "modid": "malum"}], "result": "malum:spirit"}"#;
@@ -827,7 +1043,7 @@ mod tests {
         let mut tables = SymbolTables::default();
         parser::parse_and_bind(r#"dispatch minecraft:resource["recipe"] to struct { result: string }"#, "::test", &mut tables).unwrap();
         let index = DatapackIndex {
-            tables,
+            tables: Arc::new(tables),
             registries: RegistryIndex::default(),
             version: VersionContext { minecraft: Some("1.21.1".into()), neoforge: None },
             path_rules: Vec::new(),
@@ -853,8 +1069,9 @@ mod tests {
         let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: None };
         let mut registries = RegistryIndex::default();
         seed_condition_registries(&mut registries, &tables, &version);
+        let tables = Arc::new(tables);
         let index = |ignored_loaders: Vec<&'static str>| DatapackIndex {
-            tables: tables.clone(),
+            tables: Arc::clone(&tables),
             registries: registries.clone(),
             version: version.clone(),
             path_rules: Vec::new(),
@@ -882,8 +1099,9 @@ dispatch minecraft:resource["worldgen/noise"] to struct { name: string }
             &mut tables,
         )
         .unwrap();
+        let tables = Arc::new(tables);
         let index = |minecraft: &str| DatapackIndex {
-            tables: tables.clone(),
+            tables: Arc::clone(&tables),
             registries: RegistryIndex::default(),
             version: VersionContext { minecraft: Some(minecraft.into()), neoforge: None },
             path_rules: Vec::new(),

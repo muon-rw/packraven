@@ -92,13 +92,51 @@ test('datapack JSON files show Schemas toolbar reload, lint errors, completion a
   // Async datapack linter surfaces the problem in the lint gutter and toolbar.
   await expect(page.locator('.cm-lint-marker-error')).toHaveCount(1, { timeout: 5000 })
 
-  // Trigger autocomplete inside the "create:" string value.
+  // Trigger autocomplete automatically by moving into the "create:" string value (no Ctrl+Space needed).
   const idLine = page.locator('.cm-line', { hasText: '"create:"' })
   await idLine.click()
   await page.keyboard.press('End')
   await page.keyboard.press('ArrowLeft')
   await page.keyboard.press('ArrowLeft')
-  await page.keyboard.press('Control+Space')
+  await expect(page.locator('.cm-tooltip-autocomplete')).toContainText('create:brass_ingot')
+
+  // Escape dismisses the popup and stays dismissed while arrowing inside that same string.
+  await page.keyboard.press('Escape')
+  await expect(page.locator('.cm-tooltip-autocomplete')).toHaveCount(0)
+  await page.keyboard.press('ArrowLeft')
+  await page.waitForTimeout(150)
+  await expect(page.locator('.cm-tooltip-autocomplete')).toHaveCount(0)
+
+  // Selecting inside the string and pressing Backspace (delete.selection) reopens autocomplete immediately.
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Backspace')
+  await expect(page.locator('.cm-tooltip-autocomplete')).toContainText('create:brass_ingot')
+
+  // Accepting replaces the string with a full valid ID; clicking at its end suppresses the lone self-match.
+  await page.keyboard.press('Enter')
+  await expect(page.locator('.cm-tooltip-autocomplete')).toHaveCount(0)
+  await page.keyboard.press('ArrowDown')
+  await page.keyboard.press('ArrowUp')
+  await page.keyboard.press('End')
+  await page.keyboard.press('ArrowLeft')
+  await page.keyboard.press('ArrowLeft')
+  await page.waitForTimeout(150)
+  await expect(page.locator('.cm-tooltip-autocomplete')).toHaveCount(0)
+
+  // Selecting the ID suffix inside the full string opens completions filtered by the prefix before selection.
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
+  await page.keyboard.press('Shift+ArrowLeft')
   await expect(page.locator('.cm-tooltip-autocomplete')).toContainText('create:brass_ingot')
   await page.keyboard.press('Escape')
 

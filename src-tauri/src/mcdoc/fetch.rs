@@ -3,7 +3,8 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -489,13 +490,40 @@ pub fn cache_dir() -> PathBuf {
         .join("mcdoc")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp { len: meta.len(), modified: meta.modified().ok() })
+}
+
+static VANILLA_SYMBOLS_CACHE: OnceLock<Mutex<Option<(FileStamp, SymbolTables)>>> = OnceLock::new();
+static MCMETA_REGISTRIES_CACHE: OnceLock<Mutex<HashMap<String, (FileStamp, HashMap<String, Vec<String>>)>>> = OnceLock::new();
+static MCMETA_BLOCKS_CACHE: OnceLock<Mutex<HashMap<String, (FileStamp, HashMap<String, BTreeMap<String, Vec<String>>>)>>> = OnceLock::new();
+
 /// Loads `vanilla-mcdoc/symbols` from persistent local storage, refreshing from Spyglass's API only when absent or `force` is true.
 pub async fn load_vanilla_symbols(force: bool) -> Result<SymbolTables> {
     let path = cache_dir().join("vanilla-mcdoc-symbols.json");
-    load_cached(&path, VANILLA_MCDOC_SYMBOLS_URL, force, |bytes| {
+    let cache = VANILLA_SYMBOLS_CACHE.get_or_init(|| Mutex::new(None));
+    if !force && let Some(stamp) = file_stamp(&path) {
+        if let Some((cached_stamp, tables)) = cache.lock().unwrap().as_ref()
+            && *cached_stamp == stamp
+        {
+            return Ok(tables.clone());
+        }
+    }
+    let tables: SymbolTables = load_cached_parsing_off_thread(&path, VANILLA_MCDOC_SYMBOLS_URL, force, |bytes| {
         serde_json::from_slice(bytes).context("parsing vanilla-mcdoc symbols.json")
     })
-    .await
+    .await?;
+    if let Some(stamp) = file_stamp(&path) {
+        *cache.lock().unwrap() = Some((stamp, tables.clone()));
+    }
+    Ok(tables)
 }
 
 /// Loads the data pack format (`data_pack_version`, plus `data_pack_version_minor` from 1.21.9) that
@@ -517,22 +545,48 @@ pub async fn load_mcmeta_data_pack_format(mc_version: &str, force: bool) -> Resu
 pub async fn load_mcmeta_registries(mc_version: &str, force: bool) -> Result<HashMap<String, Vec<String>>> {
     let safe_ver = sanitize_version(mc_version);
     let path = cache_dir().join("mcmeta").join(&safe_ver).join("registries.json");
+    let cache = MCMETA_REGISTRIES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if !force && let Some(stamp) = file_stamp(&path) {
+        if let Some((cached_stamp, regs)) = cache.lock().unwrap().get(&safe_ver)
+            && *cached_stamp == stamp
+        {
+            return Ok(regs.clone());
+        }
+    }
     let url = format!("https://raw.githubusercontent.com/misode/mcmeta/{mc_version}-summary/registries/data.min.json");
-    load_cached(&path, &url, force, |bytes| {
-        serde_json::from_slice(bytes).with_context(|| format!("parsing mcmeta registries for {mc_version}"))
+    let mc = mc_version.to_string();
+    let regs: HashMap<String, Vec<String>> = load_cached_parsing_off_thread(&path, &url, force, move |bytes| {
+        serde_json::from_slice(bytes).with_context(|| format!("parsing mcmeta registries for {mc}"))
     })
-    .await
+    .await?;
+    if let Some(stamp) = file_stamp(&path) {
+        cache.lock().unwrap().insert(safe_ver, (stamp, regs.clone()));
+    }
+    Ok(regs)
 }
 
 /// Loads vanilla block state definitions (`summary/blocks/data.min.json`) for `mc_version` from persistent local storage.
 pub async fn load_mcmeta_block_states(mc_version: &str, force: bool) -> Result<HashMap<String, BTreeMap<String, Vec<String>>>> {
     let safe_ver = sanitize_version(mc_version);
     let path = cache_dir().join("mcmeta").join(&safe_ver).join("blocks.json");
+    let cache = MCMETA_BLOCKS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if !force && let Some(stamp) = file_stamp(&path) {
+        if let Some((cached_stamp, blocks)) = cache.lock().unwrap().get(&safe_ver)
+            && *cached_stamp == stamp
+        {
+            return Ok(blocks.clone());
+        }
+    }
     let url = format!("https://raw.githubusercontent.com/misode/mcmeta/{mc_version}-summary/blocks/data.min.json");
-    load_cached(&path, &url, force, |bytes| {
-        parse_mcmeta_blocks(bytes).with_context(|| format!("parsing mcmeta blocks for {mc_version}"))
+    let mc = mc_version.to_string();
+    let blocks = load_cached_parsing_off_thread(&path, &url, force, move |bytes| {
+        parse_mcmeta_blocks(bytes).with_context(|| format!("parsing mcmeta blocks for {mc}"))
     })
-    .await
+    .await?;
+    if let Some(stamp) = file_stamp(&path) {
+        cache.lock().unwrap().insert(safe_ver, (stamp, blocks.clone()));
+    }
+    Ok(blocks)
 }
 
 fn parse_mcdoc_bytes(bytes: &[u8], label: &str) -> Result<String> {
@@ -633,6 +687,65 @@ where
     F: Fn(&[u8]) -> Result<T>,
 {
     load_cached_with_status(path, url, force, None, parse).await.map(|(value, _)| value)
+}
+
+async fn load_cached_parsing_off_thread<T, F>(path: &Path, url: &str, force: bool, parse: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: Fn(&[u8]) -> Result<T> + Send + Sync + 'static,
+{
+    let parse = std::sync::Arc::new(parse);
+    let existing = if path.is_file() {
+        if let Ok(bytes) = tokio::fs::read(path).await {
+            let p = std::sync::Arc::clone(&parse);
+            tokio::task::spawn_blocking(move || p(&bytes).ok()).await.ok().flatten()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if !force && let Some(cached) = existing {
+        return Ok(cached);
+    }
+    let etag_file = etag_path(path);
+    let cached_etag = if existing.is_some() {
+        tokio::fs::read_to_string(&etag_file).await.ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    match fetch_conditional(url, cached_etag.as_deref(), None).await {
+        Ok(FetchOutcome::NotModified) => match existing {
+            Some(cached) => Ok(cached),
+            None => anyhow::bail!("received 304 Not Modified without a cached copy for {url}"),
+        },
+        Ok(FetchOutcome::Body { bytes, etag }) => {
+            let raw = bytes.clone();
+            let p = std::sync::Arc::clone(&parse);
+            let parsed = tokio::task::spawn_blocking(move || p(&raw))
+                .await
+                .map_err(|e| anyhow::anyhow!("parsing task failed for {url}: {e}"))?;
+            match parsed {
+                Ok(value) => {
+                    let _ = write_atomic(path, &bytes).await;
+                    if let Some(tag) = etag {
+                        let _ = write_atomic(&etag_file, tag.as_bytes()).await;
+                    } else {
+                        let _ = tokio::fs::remove_file(&etag_file).await;
+                    }
+                    Ok(value)
+                }
+                Err(err) => match existing {
+                    Some(cached) => Ok(cached),
+                    None => Err(err),
+                },
+            }
+        }
+        Err(err) => match existing {
+            Some(cached) => Ok(cached),
+            None => Err(err),
+        },
+    }
 }
 
 async fn load_cached_with_status<T, F>(path: &Path, url: &str, force: bool, timeout: Option<Duration>, parse: F) -> Result<(T, bool)>

@@ -75,6 +75,41 @@ use settings::Settings;
 const STARTED_HIDDEN_ARG: &str = "--hidden";
 pub(crate) const TRAY_ID: &str = "main";
 
+// `npm run dev:real` sets this so a scripted debug build can run beside our own packraven and
+// serve the browser bridge (see `src/dev/bridge.ts`).
+fn is_scripted_instance() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("PACKRAVEN_SCRIPTED_INSTANCE").is_some()
+}
+
+/// Copies your settings to a file only the scripted instance uses, so its pack switches and other
+/// changes never reach your own packraven. `PACKRAVEN_SCRIPTED_PACK` picks the pack to open, by path
+/// or by part of the folder name of a pack you've added.
+fn scripted_settings_path(config_dir: &std::path::Path) -> std::path::PathBuf {
+    let path = config_dir.join("settings.scripted.json");
+    let mut settings = Settings::load(&config_dir.join("settings.json"));
+    if let Some(wanted) = std::env::var("PACKRAVEN_SCRIPTED_PACK").ok().filter(|p| !p.is_empty()) {
+        let needle = wanted.to_lowercase();
+        let dir = Some(std::path::PathBuf::from(&wanted)).filter(|p| p.is_dir()).or_else(|| {
+            settings
+                .packs
+                .iter()
+                .find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().to_lowercase().contains(&needle)))
+                .cloned()
+        });
+        match dir {
+            Some(dir) => {
+                if !settings.packs.contains(&dir) {
+                    settings.packs.push(dir.clone());
+                }
+                settings.instance_dir = dir;
+            }
+            None => eprintln!("scripted instance: no added pack matches {wanted:?}; opening the last pack instead"),
+        }
+    }
+    let _ = settings.save(&path);
+    path
+}
+
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -123,15 +158,30 @@ fn iris_clean_stdio() -> anyhow::Result<()> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)))
+    let scripted_instance = is_scripted_instance();
+    let mut builder = tauri::Builder::default();
+    if !scripted_instance {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| show_main_window(app)));
+    }
+    builder
         .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, Some(vec![STARTED_HIDDEN_ARG])))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .setup(|app| {
+        .setup(move |app| {
+            // WebView2 fails with 0x800700AA when a second packraven instance shares the same
+            // user-data folder with different options, and Tauri 2.12's `From<&WindowConfig>`
+            // drops `dataDirectory`, so the scripted config sets `create: false` and we build
+            // the hidden window here with its own data directory.
+            if scripted_instance && app.get_webview_window("main").is_none() {
+                if let Some(config) = app.config().app.windows.first() {
+                    tauri::WebviewWindowBuilder::from_config(app.handle(), config)?
+                        .data_directory(app.path().app_local_data_dir()?.join("scripted-webview"))
+                        .build()?;
+                }
+            }
             let config_dir = app.path().app_config_dir()?;
-            let settings_path = config_dir.join("settings.json");
+            let settings_path = if scripted_instance { scripted_settings_path(&config_dir) } else { config_dir.join("settings.json") };
             let _ = java::DOWNLOAD_DIR.set(app.path().app_data_dir()?.join("java"));
             let settings = Settings::load(&settings_path);
             settings.request_folder_access();
@@ -152,7 +202,9 @@ pub fn run() {
                 probejs: Arc::default(),
                 datapack: Arc::default(),
             });
-            presence::start();
+            if !scripted_instance {
+                presence::start();
+            }
             app.state::<AppState>().rewatch(app.handle());
             announcer::start(app.handle().clone());
             app.manage(self_update::SelfUpdate::default());
@@ -164,7 +216,7 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show, &quit])?;
             TrayIconBuilder::with_id(TRAY_ID)
                 .icon(app.default_window_icon().cloned().expect("bundled icon"))
-                .tooltip("packraven")
+                .tooltip(if scripted_instance { "packraven (scripted instance)" } else { "packraven" })
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -179,7 +231,7 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            if !std::env::args().any(|a| a == STARTED_HIDDEN_ARG) {
+            if !scripted_instance && !std::env::args().any(|a| a == STARTED_HIDDEN_ARG) {
                 show_main_window(app.handle());
             }
             Ok(())

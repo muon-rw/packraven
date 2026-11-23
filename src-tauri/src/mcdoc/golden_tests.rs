@@ -1216,7 +1216,7 @@ fn validates_and_completes_bettercombat_irons_and_dynamic_difficulty() {
     registries.finalize();
 
     let index = super::DatapackIndex {
-        tables,
+        tables: std::sync::Arc::new(tables),
         registries,
         version: VersionContext { minecraft: Some("1.21.1".into()), neoforge: Some("21.1.265".into()) },
         path_rules,

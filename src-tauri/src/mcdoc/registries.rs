@@ -93,6 +93,7 @@ pub struct RegistryIndex {
     pub mod_ids: HashSet<String>,
     pub code_source: CodeRegistrySource,
     pub known: KnownRegistries,
+    pub(crate) has_uppercase: bool,
 }
 
 impl RegistryIndex {
@@ -100,15 +101,24 @@ impl RegistryIndex {
         let cat = normalize_category(category);
         let list = self.entries.entry(cat).or_default();
         for id in ids {
-            list.push(lengthen_id(&id));
+            let full = lengthen_id(&id);
+            if full.bytes().any(|b| b.is_ascii_uppercase()) {
+                self.has_uppercase = true;
+            }
+            list.push(full);
         }
     }
 
     pub fn finalize(&mut self) {
+        let mut has_upper = false;
         for list in self.entries.values_mut() {
             list.sort_unstable();
             list.dedup();
+            if !has_upper && list.iter().any(|s| s.bytes().any(|b| b.is_ascii_uppercase())) {
+                has_upper = true;
+            }
         }
+        self.has_uppercase = has_upper;
     }
 
     pub fn apply_vanilla_registries(&mut self, registries: HashMap<String, Vec<String>>) {
@@ -229,31 +239,118 @@ impl RegistryIndex {
         contains: &mut Vec<String>,
     ) {
         let Some(list) = self.entries.get(lookup_cat) else { return };
+        let format_id = |id: &String| if prefix.is_empty() { id.clone() } else { format!("{prefix}{id}") };
+
+        if needle.is_empty() {
+            for id in list.iter().take(limit.saturating_sub(starts.len())) {
+                starts.push(format_id(id));
+            }
+            return;
+        }
+
+        if !self.has_uppercase {
+            let direct_start = list.partition_point(|id| id.as_str() < needle);
+            let direct_end = direct_start + list[direct_start..].iter().take_while(|id| id.starts_with(needle)).count();
+            let direct = &list[direct_start..direct_end];
+
+            // When the user types a short path like "diamond", also match "minecraft:diamond…" in sorted order.
+            let mc_slice = if !needle.contains(':') && !"minecraft:".starts_with(needle) {
+                let mc_needle = format!("minecraft:{needle}");
+                let mc_start = list.partition_point(|id| id.as_str() < mc_needle.as_str());
+                let mc_end = mc_start + list[mc_start..].iter().take_while(|id| id.starts_with(mc_needle.as_str())).count();
+                &list[mc_start..mc_end]
+            } else {
+                &[]
+            };
+
+            let (mut i, mut j) = (0usize, 0usize);
+            while starts.len() < limit && (i < direct.len() || j < mc_slice.len()) {
+                let pick = match (direct.get(i), mc_slice.get(j)) {
+                    (Some(a), Some(b)) => {
+                        if a <= b {
+                            i += 1;
+                            a
+                        } else {
+                            j += 1;
+                            b
+                        }
+                    }
+                    (Some(a), None) => {
+                        i += 1;
+                        a
+                    }
+                    (None, Some(b)) => {
+                        j += 1;
+                        b
+                    }
+                    (None, None) => break,
+                };
+                starts.push(format_id(pick));
+            }
+
+            let need_contains = limit.saturating_sub(starts.len());
+            if need_contains == 0 || contains.len() >= need_contains {
+                return;
+            }
+            for id in list {
+                if id.starts_with(needle) || id.strip_prefix("minecraft:").is_some_and(|s| s.starts_with(needle)) {
+                    continue;
+                }
+                if id.contains(needle) {
+                    contains.push(format_id(id));
+                    if contains.len() >= need_contains {
+                        break;
+                    }
+                }
+            }
+            return;
+        }
+
         for id in list {
-            let lower = id.to_lowercase();
-            let short = lower.strip_prefix("minecraft:");
-            let is_start = needle.is_empty()
-                || lower.starts_with(needle)
-                || short.is_some_and(|s| s.starts_with(needle));
-            let is_match = is_start || lower.contains(needle);
-            if !is_match {
-                continue;
-            }
-            let formatted = if prefix.is_empty() { id.clone() } else { format!("{prefix}{id}") };
+            let short = strip_ascii_prefix(id, "minecraft:");
+            let is_start = starts_with_ascii_lower(id, needle) || short.is_some_and(|s| starts_with_ascii_lower(s, needle));
             if is_start {
-                starts.push(formatted);
-            } else if contains.len() < limit {
-                contains.push(formatted);
-            }
-            if needle.is_empty() && starts.len() >= limit {
-                break;
+                if starts.len() < limit {
+                    starts.push(format_id(id));
+                }
+            } else if contains.len() < limit && contains_ascii_lower(id, needle) {
+                contains.push(format_id(id));
             }
         }
     }
 }
 
-/// Scans `mods/*.jar` in parallel for `data/<ns>/<category>/...json` entries and the mod IDs the jars declare.
-pub fn scan_mod_jars_data(root: &Path, known: &KnownRegistries) -> (HashMap<String, Vec<String>>, HashSet<String>) {
+fn starts_with_ascii_lower(haystack: &str, needle_lower: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let nb = needle_lower.as_bytes();
+    hb.len() >= nb.len() && hb[..nb.len()].iter().zip(nb).all(|(a, b)| a.to_ascii_lowercase() == *b)
+}
+
+fn strip_ascii_prefix<'a>(s: &'a str, prefix_lower: &str) -> Option<&'a str> {
+    starts_with_ascii_lower(s, prefix_lower).then(|| &s[prefix_lower.len()..])
+}
+
+fn contains_ascii_lower(haystack: &str, needle_lower: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let nb = needle_lower.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    if hb.len() < nb.len() {
+        return false;
+    }
+    let first = nb[0];
+    let last_start = hb.len() - nb.len();
+    for i in 0..=last_start {
+        if hb[i].to_ascii_lowercase() == first && hb[i + 1..i + nb.len()].iter().zip(&nb[1..]).all(|(a, b)| a.to_ascii_lowercase() == *b) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Scans `mods/*.jar` in parallel for `data/<ns>/<category>/...json` entries and optionally the mod IDs the jars declare.
+pub fn scan_mod_jars_data(root: &Path, known: &KnownRegistries, need_mod_ids: bool) -> (HashMap<String, Vec<String>>, HashSet<String>) {
     let jars: Vec<PathBuf> = std::fs::read_dir(root.join("mods"))
         .into_iter()
         .flatten()
@@ -274,7 +371,7 @@ pub fn scan_mod_jars_data(root: &Path, known: &KnownRegistries) -> (HashMap<Stri
                 let mut local: HashMap<String, Vec<String>> = HashMap::new();
                 let mut mod_ids: HashSet<String> = HashSet::new();
                 for jar_path in slice {
-                    scan_single_jar(jar_path, known, &mut local, Some(&mut mod_ids));
+                    scan_single_jar(jar_path, known, &mut local, need_mod_ids.then_some(&mut mod_ids));
                 }
                 (local, mod_ids)
             }));
@@ -418,6 +515,7 @@ fn parse_non_json_data_path(path: &str) -> Option<(String, String)> {
 pub fn scan_pack_data(root: &Path, lock: Option<&Lockfile>, known: &KnownRegistries) -> HashMap<String, Vec<String>> {
     let mut out: HashMap<String, Vec<String>> = HashMap::new();
     let mut roots: Vec<PathBuf> = Vec::new();
+    let mut zips: Vec<PathBuf> = Vec::new();
 
     if root.join("data").is_dir() {
         roots.push(root.to_path_buf());
@@ -432,7 +530,7 @@ pub fn scan_pack_data(root: &Path, lock: Option<&Lockfile>, known: &KnownRegistr
                 if p.is_dir() {
                     roots.push(p);
                 } else if pack.zipped && p.is_file() {
-                    scan_single_jar(&p, known, &mut out, None);
+                    zips.push(p);
                 }
             }
         }
@@ -444,7 +542,32 @@ pub fn scan_pack_data(root: &Path, lock: Option<&Lockfile>, known: &KnownRegistr
             if p.is_dir() {
                 roots.push(p);
             } else if p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) {
-                scan_single_jar(&p, known, &mut out, None);
+                zips.push(p);
+            }
+        }
+    }
+
+    zips.sort_unstable();
+    zips.dedup();
+    if !zips.is_empty() {
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8).min(zips.len());
+        let chunk_size = zips.len().div_ceil(threads);
+        let partials: Vec<HashMap<String, Vec<String>>> = std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(threads);
+            for slice in zips.chunks(chunk_size) {
+                handles.push(scope.spawn(move || {
+                    let mut local: HashMap<String, Vec<String>> = HashMap::new();
+                    for zip_path in slice {
+                        scan_single_jar(zip_path, known, &mut local, None);
+                    }
+                    local
+                }));
+            }
+            handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+        for partial in partials {
+            for (cat, ids) in partial {
+                out.entry(cat).or_default().extend(ids);
             }
         }
     }
@@ -869,13 +992,25 @@ mod tests {
         zip.finish().unwrap();
 
         let mut index = RegistryIndex::default();
-        let (jar_entries, jar_mods) = scan_mod_jars_data(&root, &KnownRegistries::default());
+        let (jar_entries, jar_mods) = scan_mod_jars_data(&root, &KnownRegistries::default(), true);
         assert!(["example", "bundled_lib", "deeper_lib"].iter().all(|id| jar_mods.contains(*id)), "{jar_mods:?}");
         assert!(!jar_mods.contains("create"), "a jar's compat data for Create doesn't install Create");
+        let (no_id_entries, no_id_mods) = scan_mod_jars_data(&root, &KnownRegistries::default(), false);
+        assert!(no_id_mods.is_empty(), "skipping mod IDs must skip jar manifests and nested jars");
+        assert_eq!(no_id_entries, jar_entries, "data entries stay identical when skipping mod IDs");
         for (cat, ids) in jar_entries {
             index.insert_entries(&cat, ids);
         }
-        index.insert_entries("item", ["minecraft:diamond".into(), "create:brass_ingot".into()]);
+        index.insert_entries(
+            "item",
+            [
+                "minecraft:diamond".into(),
+                "minecraft:diamond_sword".into(),
+                "create:brass_ingot".into(),
+                "diamond_mod:ruby".into(),
+                "other:blue_diamond".into(),
+            ],
+        );
         index.finalize();
 
         assert_eq!(index.lookup("recipe", "create:brass_ingot", false, false), IdLookup::Known);
@@ -883,7 +1018,12 @@ mod tests {
         assert_eq!(index.lookup("item", "#c:ingots/brass", true, false), IdLookup::Known);
         assert_eq!(index.lookup("item", "create:unknown_item", false, false), IdLookup::UnknownUnverified);
 
-        assert_eq!(index.complete("item", true, false, "diam", 10), vec!["minecraft:diamond"]);
+        assert_eq!(
+            index.complete("item", true, false, "diam", 10),
+            vec!["diamond_mod:ruby", "minecraft:diamond", "minecraft:diamond_sword", "other:blue_diamond"]
+        );
+        assert_eq!(index.complete("item", true, false, "DIAM", 2), vec!["diamond_mod:ruby", "minecraft:diamond"]);
+        assert_eq!(index.complete("item", true, false, "mine", 10), vec!["minecraft:diamond", "minecraft:diamond_sword"]);
         assert_eq!(index.complete("item", true, false, "#c:ing", 10), vec!["#c:ingots/brass"]);
 
         let _ = std::fs::remove_dir_all(&root);

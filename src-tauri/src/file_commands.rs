@@ -32,10 +32,18 @@ pub fn read_file(state: State<'_, AppState>, path: String, allow_large: Option<b
 
 #[tauri::command]
 pub fn write_file(state: State<'_, AppState>, path: String, text: String, crlf: bool, bom: bool) -> CmdResult<()> {
-    let root = state.settings().instance_dir;
+    let settings = state.settings();
+    let root = settings.instance_dir;
     files::write(&root, &path, &text, crlf, bom).map_err(err)?;
     if path.ends_with(".proberaven/dump.json") || path.ends_with("proberaven/dump.json") || path == crate::pack::LOCKFILE {
         state.datapack.invalidate(&root);
+        crate::mcdoc::DatapackCache::spawn_warm(
+            std::sync::Arc::clone(&state.datapack),
+            root,
+            settings.install_dir,
+            std::sync::Arc::clone(&state.probejs),
+            None,
+        );
     }
     Ok(())
 }
@@ -180,20 +188,46 @@ pub async fn probejs_hover(state: State<'_, AppState>, text: String, offset: usi
     .map_err(err)
 }
 
-fn touches_datapack(path: &str) -> bool {
-    let norm = path.replace('\\', "/").to_lowercase();
-    norm.starts_with("data/")
-        || norm.contains("/data/")
-        || norm.starts_with("datapacks/")
-        || norm.starts_with("mods/")
+// A trailing slash lets the bare folder names match too, like pasting straight into `datapacks`.
+fn normalized_dir_path(path: &str) -> String {
+    let mut norm = path.replace('\\', "/").to_lowercase();
+    norm.push('/');
+    norm
+}
+
+fn touches_base_datapack(path: &str) -> bool {
+    let norm = normalized_dir_path(path);
+    norm.starts_with("mods/")
         || norm.contains(".proberaven/")
-        || norm == crate::pack::LOCKFILE
+        || norm.starts_with(".probe/")
+        || norm.starts_with("kubejs/probe/")
+        || norm.strip_suffix('/') == Some(crate::pack::LOCKFILE)
+}
+
+fn touches_pack_data(path: &str) -> bool {
+    let norm = normalized_dir_path(path);
+    norm.starts_with("data/") || norm.contains("/data/") || norm.starts_with("datapacks/")
 }
 
 fn invalidate_if_datapack(state: &AppState, root: &Path, paths: &[&str]) {
-    if paths.iter().any(|p| touches_datapack(p)) {
-        state.datapack.invalidate(root);
+    let base = paths.iter().any(|p| touches_base_datapack(p));
+    let pack_data = paths.iter().any(|p| touches_pack_data(p));
+    if !base && !pack_data {
+        return;
     }
+    let install_dir = state.settings().install_dir;
+    if base {
+        state.datapack.invalidate(root);
+    } else {
+        state.datapack.mark_pack_data_dirty();
+    }
+    crate::mcdoc::DatapackCache::spawn_warm(
+        std::sync::Arc::clone(&state.datapack),
+        root.to_path_buf(),
+        install_dir,
+        std::sync::Arc::clone(&state.probejs),
+        None,
+    );
 }
 
 #[tauri::command]
@@ -359,12 +393,11 @@ fn record_pasted(state: &AppState, root: &Path, verb: &str, pasted: &Pasted) {
 pub async fn trash_paths(state: State<'_, AppState>, paths: Vec<String>) -> CmdResult<()> {
     let root = state.settings().instance_dir;
     let label = format!("Delete {}", history::describe(&paths));
-    let datapack_affected = paths.iter().any(|p| touches_datapack(p));
     let task_root = root.clone();
-    let trashed = tauri::async_runtime::spawn_blocking(move || files::trash(&task_root, &paths)).await.map_err(|e| e.to_string())?.map_err(err)?;
-    if datapack_affected {
-        state.datapack.invalidate(&root);
-    }
+    let task_paths = paths.clone();
+    let trashed = tauri::async_runtime::spawn_blocking(move || files::trash(&task_root, &task_paths)).await.map_err(|e| e.to_string())?.map_err(err)?;
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    invalidate_if_datapack(&state, &root, &refs);
     state.history.lock().unwrap().record(&root, label, trashed.map(Action::Restore));
     Ok(())
 }
@@ -403,8 +436,9 @@ fn explorer_cut(clipboard: &ClipboardContext) -> bool {
 #[tauri::command]
 pub async fn paste_files(state: State<'_, AppState>, dir: String, cut: Vec<String>) -> CmdResult<Pasted> {
     let root = state.settings().instance_dir;
-    let datapack_affected = touches_datapack(&dir) || cut.iter().any(|p| touches_datapack(p));
     let task_root = root.clone();
+    let task_dir = dir.clone();
+    let task_cut = cut.clone();
     let pasted = tauri::async_runtime::spawn_blocking(move || {
         let root = task_root;
         let clipboard = ClipboardContext::new().map_err(|e| format!("opening the clipboard: {e}"))?;
@@ -415,10 +449,10 @@ pub async fn paste_files(state: State<'_, AppState>, dir: String, cut: Vec<Strin
         }
         // You may have copied something else since you cut, so we only treat the paste as a move
         // when the clipboard still holds exactly the files you cut.
-        let cut_paths: HashSet<PathBuf> = files::absolute_paths(&root, &cut).map_err(err)?.into_iter().map(PathBuf::from).collect();
-        let cut_here = !cut.is_empty() && sources.iter().cloned().collect::<HashSet<_>>() == cut_paths;
+        let cut_paths: HashSet<PathBuf> = files::absolute_paths(&root, &task_cut).map_err(err)?.into_iter().map(PathBuf::from).collect();
+        let cut_here = !task_cut.is_empty() && sources.iter().cloned().collect::<HashSet<_>>() == cut_paths;
         let move_requested = cut_here || explorer_cut(&clipboard);
-        let pasted = files::paste(&root, &dir, &sources, move_requested).map_err(err)?;
+        let pasted = files::paste(&root, &task_dir, &sources, move_requested).map_err(err)?;
         // Like Explorer, we empty the clipboard after a cut, since its files are no longer there.
         if move_requested {
             let _ = clipboard.clear();
@@ -427,9 +461,10 @@ pub async fn paste_files(state: State<'_, AppState>, dir: String, cut: Vec<Strin
     })
     .await
     .map_err(|e| e.to_string())??;
-    if datapack_affected {
-        state.datapack.invalidate(&root);
-    }
+    let mut refs: Vec<&str> = Vec::with_capacity(1 + cut.len());
+    refs.push(dir.as_str());
+    refs.extend(cut.iter().map(String::as_str));
+    invalidate_if_datapack(&state, &root, &refs);
     record_pasted(&state, &root, "Paste", &pasted);
     Ok(pasted)
 }
@@ -478,13 +513,11 @@ pub fn move_paths(state: State<'_, AppState>, paths: Vec<String>, dir: String) -
 #[tauri::command]
 pub async fn import_paths(state: State<'_, AppState>, dir: String, sources: Vec<PathBuf>) -> CmdResult<Pasted> {
     let root = state.settings().instance_dir;
-    let datapack_affected = touches_datapack(&dir);
     let requested_move = os_drag::requested_move();
     let task_root = root.clone();
-    let pasted = tauri::async_runtime::spawn_blocking(move || files::import(&task_root, &dir, &sources, requested_move)).await.map_err(|e| e.to_string())?.map_err(err)?;
-    if datapack_affected {
-        state.datapack.invalidate(&root);
-    }
+    let task_dir = dir.clone();
+    let pasted = tauri::async_runtime::spawn_blocking(move || files::import(&task_root, &task_dir, &sources, requested_move)).await.map_err(|e| e.to_string())?.map_err(err)?;
+    invalidate_if_datapack(&state, &root, &[dir.as_str()]);
     record_pasted(&state, &root, if pasted.transfers.is_empty() { "Copy in" } else { "Move in" }, &pasted);
     Ok(pasted)
 }
@@ -500,8 +533,9 @@ pub async fn file_undo(state: State<'_, AppState>, redo: bool) -> CmdResult<Opti
     // Restoring from the trash or moving across drives can take a while, but undo steps must
     // run one at a time, so we hold the history for the whole step.
     let outcome = tokio::task::block_in_place(|| state.history.lock().unwrap().step(&root, redo)).map_err(err)?;
-    if outcome.is_some() {
-        state.datapack.invalidate(&root);
+    if let Some(outcome) = &outcome {
+        let paths: Vec<&str> = outcome.paths().collect();
+        invalidate_if_datapack(&state, &root, &paths);
     }
     Ok(outcome)
 }

@@ -2,10 +2,13 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.3]
+### Added
+- Support for mcdoc dynamic keys in recipes, so the `key` fields will suggest letters you've already entered in the `pattern`. Much more to come here, to support other dynamically keyed fields.
+
 ### Changed
 - Greatly improve the responsiveness of autocomplete, especially for very large packs with a lot of registry entries
-- Minor improvements to recipe autocomplete
+
 ### Fixed
 - Autocomplete not working for some keys that were valid until you had already typed the full key.
 

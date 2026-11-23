@@ -1195,3 +1195,86 @@ fn validates_apotheosis_trades_mixes_stats_and_spawner_recipes() {
     let diags = check_json_with_type(parsed.root.as_ref().unwrap(), spawner_schema, &env).diagnostics;
     assert!(diags.is_empty(), "spawner_modifier failed: {diags:?}");
 }
+
+#[test]
+fn validates_and_completes_bettercombat_irons_and_dynamic_difficulty() {
+    let manifest = load_muon_manifest_for_test();
+    let mut tables = SymbolTables::default();
+    parse_and_bind(PACKRAVEN_MCDOC, "::packraven", &mut tables).unwrap();
+    let mut path_rules = Vec::new();
+    for id in ["bettercombat", "irons_spellbooks", "dynamic_difficulty"] {
+        let entry = manifest.schemas.iter().find(|e| e.id == id).unwrap_or_else(|| panic!("manifest has no `{id}` schema"));
+        let src = load_muon_mcdoc_for_test(&entry.file);
+        parse_and_bind(&src, &entry.module, &mut tables).unwrap();
+        path_rules.extend(entry.paths.iter().cloned());
+    }
+
+    let mut registries = RegistryIndex { code_source: super::registries::CodeRegistrySource::ProbeRaven, ..Default::default() };
+    registries.insert_entries("irons_spellbooks:schools", ["irons_spellbooks:fire".into(), "aero_additions:wind".into()]);
+    registries.insert_entries("sound_event", ["simplyswords:elemental_sword_holy_attack_01".into()]);
+    registries.insert_entries("attribute", ["minecraft:generic.max_health".into()]);
+    registries.finalize();
+
+    let index = super::DatapackIndex {
+        tables,
+        registries,
+        version: VersionContext { minecraft: Some("1.21.1".into()), neoforge: Some("21.1.265".into()) },
+        path_rules,
+        ignored_loaders: vec!["forge", "fabric"],
+        foreign_loader_folders: &[],
+        data_pack_format: None,
+    };
+
+    // 1. Better Combat: validate & complete inside `attributes.attacks[0]`
+    let bc_path = "config/paxi/datapacks/Raven's Data/data/simplyswords/weapon_attributes/arcanethyst.json";
+    assert_eq!(index.resolve_category(bc_path).as_deref(), Some("bettercombat:weapon_attributes"));
+    let bc_valid = r#"{ "attributes": { "attack_range": 4, "attacks": [{ "hitbox": "HORIZONTAL_PLANE", "damage_multiplier": 1.0, "angle": 160, "upswing": 0.5, "animation": "malfu:halberd" }] } }"#;
+    assert!(index.lint(bc_path, bc_valid).is_empty(), "{:?}", index.lint(bc_path, bc_valid));
+    let bc_inherited = r#"{ "parent": "bettercombat:claymore", "attributes": { "attacks": [{ "damage_multiplier": 1.5 }] } }"#;
+    let bc_inherited_diags: Vec<_> = index.lint(bc_path, bc_inherited).into_iter().filter(|d| d.severity == "error").collect();
+    assert!(bc_inherited_diags.is_empty(), "parent-inheriting partial attack should have no errors: {bc_inherited_diags:?}");
+    let bc_missing_req = r#"{ "attributes": { "attacks": [{ "damage_multiplier": 1.0 }] } }"#;
+    let bc_missing_diags = index.lint(bc_path, bc_missing_req);
+    assert!(
+        bc_missing_diags.iter().any(|d| d.severity == "error"),
+        "standalone attack missing hitbox/animation should error: {bc_missing_diags:?}"
+    );
+    let bc_bad = r#"{ "attributes": { "attacks": [{ "hitbox": "BOGUS", "animation": "a", "unknown_field": 1 }] } }"#;
+    let bc_diags = index.lint(bc_path, bc_bad);
+    assert!(bc_diags.len() >= 2, "expected hitbox + unknown_field diagnostics, got: {bc_diags:?}");
+
+    let bc_root_src = "{\n  \"\"\n}";
+    let bc_root_keys: Vec<String> = index.complete(bc_path, bc_root_src, bc_root_src.find("\"\"").unwrap() + 1).items.into_iter().map(|i| i.label).collect();
+    assert!(bc_root_keys.contains(&"parent".to_string()) && bc_root_keys.contains(&"attributes".to_string()), "bc root keys: {bc_root_keys:?}");
+
+    let bc_comp_src = "{\n  \"attributes\": {\n    \"attacks\": [\n      {\n        \"\"\n      }\n    ]\n  }\n}";
+    let bc_cursor = bc_comp_src.find("\"\"").unwrap() + 1;
+    let bc_keys: Vec<String> = index.complete(bc_path, bc_comp_src, bc_cursor).items.into_iter().map(|i| i.label).collect();
+    assert!(bc_keys.contains(&"hitbox".to_string()) && bc_keys.contains(&"animation".to_string()), "bc attack keys: {bc_keys:?}");
+
+    let bc_val_src = r#"{ "attributes": { "attacks": [{ "hitbox": "", "animation": "a" }] } }"#;
+    let bc_val_cursor = bc_val_src.find("\"\"").unwrap() + 1;
+    let bc_vals: Vec<String> = index.complete(bc_path, bc_val_src, bc_val_cursor).items.into_iter().map(|i| i.label).collect();
+    assert!(bc_vals.contains(&"HORIZONTAL_PLANE".to_string()), "bc hitbox values: {bc_vals:?}");
+
+    // 2. Iron's Spellbooks spell config: validate & complete keys and school registry values
+    let is_path = "config/paxi/datapacks/Raven's Data/data/wind_spellbooks/irons_spellbooks_spell_config/aeropic.json";
+    assert_eq!(index.resolve_category(is_path).as_deref(), Some("irons_spellbooks:spell_config"));
+    let is_src = "{\n  \"irons_spellbooks:school\": \"aero\"\n}";
+    let is_val_cursor = is_src.find("aero").unwrap() + 4;
+    let is_vals: Vec<String> = index.complete(is_path, is_src, is_val_cursor).items.into_iter().map(|i| i.label).collect();
+    assert!(is_vals.contains(&"aero_additions:wind".to_string()), "irons school values: {is_vals:?}");
+
+    let is_key_src = "{\n  \"\"\n}";
+    let is_key_cursor = is_key_src.find("\"\"").unwrap() + 1;
+    let is_keys: Vec<String> = index.complete(is_path, is_key_src, is_key_cursor).items.into_iter().map(|i| i.label).collect();
+    assert!(is_keys.contains(&"irons_spellbooks:school".to_string()) && is_keys.contains(&"irons_spellbooks:enabled".to_string()), "irons spell config keys: {is_keys:?}");
+
+    // 3. Dynamic Difficulty leveling settings: validate & complete spread BaseLevelingSettings + EntityLevelingSettings keys
+    let dd_path = "config/paxi/datapacks/Raven's Data/data/witchery/leveling_settings/entities/baba_yaga.json";
+    assert_eq!(index.resolve_category(dd_path).as_deref(), Some("dynamic_difficulty:entity_leveling_settings"));
+    let dd_key_src = "{\n  \"\"\n}";
+    let dd_key_cursor = dd_key_src.find("\"\"").unwrap() + 1;
+    let dd_keys: Vec<String> = index.complete(dd_path, dd_key_src, dd_key_cursor).items.into_iter().map(|i| i.label).collect();
+    assert!(dd_keys.contains(&"starting_level".to_string()) && dd_keys.contains(&"apply_level_bonuses".to_string()), "dd keys: {dd_keys:?}");
+}

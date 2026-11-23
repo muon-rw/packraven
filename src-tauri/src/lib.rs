@@ -157,6 +157,7 @@ pub fn run() {
             announcer::start(app.handle().clone());
             app.manage(self_update::SelfUpdate::default());
             self_update::start(app.handle().clone());
+            mcdoc::start_refresh_loop(app.handle().clone());
 
             let show = MenuItem::with_id(app, "show", "Show packraven", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;

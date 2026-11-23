@@ -1,7 +1,7 @@
 import type { Extension } from '@codemirror/state'
 import { ViewPlugin, hoverTooltip, type EditorView, type Tooltip, type ViewUpdate } from '@codemirror/view'
 import { autocompletion, completionStatus, startCompletion, type Completion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
-import { api, errorText } from './api'
+import { api, errorText, type DatapackStatusInfo } from './api'
 
 export type DatapackSchemaStatus = 'idle' | 'loading' | 'ready' | 'unavailable' | 'error'
 export type CodeRegistrySource = 'vanillaOnly' | 'probeJs' | 'probeRaven'
@@ -49,6 +49,24 @@ function failedRecently() {
   return (datapack.status === 'unavailable' || datapack.status === 'error') && Date.now() - lastFailedAt < RECHECK_AFTER_MS
 }
 
+export function applyDatapackStatus(info: DatapackStatusInfo): boolean {
+  datapack.minecraft = info.minecraft
+  datapack.loader = info.loader
+  datapack.symbolCount = info.symbolCount
+  datapack.registryEntries = info.registryEntries
+  datapack.codeSource = info.codeSource
+  datapack.probeAvailable = info.probeAvailable
+  datapack.loadMs = info.loadMs
+  datapack.error = info.error
+  if (!info.available) {
+    datapack.status = info.error ? 'error' : 'unavailable'
+    lastFailedAt = Date.now()
+    return false
+  }
+  datapack.status = 'ready'
+  return true
+}
+
 export async function ensureDatapack(force = false): Promise<boolean> {
   if (!force && datapack.status === 'ready') return true
   if (!force && failedRecently()) return false
@@ -60,22 +78,7 @@ export async function ensureDatapack(force = false): Promise<boolean> {
   let run!: Promise<boolean>
   run = (async () => {
     try {
-      const info = await api.datapackStatus(force)
-      datapack.minecraft = info.minecraft
-      datapack.loader = info.loader
-      datapack.symbolCount = info.symbolCount
-      datapack.registryEntries = info.registryEntries
-      datapack.codeSource = info.codeSource
-      datapack.probeAvailable = info.probeAvailable
-      datapack.loadMs = info.loadMs
-      datapack.error = info.error
-      if (!info.available) {
-        datapack.status = info.error ? 'error' : 'unavailable'
-        lastFailedAt = Date.now()
-        return false
-      }
-      datapack.status = 'ready'
-      return true
+      return applyDatapackStatus(await api.datapackStatus(force))
     } catch (e) {
       datapack.status = 'error'
       datapack.error = errorText(e)

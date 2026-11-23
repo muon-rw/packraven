@@ -17,7 +17,7 @@
   import FileSearchResults from '../components/FileSearchResults.svelte'
   import TextSearch from '../components/TextSearch.svelte'
   import { textSearch } from '../lib/textSearch.svelte'
-  import type { TextMatch } from '../lib/api'
+  import type { DatapackStatusInfo, TextMatch } from '../lib/api'
   import ImageView from '../components/ImageView.svelte'
   import MediaView from '../components/MediaView.svelte'
   import NbtView from '../components/NbtView.svelte'
@@ -27,7 +27,7 @@
   import { canFormat, isGzip, outerArchive, packTarget, viewerFor } from '../lib/viewers'
   import { isKubejsScript } from '../lib/kubejs'
   import { probejs, refreshProbejs } from '../lib/probejs.svelte'
-  import { datapack, isDatapackJson, refreshDatapack } from '../lib/datapack.svelte'
+  import { applyDatapackStatus, datapack, isDatapackJson, refreshDatapack } from '../lib/datapack.svelte'
   import { job, onJobEnd } from '../lib/jobs.svelte'
   import type { FormatOutcome } from '../lib/format'
   import ContextMenu from '../components/ContextMenu.svelte'
@@ -91,12 +91,18 @@
     loadChanges()
     const timer = setInterval(loadChanges, 30_000)
     const unlistenGit = listen('git-change', loadChanges)
+    const unlistenSchemas = listen<DatapackStatusInfo>('datapack-schemas-updated', ({ payload }) => {
+      const ok = applyDatapackStatus(payload)
+      const tab = activeTab()
+      if (ok && view && tab && isDatapackJson(tab.path)) checkNow()
+    })
     document.addEventListener('visibilitychange', loadChanges)
     const pinActive = () => workspace.active && pin(workspace.active)
     host.addEventListener('mousedown', pinActive)
     return () => {
       clearInterval(timer)
       unlistenGit.then((stop) => stop())
+      unlistenSchemas.then((stop) => stop())
       document.removeEventListener('visibilitychange', loadChanges)
       host.removeEventListener('mousedown', pinActive)
       const current = activeTab()

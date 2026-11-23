@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -11,6 +12,10 @@ use serde_json::Value;
 use super::types::SymbolTables;
 use super::version::compare_version;
 use crate::http::CLIENT;
+
+// Only background refreshes give up early. They always have a cached copy to fall back on, while a
+// first download on a slow connection must be allowed to finish.
+const BACKGROUND_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 
 const VANILLA_MCDOC_SYMBOLS_URL: &str = "https://api.spyglassmc.com/vanilla-mcdoc/symbols";
 const MISODE_PARTNER_MCDOC_BASE: &str = "https://raw.githubusercontent.com/misode/misode.github.io/master/public/mcdoc";
@@ -539,10 +544,98 @@ fn parse_mcdoc_bytes(bytes: &[u8], label: &str) -> Result<String> {
     Ok(text)
 }
 
-/// Reads a persisted local file when present; on refresh (`force`) or cache miss, fetches from `url`,
-/// validates with `parse`, and atomically replaces the file on disk. A failed or invalid fetch falls back
-/// to the existing local file so flaky networks never block or wipe schemas.
+/// Checks `vanilla-mcdoc/symbols`, `muon-rw/mcdocs`, and `misode` partner schemas against their
+/// remote sources using HTTP `ETag` conditional requests, updating the local cache whenever any file
+/// changed. Returns whether any cached schema changed on disk. Offline or failed requests leave the
+/// cached files intact and return `false`.
+pub async fn refresh_remote_schemas(active_muon_files: &[String], active_partners: &[String]) -> bool {
+    let vanilla_path = cache_dir().join("vanilla-mcdoc-symbols.json");
+    let manifest_path = cache_dir().join("muon").join("manifest.json");
+    let manifest_url = format!("{MUON_MCDOCS_BASE}/manifest.json");
+    let misode_path = cache_dir().join("misode-config.json");
+
+    let (vanilla_res, manifest_res, misode_res) = tokio::join!(
+        load_cached_with_status(&vanilla_path, VANILLA_MCDOC_SYMBOLS_URL, true, Some(BACKGROUND_REFRESH_TIMEOUT), |bytes| {
+            serde_json::from_slice::<SymbolTables>(bytes).context("parsing vanilla-mcdoc symbols.json")
+        }),
+        load_cached_with_status(&manifest_path, &manifest_url, true, Some(BACKGROUND_REFRESH_TIMEOUT), |bytes| {
+            serde_json::from_slice::<MuonManifest>(bytes).context("parsing muon-rw/mcdocs manifest.json")
+        }),
+        load_cached_with_status(&misode_path, MISODE_CONFIG_URL, true, Some(BACKGROUND_REFRESH_TIMEOUT), |bytes| {
+            serde_json::from_slice::<MisodeConfig>(bytes).context("parsing misode config.json")
+        }),
+    );
+
+    let mut changed = vanilla_res.as_ref().is_ok_and(|(_, c)| *c)
+        || manifest_res.as_ref().is_ok_and(|(_, c)| *c)
+        || misode_res.as_ref().is_ok_and(|(_, c)| *c);
+
+    let mut muon_files: HashSet<String> = active_muon_files.iter().cloned().collect();
+    if let Ok((manifest, _)) = manifest_res {
+        for entry in manifest.schemas {
+            let rel = entry.file.trim_start_matches('/');
+            let cached = cache_dir().join("muon").join(sanitize_version(&rel.replace('/', "_")));
+            if cached.is_file() {
+                muon_files.insert(entry.file);
+            }
+        }
+    }
+
+    let mut partner_names: HashSet<String> = active_partners.iter().cloned().collect();
+    if let Ok(mut entries) = tokio::fs::read_dir(cache_dir().join("partners")).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "mcdoc")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                partner_names.insert(stem.to_string());
+            }
+        }
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for file in muon_files {
+        set.spawn(async move {
+            let rel = file.trim_start_matches('/').to_string();
+            let safe_name = sanitize_version(&rel.replace('/', "_"));
+            let path = cache_dir().join("muon").join(safe_name);
+            let url = format!("{MUON_MCDOCS_BASE}/{rel}");
+            load_cached_with_status(&path, &url, true, Some(BACKGROUND_REFRESH_TIMEOUT), |bytes| parse_mcdoc_bytes(bytes, &rel))
+                .await
+                .is_ok_and(|(_, c)| c)
+        });
+    }
+    for name in partner_names {
+        set.spawn(async move {
+            let safe = sanitize_version(&name);
+            let path = cache_dir().join("partners").join(format!("{safe}.mcdoc"));
+            let url = format!("{MISODE_PARTNER_MCDOC_BASE}/{safe}.mcdoc");
+            load_cached_with_status(&path, &url, true, Some(BACKGROUND_REFRESH_TIMEOUT), |bytes| parse_mcdoc_bytes(bytes, &name))
+                .await
+                .is_ok_and(|(_, c)| c)
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        if matches!(joined, Ok(true)) {
+            changed = true;
+        }
+    }
+
+    changed
+}
+
+/// Reads a persisted local file when present; on refresh (`force`) or cache miss, fetches from `url`
+/// (sending `If-None-Match` when a cached `ETag` is present), validates with `parse`, and atomically
+/// replaces the file on disk. A failed or invalid fetch falls back to the existing local file so
+/// flaky networks or offline use never block or wipe schemas.
 async fn load_cached<T, F>(path: &Path, url: &str, force: bool, parse: F) -> Result<T>
+where
+    F: Fn(&[u8]) -> Result<T>,
+{
+    load_cached_with_status(path, url, force, None, parse).await.map(|(value, _)| value)
+}
+
+async fn load_cached_with_status<T, F>(path: &Path, url: &str, force: bool, timeout: Option<Duration>, parse: F) -> Result<(T, bool)>
 where
     F: Fn(&[u8]) -> Result<T>,
 {
@@ -552,18 +645,72 @@ where
         None
     };
     if !force && let Some(cached) = existing {
-        return Ok(cached);
+        return Ok((cached, false));
     }
-    match fetch_bytes(url).await.and_then(|bytes| parse(&bytes).map(|parsed| (bytes, parsed))) {
-        Ok((bytes, parsed)) => {
-            let _ = write_atomic(path, &bytes).await;
-            Ok(parsed)
-        }
+    let etag_file = etag_path(path);
+    let cached_etag = if existing.is_some() {
+        tokio::fs::read_to_string(&etag_file).await.ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    match fetch_conditional(url, cached_etag.as_deref(), timeout).await {
+        Ok(FetchOutcome::NotModified) => match existing {
+            Some(cached) => Ok((cached, false)),
+            None => anyhow::bail!("received 304 Not Modified without a cached copy for {url}"),
+        },
+        Ok(FetchOutcome::Body { bytes, etag }) => match parse(&bytes) {
+            Ok(parsed) => {
+                let _ = write_atomic(path, &bytes).await;
+                if let Some(tag) = etag {
+                    let _ = write_atomic(&etag_file, tag.as_bytes()).await;
+                } else {
+                    let _ = tokio::fs::remove_file(&etag_file).await;
+                }
+                Ok((parsed, true))
+            }
+            Err(err) => match existing {
+                Some(cached) => Ok((cached, false)),
+                None => Err(err),
+            },
+        },
         Err(err) => match existing {
-            Some(cached) => Ok(cached),
+            Some(cached) => Ok((cached, false)),
             None => Err(err),
         },
     }
+}
+
+enum FetchOutcome {
+    NotModified,
+    Body { bytes: Vec<u8>, etag: Option<String> },
+}
+
+fn etag_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push(".etag");
+    PathBuf::from(os)
+}
+
+async fn fetch_conditional(url: &str, etag: Option<&str>, timeout: Option<Duration>) -> Result<FetchOutcome> {
+    let mut req = CLIENT.get(url);
+    if let Some(timeout) = timeout {
+        req = req.timeout(timeout);
+    }
+    if let Some(tag) = etag {
+        req = req.header(reqwest::header::IF_NONE_MATCH, tag);
+    }
+    let response = req.send().await?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(FetchOutcome::NotModified);
+    }
+    let response = response.error_for_status().with_context(|| format!("fetching {url}"))?;
+    let next_etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bytes = response.bytes().await?.to_vec();
+    Ok(FetchOutcome::Body { bytes, etag: next_etag })
 }
 
 fn parse_mcmeta_blocks(bytes: &[u8]) -> Result<HashMap<String, BTreeMap<String, Vec<String>>>> {
@@ -588,11 +735,6 @@ fn parse_mcmeta_blocks(bytes: &[u8]) -> Result<HashMap<String, BTreeMap<String, 
         }
     }
     Ok(out)
-}
-
-async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let response = CLIENT.get(url).send().await?.error_for_status().with_context(|| format!("fetching {url}"))?;
-    Ok(response.bytes().await?.to_vec())
 }
 
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -656,6 +798,99 @@ mod tests {
             .expect("failed refresh must preserve local copy");
         assert_eq!(preserved, original);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn load_cached_uses_etag_for_304_and_updates_on_200() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir().join(format!("packraven-fetch-etag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("schema.mcdoc");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let responses = [
+                ("v1", "struct A { x: int }\n", None),
+                ("v1", "", Some("\"v1\"")),
+                ("v2", "struct B { y: string }\n", Some("\"v1\"")),
+            ];
+            for (etag, body, expect_inm) in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                if let Some(expected) = expect_inm {
+                    assert!(
+                        req.to_ascii_lowercase().contains(&format!("if-none-match: {}", expected.to_ascii_lowercase())),
+                        "expected If-None-Match {expected}, got:\n{req}"
+                    );
+                }
+                let resp = if body.is_empty() {
+                    "HTTP/1.1 304 Not Modified\r\nconnection: close\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\netag: \"{etag}\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let url = format!("http://{addr}/schema.mcdoc");
+        let (first, changed1) = load_cached_with_status(&file, &url, true, None, |b| parse_mcdoc_bytes(b, "test")).await.unwrap();
+        assert!(changed1);
+        assert!(first.contains("struct A"));
+
+        let (second, changed2) = load_cached_with_status(&file, &url, true, None, |b| parse_mcdoc_bytes(b, "test")).await.unwrap();
+        assert!(!changed2);
+        assert_eq!(second, first);
+
+        let (third, changed3) = load_cached_with_status(&file, &url, true, None, |b| parse_mcdoc_bytes(b, "test")).await.unwrap();
+        assert!(changed3);
+        assert!(third.contains("struct B"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), third);
+
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn refresh_replaces_a_stale_copy_cached_before_etags() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = std::env::temp_dir().join(format!("packraven-fetch-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("manifest.mcdoc");
+        std::fs::write(&file, "struct Old { x: int }\n").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            assert!(!req.contains("if-none-match"), "sent a conditional request without a stored ETag:\n{req}");
+            let body = "struct New { y: string }\n";
+            let resp = format!("HTTP/1.1 200 OK\r\netag: \"n\"\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let url = format!("http://{addr}/manifest.mcdoc");
+        let (fresh, changed) = load_cached_with_status(&file, &url, true, Some(BACKGROUND_REFRESH_TIMEOUT), |b| parse_mcdoc_bytes(b, "test"))
+            .await
+            .unwrap();
+        assert!(changed);
+        assert!(fresh.contains("struct New"));
+        assert_eq!(std::fs::read_to_string(etag_path(&file)).unwrap(), "\"n\"");
+
+        server.await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

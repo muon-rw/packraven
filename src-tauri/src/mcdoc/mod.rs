@@ -13,10 +13,11 @@ pub mod version;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sha1::{Digest, Sha1};
+use tauri::{AppHandle, Emitter, Manager};
 
 use checker::{check_json_with_type, resource_root_type, CheckEnv};
 use completer::{byte_to_utf16, CompleteOptions, CompletionResult, HoverInfo};
@@ -247,12 +248,17 @@ impl DatapackIndex {
     }
 }
 
+pub const SCHEMAS_UPDATED_EVENT: &str = "datapack-schemas-updated";
+const SCHEMA_REFRESH_EVERY: Duration = Duration::from_secs(5 * 60);
+
 struct CachedDatapack {
     root: PathBuf,
     fingerprint: String,
     build_started: Instant,
     status: DatapackStatus,
     index: Option<Arc<DatapackIndex>>,
+    active_muon_files: Vec<String>,
+    active_partners: Vec<String>,
 }
 
 #[derive(Default)]
@@ -262,10 +268,56 @@ pub struct DatapackCache {
     building: tokio::sync::Mutex<()>,
 }
 
+/// Refreshes remote schemas on startup and periodically in the background using conditional `ETag`
+/// requests, rebuilding the active pack's index and notifying open editors when anything changes.
+pub fn start_refresh_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            refresh_in_background(&app).await;
+            tokio::time::sleep(SCHEMA_REFRESH_EVERY).await;
+        }
+    });
+}
+
+async fn refresh_in_background(app: &AppHandle) {
+    let state = app.state::<crate::commands::AppState>();
+    let (active_muon_files, active_partners) = state.datapack.cached_schema_inputs();
+    let changed = fetch::refresh_remote_schemas(&active_muon_files, &active_partners).await;
+    if !changed {
+        return;
+    }
+    // A build already running may have read the old files, and it only shows up in `has_cached` once
+    // it finishes. Later refreshes get 304s and report no change, so we wait instead of skipping it.
+    drop(state.datapack.building.lock().await);
+    let settings = state.settings();
+    if !state.datapack.has_cached(&settings.instance_dir) {
+        return;
+    }
+    state.datapack.invalidate(&settings.instance_dir);
+    let probe = Arc::clone(&state.probejs);
+    let (status, _) = state.datapack.ensure(settings.instance_dir, settings.install_dir, probe, false).await;
+    if status.available {
+        let _ = app.emit(SCHEMAS_UPDATED_EVENT, &status);
+    }
+}
+
 impl DatapackCache {
     pub fn get(&self, root: &Path) -> Option<Arc<DatapackIndex>> {
         let guard = self.inner.lock().unwrap();
         guard.as_ref().filter(|c| c.root == root).and_then(|c| c.index.clone())
+    }
+
+    pub fn has_cached(&self, root: &Path) -> bool {
+        let guard = self.inner.lock().unwrap();
+        guard.as_ref().is_some_and(|c| c.root == root && c.index.is_some())
+    }
+
+    pub fn cached_schema_inputs(&self) -> (Vec<String>, Vec<String>) {
+        let guard = self.inner.lock().unwrap();
+        match guard.as_ref() {
+            Some(c) => (c.active_muon_files.clone(), c.active_partners.clone()),
+            None => (Vec::new(), Vec::new()),
+        }
     }
 
     pub fn invalidate(&self, root: &Path) {
@@ -340,6 +392,8 @@ impl DatapackCache {
                     build_started: started,
                     status: status.clone(),
                     index: None,
+                    active_muon_files: Vec::new(),
+                    active_partners: Vec::new(),
                 });
                 return (status, None);
             }
@@ -404,6 +458,7 @@ impl DatapackCache {
         .unwrap_or_default();
 
         let mut path_rules = Vec::new();
+        let mut active_muon_files = Vec::new();
 
         // Fetch and bind schemas from `muon-rw/mcdocs` (live, disk-cached).
         if let Some(manifest) = &muon_manifest {
@@ -420,6 +475,7 @@ impl DatapackCache {
                     continue;
                 }
                 path_rules.extend(entry.paths.iter().cloned());
+                active_muon_files.push(entry.file.clone());
                 let file = entry.file.clone();
                 let module = entry.module.clone();
                 set.spawn(async move { (module, fetch::load_muon_mcdoc(&file, force).await) });
@@ -433,6 +489,7 @@ impl DatapackCache {
 
         // Fetch and bind misode partner `.mcdoc` schemas dynamically from `misode/misode.github.io`.
         let partner_names = fetch::partner_schemas_for_pack(loader_kind.as_deref(), &registries.mod_ids, misode_config.as_ref());
+        let active_partners = partner_names.clone();
         if let Some(cfg) = &misode_config {
             path_rules.extend(fetch::misode_partner_path_rules(cfg, &partner_names, minecraft.as_deref()));
         }
@@ -493,6 +550,8 @@ impl DatapackCache {
             build_started: started,
             status: status.clone(),
             index: Some(index.clone()),
+            active_muon_files,
+            active_partners,
         });
         (status, Some(index))
     }

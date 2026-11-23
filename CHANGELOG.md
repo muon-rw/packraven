@@ -2,6 +2,10 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2]
+### Fixed
+- New mcdocs not working in the editor until you clicked **Schemas**. (They're now downloaded on app startup and periodically checked)
+
 ## [0.7.1] - 2026-11-22
 ### Added
 - New mods supported for JSON autocomplete/validation: 

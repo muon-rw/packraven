@@ -17,9 +17,6 @@ const MISODE_PARTNER_MCDOC_BASE: &str = "https://raw.githubusercontent.com/misod
 const MISODE_CONFIG_URL: &str = "https://raw.githubusercontent.com/misode/misode.github.io/master/src/config.json";
 const MUON_MCDOCS_BASE: &str = "https://raw.githubusercontent.com/muon-rw/mcdocs/main";
 
-/// Offline fallback copy of `muon-rw/mcdocs`'s Apotheosis schema (1.21.1+ and 26.1).
-pub const APOTHEOSIS_MCDOC: &str = include_str!("apotheosis.mcdoc");
-
 /// Pairs each load condition dispatcher in [`PACKRAVEN_MCDOC`] with the registry its `type` field names.
 /// NeoForge's name matches its real registry, so a ProbeRaven dump fills in modded conditions. Fabric
 /// and Forge 1.20.1 keep conditions in plain maps that no dump can read, so their `type` fields only
@@ -157,6 +154,8 @@ pub struct MuonSchemaEntry {
     pub id: String,
     pub file: String,
     pub module: String,
+    #[serde(default)]
+    pub loaders: Vec<String>,
     #[serde(default)]
     pub mod_ids: Vec<String>,
     #[serde(default)]

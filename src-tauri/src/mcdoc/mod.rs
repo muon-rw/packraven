@@ -95,12 +95,18 @@ impl DatapackIndex {
             && let Some(stripped) = after_data.strip_suffix(".json")
             && let Some((namespace, rest)) = stripped.split_once('/')
         {
-            // Longest matching dynamic folder rule wins over generic single-segment fallback.
+            // Exact rules beat folder rules, namespaced rules beat wildcard rules, then longest match wins.
             if let Some(rule) = self
                 .path_rules
                 .iter()
                 .filter(|r| r.matches(namespace, rest))
-                .max_by_key(|r| r.exact.as_ref().map(String::len).or_else(|| r.folder.as_ref().map(String::len)).unwrap_or(0))
+                .max_by_key(|r| {
+                    (
+                        r.exact.is_some(),
+                        r.namespace.is_some(),
+                        r.exact.as_ref().map(String::len).or_else(|| r.folder.as_ref().map(String::len)).unwrap_or(0),
+                    )
+                })
             {
                 return Some(rule.category.clone());
             }
@@ -112,13 +118,13 @@ impl DatapackIndex {
     pub fn json_dialect(&self, path: &str) -> Option<json_parser::JsonDialect> {
         let minecraft = self.version.minecraft.as_deref()?;
         let category = self.resolve_category(path);
-        Some(json_dialect_for(minecraft, self.version.neoforge.is_some(), category.as_deref()))
+        Some(json_dialect_for(minecraft, self.version.neoforge.is_some(), category.as_deref(), &self.registries.known))
     }
 
     fn reads_primitives_as_strings(&self, path: &str) -> bool {
         let category = self.resolve_category(path);
         self.version.minecraft.as_deref().is_some_and(|mc| version::compare_version(mc, "1.20.5") == std::cmp::Ordering::Less)
-            && !category.as_deref().is_some_and(|c| c.starts_with("tag/") || loads_through_registry_data_loader(c))
+            && !category.as_deref().is_some_and(|c| c.starts_with("tag/") || loads_through_registry_data_loader(c, &self.registries.known))
     }
 
     /// Lints a file only when Minecraft would load it, so a copy that one of the pack's overlays
@@ -398,7 +404,6 @@ impl DatapackCache {
         .unwrap_or_default();
 
         let mut path_rules = Vec::new();
-        let mut apotheosis_loaded = false;
 
         // Fetch and bind schemas from `muon-rw/mcdocs` (live, disk-cached).
         if let Some(manifest) = &muon_manifest {
@@ -407,29 +412,23 @@ impl DatapackCache {
                 if !fetch::schema_matches_version(minecraft.as_deref(), entry.min_minecraft.as_deref(), entry.max_minecraft.as_deref()) {
                     continue;
                 }
-                if !entry.always_load && !entry.mod_ids.iter().any(|m| registries.mod_ids.contains(m)) {
+                let loader_match = loader_kind
+                    .as_deref()
+                    .is_some_and(|l| entry.loaders.iter().any(|allowed| allowed.eq_ignore_ascii_case(l)));
+                let mod_match = entry.mod_ids.iter().any(|m| registries.mod_ids.contains(m));
+                if !entry.always_load && !loader_match && !mod_match {
                     continue;
                 }
                 path_rules.extend(entry.paths.iter().cloned());
-                let entry_id = entry.id.clone();
                 let file = entry.file.clone();
                 let module = entry.module.clone();
-                set.spawn(async move { (entry_id, module, fetch::load_muon_mcdoc(&file, force).await) });
+                set.spawn(async move { (module, fetch::load_muon_mcdoc(&file, force).await) });
             }
             while let Some(joined) = set.join_next().await {
-                if let Ok((entry_id, module, Ok(src))) = joined
-                    && parser::parse_and_bind(&src, &module, &mut tables).is_ok()
-                    && entry_id == "apotheosis"
-                {
-                    apotheosis_loaded = true;
+                if let Ok((module, Ok(src))) = joined {
+                    let _ = parser::parse_and_bind(&src, &module, &mut tables);
                 }
             }
-        }
-        // Offline fallback for Apotheosis when `muon-rw/mcdocs` is unreachable and uncached.
-        if !apotheosis_loaded
-            && fetch::schema_matches_version(minecraft.as_deref(), Some("1.21.1"), None)
-        {
-            let _ = parser::parse_and_bind(fetch::APOTHEOSIS_MCDOC, "::apotheosis", &mut tables);
         }
 
         // Fetch and bind misode partner `.mcdoc` schemas dynamically from `misode/misode.github.io`.
@@ -504,10 +503,10 @@ impl DatapackCache {
 ///   also extend) reads non-leniently, while tags and `RegistryDataLoader` registries read leniently.
 /// - From 1.21.11 (and, we assume, 1.21.2 on) everything uses `StrictJsonParser`, except that NeoForge
 ///   patches the shared data loader back to lenient through 26.2. NeoForge 26.3 is strict throughout.
-fn json_dialect_for(minecraft: &str, neoforge: bool, category: Option<&str>) -> json_parser::JsonDialect {
+fn json_dialect_for(minecraft: &str, neoforge: bool, category: Option<&str>, known: &registries::KnownRegistries) -> json_parser::JsonDialect {
     use json_parser::JsonDialect;
     use std::cmp::Ordering::Less;
-    let tags_or_registry = category.is_some_and(|c| c.starts_with("tag/") || loads_through_registry_data_loader(c));
+    let tags_or_registry = category.is_some_and(|c| c.starts_with("tag/") || loads_through_registry_data_loader(c, known));
     if version::compare_version(minecraft, "1.21.2") == Less {
         return if tags_or_registry { JsonDialect::Lenient } else { JsonDialect::LegacyStrict };
     }
@@ -517,32 +516,18 @@ fn json_dialect_for(minecraft: &str, neoforge: bool, category: Option<&str>) -> 
     JsonDialect::Strict
 }
 
-/// Categories `RegistryDataLoader` reads: its `WORLDGEN_REGISTRIES` and dimension registries, and
-/// NeoForge's datapack registries.
-fn loads_through_registry_data_loader(category: &str) -> bool {
-    category.starts_with("worldgen/")
-        || category.ends_with("_variant")
-        || matches!(
-            category,
-            "dimension"
-                | "dimension_type"
-                | "chat_type"
-                | "trim_pattern"
-                | "trim_material"
-                | "trial_spawner"
-                | "damage_type"
-                | "banner_pattern"
-                | "enchantment"
-                | "enchantment_provider"
-                | "jukebox_song"
-                | "instrument"
-                | "test_environment"
-                | "test_instance"
-                | "dialog"
-                | "timeline"
-                | "neoforge:biome_modifier"
-                | "neoforge:structure_modifier"
-        )
+/// Returns whether Minecraft reads `category` through `RegistryDataLoader` rather than
+/// `SimpleJsonResourceReloadListener`. Vanilla's non-registry JSON data folders are excluded; every
+/// other known registry from `mcmeta` or a ProbeRaven dump loads through `RegistryDataLoader` when
+/// it appears as a data file.
+fn loads_through_registry_data_loader(category: &str, known: &registries::KnownRegistries) -> bool {
+    if matches!(
+        category,
+        "advancement" | "recipe" | "loot_table" | "predicate" | "item_modifier" | "pack_mcmeta" | "structure" | "datapack"
+    ) {
+        return false;
+    }
+    category.starts_with("worldgen/") || known.contains(category)
 }
 
 /// Folders Minecraft renamed in 1.21: (before, from 1.21 on).
@@ -857,14 +842,24 @@ dispatch minecraft:resource["worldgen/noise"] to struct { name: string }
     #[test]
     fn picks_the_json_parser_minecraft_uses() {
         use json_parser::JsonDialect::{LegacyStrict, Lenient, Strict};
-        assert_eq!(json_dialect_for("1.20.1", false, Some("loot_table")), LegacyStrict);
-        assert_eq!(json_dialect_for("1.21.1", true, Some("tag/item")), Lenient);
-        assert_eq!(json_dialect_for("1.21.1", true, Some("worldgen/template_pool")), Lenient);
-        assert_eq!(json_dialect_for("1.21.11", false, Some("recipe")), Strict);
-        assert_eq!(json_dialect_for("1.21.11", true, Some("recipe")), Lenient);
-        assert_eq!(json_dialect_for("1.21.11", true, Some("tag/item")), Strict);
-        assert_eq!(json_dialect_for("26.2", true, None), Lenient);
-        assert_eq!(json_dialect_for("26.3", true, Some("recipe")), Strict);
+        let mut known = registries::KnownRegistries::default();
+        for name in ["loot_table", "recipe", "damage_type", "world_clock", "irons_jewelry:material"] {
+            known.insert(name);
+        }
+        assert_eq!(json_dialect_for("1.20.1", false, Some("loot_table"), &known), LegacyStrict);
+        assert_eq!(json_dialect_for("1.21.1", true, Some("tag/item"), &known), Lenient);
+        assert_eq!(json_dialect_for("1.21.1", true, Some("worldgen/template_pool"), &registries::KnownRegistries::default()), Lenient);
+        assert_eq!(json_dialect_for("1.21.1", true, Some("damage_type"), &known), Lenient);
+        assert_eq!(json_dialect_for("1.21.1", true, Some("irons_jewelry:material"), &known), Lenient);
+        assert_eq!(json_dialect_for("1.21.1", true, Some("apotheosis:affixes"), &known), LegacyStrict);
+        assert_eq!(json_dialect_for("1.21.11", false, Some("recipe"), &known), Strict);
+        assert_eq!(json_dialect_for("1.21.11", true, Some("recipe"), &known), Lenient);
+        assert_eq!(json_dialect_for("1.21.11", true, Some("apotheosis:affixes"), &known), Lenient);
+        assert_eq!(json_dialect_for("1.21.11", true, Some("irons_jewelry:material"), &known), Strict);
+        assert_eq!(json_dialect_for("1.21.11", true, Some("tag/item"), &known), Strict);
+        assert_eq!(json_dialect_for("26.2", true, Some("world_clock"), &known), Strict);
+        assert_eq!(json_dialect_for("26.2", true, None, &known), Lenient);
+        assert_eq!(json_dialect_for("26.3", true, Some("recipe"), &known), Strict);
     }
 
     #[test]

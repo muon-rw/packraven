@@ -2,6 +2,19 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1]
+### Added
+- New mods supported for JSON autocomplete/validation: 
+- - Better Combat
+- - Dynamic Difficulty
+- - Iron's Spellbooks/Jewelry
+- - Legendary Survival Overhaul
+- - Farmer's Delight
+- - Tiered / TieredZ / Tierify
+- - Loot Integrations
+- - Curios / Accessories / Trinkets 
+- - Global Loot Modifiers (Forge/Neoforge/Porting Lib, not covered by the existing partner schemas)
+
 ## [0.7.0] - 2026-11-22
 ### Added
 - Autocomplete, suggestions, hover docs, and error validation for datapack JSON, powered by packraven's own (fast!) engine for [mcdoc](https://github.com/SpyglassMC/vanilla-mcdoc) (the schemas behind misode's datapack website):

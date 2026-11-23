@@ -66,6 +66,10 @@ impl KnownRegistries {
         self.0.insert(normalize_category(registry));
     }
 
+    pub fn contains(&self, registry: &str) -> bool {
+        self.0.contains(&normalize_category(registry))
+    }
+
     /// Returns whether `tags/<first>/<second>/` holds a modded registry's tags. Without any names
     /// (offline before the first fetch) we read every folder as a vanilla registry.
     fn names_modded_tag_folder(&self, first: &str, second: &str) -> bool {
@@ -568,9 +572,40 @@ pub fn parse_data_file_path(path: &str, known: &KnownRegistries) -> Option<(Stri
         return Some((cat.into(), format!("{namespace}:{id}")));
     }
 
-    // Placebo gear sets (1.21 `data/<ns>/gear_sets/` and 26.1 `data/<ns>/placebo/gear_sets/`).
+    // Placebo registries (1.21 flat `data/<ns>/<folder>/` and 26.1 `data/<ns>/placebo/<folder>/`).
     if let Some(id) = rest.strip_prefix("placebo/gear_sets/").or_else(|| rest.strip_prefix("gear_sets/")) {
         return Some(("placebo:gear_sets".into(), format!("{namespace}:{id}")));
+    }
+    if let Some(id) = rest.strip_prefix("placebo/wanderer_trades/").or_else(|| rest.strip_prefix("wanderer_trades/")) {
+        return Some(("placebo:wanderer_trades".into(), format!("{namespace}:{id}")));
+    }
+    if let Some(id) = rest.strip_prefix("placebo/brewing_mixes/").or_else(|| rest.strip_prefix("brewing_mixes/")) {
+        return Some(("placebo:brewing_mixes".into(), format!("{namespace}:{id}")));
+    }
+    if let Some(id) = rest
+        .strip_prefix("apothic_enchanting/enchanting_stats/")
+        .or_else(|| rest.strip_prefix("enchanting_stats/"))
+    {
+        return Some(("apothic_enchanting:enchanting_stats".into(), format!("{namespace}:{id}")));
+    }
+
+    // Global loot modifier index (`data/<loader>/loot_modifiers/global_loot_modifiers.json`).
+    if rest == "loot_modifiers/global_loot_modifiers" && matches!(namespace, "neoforge" | "forge" | "porting_lib") {
+        return Some(("neoforge:global_loot_modifiers".into(), format!("{namespace}:{rest}")));
+    }
+
+    // Iron's Spellbooks & Iron's Jewelry datapack registries.
+    if let Some(id) = rest.strip_prefix("irons_spellbooks/upgrade_orb_type/") {
+        return Some(("irons_spellbooks:upgrade_orb_type".into(), format!("{namespace}:{id}")));
+    }
+    if let Some(id) = rest.strip_prefix("irons_jewelry/material/") {
+        return Some(("irons_jewelry:material".into(), format!("{namespace}:{id}")));
+    }
+    if let Some(id) = rest.strip_prefix("irons_jewelry/part/") {
+        return Some(("irons_jewelry:part".into(), format!("{namespace}:{id}")));
+    }
+    if let Some(id) = rest.strip_prefix("irons_jewelry/pattern/") {
+        return Some(("irons_jewelry:pattern".into(), format!("{namespace}:{id}")));
     }
 
     // Modded partner top-level categories.
@@ -709,6 +744,15 @@ fn is_data_driven_category(cat: &str) -> bool {
             | "apotheosis:rogue_spawners"
             | "apotheosis:tier_augments"
             | "placebo:gear_sets"
+            | "placebo:wanderer_trades"
+            | "placebo:brewing_mixes"
+            | "apothic_enchanting:enchanting_stats"
+            | "weapon_attributes"
+            | "loot_modifiers"
+            | "irons_spellbooks:upgrade_orb_type"
+            | "irons_jewelry:material"
+            | "irons_jewelry:part"
+            | "irons_jewelry:pattern"
     ) || cat.starts_with("worldgen/")
         || cat.starts_with("tag/")
 }

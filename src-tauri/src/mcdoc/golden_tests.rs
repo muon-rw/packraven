@@ -2,7 +2,7 @@
 //! plus Packraven-specific attribute, loader condition, and modded partner `.mcdoc` tests.
 
 use super::checker::{check_json_with_type, resource_root_type, CheckEnv};
-use super::fetch::{bridge_partner_dispatchers, APOTHEOSIS_MCDOC, PACKRAVEN_MCDOC};
+use super::fetch::{bridge_partner_dispatchers, PACKRAVEN_MCDOC};
 use super::json_parser::{self, Diagnostic, Severity};
 use super::parser::parse_and_bind;
 use super::registries::{parse_data_file_path, KnownRegistries, RegistryIndex};
@@ -368,10 +368,39 @@ dispatch create:recipes[create:cutting] to struct Cutting {
     );
 }
 
+/// Loads a file from `PACKRAVEN_MCDOCS_DIR` when set, otherwise fetches and caches it from `muon-rw/mcdocs`.
+fn load_muon_mcdoc_for_test(file: &str) -> String {
+    if let Ok(dir) = std::env::var("PACKRAVEN_MCDOCS_DIR") {
+        return std::fs::read_to_string(std::path::Path::new(&dir).join(file))
+            .unwrap_or_else(|e| panic!("reading {file} from PACKRAVEN_MCDOCS_DIR ({dir}): {e}"));
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(super::fetch::load_muon_mcdoc(file, false))
+        .unwrap_or_else(|e| panic!("fetching/caching {file} from muon-rw/mcdocs: {e:#}"))
+}
+
+fn load_muon_manifest_for_test() -> super::fetch::MuonManifest {
+    if let Ok(dir) = std::env::var("PACKRAVEN_MCDOCS_DIR") {
+        let raw = std::fs::read_to_string(std::path::Path::new(&dir).join("manifest.json"))
+            .unwrap_or_else(|e| panic!("reading manifest.json from PACKRAVEN_MCDOCS_DIR ({dir}): {e}"));
+        return serde_json::from_str(&raw).expect("parsing local muon-rw/mcdocs manifest.json");
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(super::fetch::load_muon_manifest(false))
+        .unwrap_or_else(|e| panic!("fetching/caching manifest.json from muon-rw/mcdocs: {e:#}"))
+}
+
 fn apotheosis_test_tables() -> SymbolTables {
     let mut tables = SymbolTables::default();
     parse_and_bind(PACKRAVEN_MCDOC, "::packraven", &mut tables).unwrap();
-    parse_and_bind(APOTHEOSIS_MCDOC, "::apotheosis", &mut tables).unwrap();
+    let src = load_muon_mcdoc_for_test("mcdoc/apotheosis.mcdoc");
+    parse_and_bind(&src, "::apotheosis", &mut tables).unwrap();
     tables
 }
 
@@ -1056,4 +1085,113 @@ fn loot_entries_accept_any_weight_like_vanilla() {
     let root = McdocType::Reference { path: Some("::java::data::loot::SingletonPoolEntry".into()), attributes: Vec::new() };
     let diags = check_json_with_type(parsed.root.as_ref().unwrap(), &root, &env).diagnostics;
     assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn parses_manifest_loaders_and_new_modded_paths() {
+    let manifest_json = r#"{
+        "formatVersion": 1,
+        "schemas": [{
+            "id": "global_loot_modifiers",
+            "file": "mcdoc/global_loot_modifiers.mcdoc",
+            "module": "::global_loot_modifiers",
+            "loaders": ["forge", "neoforge"],
+            "modIds": ["porting_lib_loot"],
+            "paths": [
+                { "namespace": "neoforge", "exact": "loot_modifiers/global_loot_modifiers", "category": "neoforge:global_loot_modifiers" },
+                { "folder": "loot_modifiers", "category": "neoforge:loot_modifier" }
+            ]
+        }]
+    }"#;
+    let manifest: super::fetch::MuonManifest = serde_json::from_str(manifest_json).unwrap();
+    assert_eq!(manifest.schemas[0].loaders, vec!["forge", "neoforge"]);
+
+    let known = KnownRegistries::default();
+    assert_eq!(
+        parse_data_file_path("data/neoforge/loot_modifiers/global_loot_modifiers.json", &known),
+        Some(("neoforge:global_loot_modifiers".into(), "neoforge:loot_modifiers/global_loot_modifiers".into()))
+    );
+    assert_eq!(
+        parse_data_file_path("data/hazennstuff/irons_jewelry/material/archery_rune.json", &known),
+        Some(("irons_jewelry:material".into(), "hazennstuff:archery_rune".into()))
+    );
+    assert_eq!(
+        parse_data_file_path("data/irons_spellbooks/irons_spellbooks/upgrade_orb_type/blood_power.json", &known),
+        Some(("irons_spellbooks:upgrade_orb_type".into(), "irons_spellbooks:blood_power".into()))
+    );
+    assert_eq!(
+        parse_data_file_path("data/apotheosis/wanderer_trades/beacon.json", &known),
+        Some(("placebo:wanderer_trades".into(), "apotheosis:beacon".into()))
+    );
+    assert_eq!(
+        parse_data_file_path("data/apothic_attributes/brewing_mixes/flying.json", &known),
+        Some(("placebo:brewing_mixes".into(), "apothic_attributes:flying".into()))
+    );
+    assert_eq!(
+        parse_data_file_path("data/apothic_enchanting/enchanting_stats/amethyst_cluster.json", &known),
+        Some(("apothic_enchanting:enchanting_stats".into(), "apothic_enchanting:amethyst_cluster".into()))
+    );
+}
+
+#[test]
+fn parses_all_muon_mcdocs_from_manifest() {
+    let manifest = load_muon_manifest_for_test();
+    assert!(!manifest.schemas.is_empty(), "muon-rw/mcdocs manifest has no schemas");
+    let mut tables = SymbolTables::default();
+    parse_and_bind(PACKRAVEN_MCDOC, "::packraven", &mut tables).unwrap();
+    for entry in &manifest.schemas {
+        let src = load_muon_mcdoc_for_test(&entry.file);
+        parse_and_bind(&src, &entry.module, &mut tables)
+            .unwrap_or_else(|e| panic!("failed to bind {} ({}): {e}", entry.id, entry.file));
+    }
+}
+
+#[test]
+fn validates_apotheosis_trades_mixes_stats_and_spawner_recipes() {
+    let tables = apotheosis_test_tables();
+    if !tables.dispatchers.get("minecraft:resource").is_some_and(|r| r.contains_key("placebo:wanderer_trades")) {
+        return;
+    }
+    let mut regs = RegistryIndex::default();
+    regs.insert_entries("item", ["minecraft:clock".into(), "minecraft:beacon".into(), "minecraft:emerald".into()]);
+    regs.insert_entries("block", ["minecraft:amethyst_cluster".into()]);
+    regs.insert_entries("potion", ["minecraft:water".into(), "minecraft:awkward".into()]);
+    regs.finalize();
+    let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: Some("21.1.265".into()) };
+    let env = CheckEnv {
+        tables: &tables,
+        registries: &regs,
+        version: &version,
+        require_canonical: false,
+        allow_missing_keys: false,
+        primitives_read_as_strings: false,
+        ignored_loaders: &[],
+    };
+
+    for (cat, json) in [
+        (
+            "placebo:wanderer_trades",
+            r#"{ "type": "placebo:basic_trade", "input_1": { "id": "minecraft:emerald", "count": 25 }, "output": { "id": "minecraft:beacon", "count": 1 }, "rare": true, "xp": 50 }"#,
+        ),
+        (
+            "placebo:brewing_mixes",
+            r#"{ "mix_type": "potion", "from": "minecraft:water", "ingredient": { "item": "minecraft:clock" }, "to": "minecraft:awkward" }"#,
+        ),
+        (
+            "apothic_enchanting:enchanting_stats",
+            r#"{ "block": "minecraft:amethyst_cluster", "stats": { "maxEterna": 40, "eterna": 1, "quanta": -1 } }"#,
+        ),
+    ] {
+        let root = resource_root_type(cat, &tables).unwrap_or_else(|| panic!("missing root for {cat}"));
+        let parsed = json_parser::parse(json, false);
+        let diags = check_json_with_type(parsed.root.as_ref().unwrap(), &root, &env).diagnostics;
+        assert!(diags.is_empty(), "{cat} failed: {diags:?}");
+    }
+
+    // Spawner modifier recipe via minecraft:recipe_serializer
+    let spawner_schema = tables.dispatchers.get("minecraft:recipe_serializer").unwrap().get("apothic_spawners:spawner_modifier").unwrap();
+    let spawner_json = r#"{ "mainhand": { "item": "minecraft:clock" }, "stat_changes": [{ "type": "apothic_spawners:max_delay", "value": -10, "min": 100, "max": -1 }] }"#;
+    let parsed = json_parser::parse(spawner_json, false);
+    let diags = check_json_with_type(parsed.root.as_ref().unwrap(), spawner_schema, &env).diagnostics;
+    assert!(diags.is_empty(), "spawner_modifier failed: {diags:?}");
 }

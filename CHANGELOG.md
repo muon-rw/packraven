@@ -2,7 +2,7 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.7.4]
+## [0.7.4] - 2026-11-23
 ### Added
 - Resource pack/assets validation, autocomplete, and hover docs *(again, mostly relying on misode's excellent [vanilla mcdoc](https://github.com/SpyglassMC/vanilla-mcdoc))*:
 - - For now, covers models, block states, item definitions, equipment, atlases, fonts, particles, `sounds.json`, lang files, texture `.mcmeta`, shaders, post effects, and waypoint styles.
@@ -387,7 +387,8 @@ We record notable changes to packraven here. The format follows [Keep a Changelo
 - Mod updates skip jars Minecraft is currently holding open instead of stopping partway
 - Failed downloads will retry up to three times
 
-[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/muon-rw/packraven/compare/v0.7.4...HEAD
+[0.7.4]: https://github.com/muon-rw/packraven/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/muon-rw/packraven/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/muon-rw/packraven/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/muon-rw/packraven/compare/v0.7.0...v0.7.1

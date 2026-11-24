@@ -723,6 +723,7 @@ export interface ProbejsCompletionItem {
   selectLen?: number
   consumeClosingQuote?: boolean
   retrigger?: boolean
+  deprecated?: boolean
 }
 
 export interface ProbejsCompletionResult {

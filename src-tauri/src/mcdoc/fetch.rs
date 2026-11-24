@@ -85,9 +85,22 @@ struct FabricCondition {
 
 dispatch minecraft:resource["packraven:fabric_condition"] to FabricCondition
 
-dispatch fabric:condition_codec["fabric:true", "fabric:false"] to struct {}
+#[since="1.20.5"]
+dispatch fabric:condition_codec["fabric:true"] to struct {}
 
-dispatch fabric:condition_codec["fabric:all_mods_loaded", "fabric:any_mod_loaded"] to struct {
+dispatch fabric:condition_codec["fabric:false"] to struct {}
+
+dispatch fabric:condition_codec["fabric:all_mods_loaded"] to struct {
+	values: [string],
+}
+
+#[until="1.20.5"]
+dispatch fabric:condition_codec["fabric:any_mod_loaded"] to struct {
+	values: [string],
+}
+
+#[since="1.20.5"]
+dispatch fabric:condition_codec["fabric:any_mods_loaded"] to struct {
 	values: [string],
 }
 
@@ -104,8 +117,23 @@ dispatch fabric:condition_codec["fabric:tags_populated"] to struct {
 	values: [string],
 }
 
+#[until="1.20.5"]
+dispatch fabric:condition_codec["fabric:block_tags_populated"] to struct {
+	values: [#[id(registry="block", tags="implicit")] string],
+}
+
+#[until="1.20.5"]
+dispatch fabric:condition_codec["fabric:fluid_tags_populated"] to struct {
+	values: [#[id(registry="fluid", tags="implicit")] string],
+}
+
+#[until="1.20.5"]
 dispatch fabric:condition_codec["fabric:item_tags_populated"] to struct {
 	values: [#[id(registry="item", tags="implicit")] string],
+}
+
+dispatch fabric:condition_codec["fabric:features_enabled"] to struct {
+	features: [string],
 }
 
 dispatch fabric:condition_codec["fabric:registry_contains"] to struct {
@@ -504,6 +532,144 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
 static VANILLA_SYMBOLS_CACHE: OnceLock<Mutex<Option<(FileStamp, SymbolTables)>>> = OnceLock::new();
 static MCMETA_REGISTRIES_CACHE: OnceLock<Mutex<HashMap<String, (FileStamp, HashMap<String, Vec<String>>)>>> = OnceLock::new();
 static MCMETA_BLOCKS_CACHE: OnceLock<Mutex<HashMap<String, (FileStamp, HashMap<String, BTreeMap<String, Vec<String>>>)>>> = OnceLock::new();
+static MCMETA_VERSIONS_CACHE: OnceLock<Mutex<Option<(FileStamp, Vec<McmetaVersion>)>>> = OnceLock::new();
+static MCMETA_GAMERULES_CACHE: OnceLock<Mutex<HashMap<String, (FileStamp, GameRules)>>> = OnceLock::new();
+static MCMETA_LANG_KEYS_CACHE: OnceLock<Mutex<HashMap<String, (FileStamp, Vec<String>)>>> = OnceLock::new();
+
+const MCMETA_VERSIONS_URL: &str = "https://raw.githubusercontent.com/misode/mcmeta/refs/heads/summary/versions/data.min.json";
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct McmetaVersion {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub data_version: Option<u64>,
+    #[serde(default)]
+    pub data_pack_version: Option<u32>,
+    #[serde(default)]
+    pub data_pack_version_minor: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GameRules {
+    pub boolean: Vec<String>,
+    pub int: Vec<String>,
+}
+
+/// Loads the `misode/mcmeta` versions catalog (used for `#[pack_format]` completions and weekly snapshot resolution).
+pub async fn load_mcmeta_versions(force: bool) -> Result<Vec<McmetaVersion>> {
+    let path = cache_dir().join("mcmeta").join("versions.json");
+    let cache = MCMETA_VERSIONS_CACHE.get_or_init(|| Mutex::new(None));
+    if !force && let Some(stamp) = file_stamp(&path) {
+        if let Some((cached_stamp, versions)) = cache.lock().unwrap().as_ref()
+            && *cached_stamp == stamp
+        {
+            return Ok(versions.clone());
+        }
+    }
+    let versions: Vec<McmetaVersion> = load_cached_parsing_off_thread(&path, MCMETA_VERSIONS_URL, force, |bytes| {
+        serde_json::from_slice(bytes).context("parsing mcmeta versions.json")
+    })
+    .await?;
+    if let Some(stamp) = file_stamp(&path) {
+        *cache.lock().unwrap() = Some((stamp, versions.clone()));
+    }
+    Ok(versions)
+}
+
+/// Extracts newest-first `(data_pack_version, release_label)` pairs for `#[pack_format]` completion,
+/// matching Spyglass's `registerPackFormatAttribute`.
+pub fn data_pack_formats_from_versions(versions: &[McmetaVersion]) -> Vec<(u32, String)> {
+    let mut sorted: Vec<&McmetaVersion> = versions.iter().collect();
+    sorted.sort_by(|a, b| b.data_version.cmp(&a.data_version));
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for v in sorted {
+        if v.kind != "release" {
+            continue;
+        }
+        if let Some(fmt) = v.data_pack_version
+            && seen.insert(fmt)
+        {
+            out.push((fmt, v.id.clone()));
+        }
+    }
+    out
+}
+
+/// Maps a weekly snapshot like `24w14a` to its target release version (e.g. `1.21`) using the `mcmeta` versions catalog.
+pub fn resolve_snapshot_version(mc: &str, versions: &[McmetaVersion]) -> Option<String> {
+    if !super::version::is_weekly_snapshot(mc) {
+        return None;
+    }
+    let mut sorted: Vec<&McmetaVersion> = versions.iter().collect();
+    sorted.sort_by(|a, b| b.data_version.cmp(&a.data_version));
+    let idx = sorted.iter().position(|v| v.id.eq_ignore_ascii_case(mc))?;
+    // In descending `data_version` order, the closest release at or before `idx` is the target release
+    // that shipped after this snapshot (matching Spyglass `resolveConfiguredVersion`).
+    for i in (0..=idx).rev() {
+        if sorted[i].kind == "release" {
+            return Some(sorted[i].id.clone());
+        }
+    }
+    sorted.iter().find(|v| v.kind == "release").map(|v| v.id.clone())
+}
+
+/// Loads vanilla boolean and integer gamerule names from `misode/mcmeta` `commands/data.min.json`.
+pub async fn load_mcmeta_game_rules(mc_version: &str, force: bool) -> Result<GameRules> {
+    let safe_ver = sanitize_version(mc_version);
+    let path = cache_dir().join("mcmeta").join(&safe_ver).join("commands.json");
+    let cache = MCMETA_GAMERULES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if !force && let Some(stamp) = file_stamp(&path) {
+        if let Some((cached_stamp, rules)) = cache.lock().unwrap().get(&safe_ver)
+            && *cached_stamp == stamp
+        {
+            return Ok(rules.clone());
+        }
+    }
+    let url = format!("https://raw.githubusercontent.com/misode/mcmeta/{mc_version}-summary/commands/data.min.json");
+    let mc = mc_version.to_string();
+    let rules = load_cached_parsing_off_thread(&path, &url, force, move |bytes| {
+        parse_mcmeta_game_rules(bytes).with_context(|| format!("parsing mcmeta commands for {mc}"))
+    })
+    .await?;
+    if let Some(stamp) = file_stamp(&path) {
+        cache.lock().unwrap().insert(safe_ver, (stamp, rules.clone()));
+    }
+    Ok(rules)
+}
+
+pub fn parse_mcmeta_game_rules(bytes: &[u8]) -> Result<GameRules> {
+    let root: Value = serde_json::from_slice(bytes)?;
+    let mut rules = GameRules::default();
+    let Some(children) = root
+        .get("children")
+        .and_then(|c| c.get("gamerule"))
+        .and_then(|g| g.get("children"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(rules);
+    };
+    for (name, node) in children {
+        let Some(val_node) = node.get("children").and_then(|c| c.get("value")) else { continue };
+        if val_node.get("type").and_then(Value::as_str) != Some("argument") {
+            continue;
+        }
+        let parser = val_node
+            .get("parser")
+            .and_then(Value::as_str)
+            .or_else(|| val_node.get("argument").and_then(|a| a.get("type")).and_then(Value::as_str));
+        match parser {
+            Some("brigadier:bool" | "minecraft:bool") => rules.boolean.push(name.clone()),
+            Some("brigadier:integer" | "minecraft:integer") => rules.int.push(name.clone()),
+            _ => {}
+        }
+    }
+    rules.boolean.sort_unstable();
+    rules.int.sort_unstable();
+    Ok(rules)
+}
 
 /// Loads `vanilla-mcdoc/symbols` from persistent local storage, refreshing from Spyglass's API only when absent or `force` is true.
 pub async fn load_vanilla_symbols(force: bool) -> Result<SymbolTables> {
@@ -563,6 +729,34 @@ pub async fn load_mcmeta_registries(mc_version: &str, force: bool) -> Result<Has
         cache.lock().unwrap().insert(safe_ver, (stamp, regs.clone()));
     }
     Ok(regs)
+}
+
+/// Loads the sorted translation keys of vanilla's `en_us.json` for `mc_version` from persistent local storage.
+pub async fn load_mcmeta_lang_keys(mc_version: &str, force: bool) -> Result<Vec<String>> {
+    let safe_ver = sanitize_version(mc_version);
+    let path = cache_dir().join("mcmeta").join(&safe_ver).join("en_us.json");
+    let cache = MCMETA_LANG_KEYS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if !force && let Some(stamp) = file_stamp(&path) {
+        if let Some((cached_stamp, keys)) = cache.lock().unwrap().get(&safe_ver)
+            && *cached_stamp == stamp
+        {
+            return Ok(keys.clone());
+        }
+    }
+    let url = format!("https://raw.githubusercontent.com/misode/mcmeta/{mc_version}-assets-json/assets/minecraft/lang/en_us.json");
+    let mc = mc_version.to_string();
+    let keys = load_cached_parsing_off_thread(&path, &url, force, move |bytes| {
+        let lang: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(bytes).with_context(|| format!("parsing vanilla en_us.json for {mc}"))?;
+        let mut keys: Vec<String> = lang.into_iter().map(|(k, _)| k).collect();
+        keys.sort_unstable();
+        Ok(keys)
+    })
+    .await?;
+    if let Some(stamp) = file_stamp(&path) {
+        cache.lock().unwrap().insert(safe_ver, (stamp, keys.clone()));
+    }
+    Ok(keys)
 }
 
 /// Loads vanilla block state definitions (`summary/blocks/data.min.json`) for `mc_version` from persistent local storage.
@@ -1044,5 +1238,31 @@ mod tests {
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].category, "thermoo:temperature_effect");
         assert!(rules[0].matches("mypack", "thermoo/temperature_effect/frost"));
+    }
+
+    #[test]
+    fn parses_mcmeta_versions_snapshots_and_game_rules() {
+        let versions: Vec<McmetaVersion> = serde_json::from_str(
+            r#"[
+                {"id": "1.20.6", "type": "release", "data_version": 3839, "data_pack_version": 41},
+                {"id": "24w14a", "type": "snapshot", "data_version": 3845, "data_pack_version": 38},
+                {"id": "1.21", "type": "release", "data_version": 3953, "data_pack_version": 48},
+                {"id": "1.21.1", "type": "release", "data_version": 3955, "data_pack_version": 48}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(data_pack_formats_from_versions(&versions), vec![(48, "1.21.1".into()), (41, "1.20.6".into())]);
+        assert_eq!(resolve_snapshot_version("24w14a", &versions).as_deref(), Some("1.21"));
+        assert_eq!(resolve_snapshot_version("1.21.1", &versions), None);
+
+        let brigadier = br#"{"children":{"gamerule":{"children":{"keepInventory":{"children":{"value":{"type":"argument","parser":"brigadier:bool"}}},"randomTickSpeed":{"children":{"value":{"type":"argument","parser":"brigadier:integer"}}}}}}}"#;
+        let rules = parse_mcmeta_game_rules(brigadier).unwrap();
+        assert_eq!(rules.boolean, vec!["keepInventory"]);
+        assert_eq!(rules.int, vec!["randomTickSpeed"]);
+
+        let spyglass_fmt = br#"{"children":{"gamerule":{"children":{"doFireTick":{"children":{"value":{"type":"argument","argument":{"type":"minecraft:bool"}}}},"spawnRadius":{"children":{"value":{"type":"argument","argument":{"type":"minecraft:integer"}}}}}}}}"#;
+        let rules2 = parse_mcmeta_game_rules(spyglass_fmt).unwrap();
+        assert_eq!(rules2.boolean, vec!["doFireTick"]);
+        assert_eq!(rules2.int, vec!["spawnRadius"]);
     }
 }

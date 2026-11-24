@@ -76,23 +76,27 @@ pub fn file_load(path: &str, files: &dyn PackFiles, env: &OverlayEnv<'_>) -> Fil
         return FileLoad::Loaded;
     }
     let parts: Vec<&str> = path.split('/').collect();
-    let Some(data) = parts.iter().position(|p| *p == "data") else { return FileLoad::Loaded };
     let join = |range: &[&str]| range.join("/");
     let mcmeta_at = |root: &[&str]| {
         let rel = if root.is_empty() { "pack.mcmeta".to_string() } else { format!("{}/pack.mcmeta", join(root)) };
         files.read(&rel).and_then(|text| json_parser::parse(&text, true).root)
     };
-    if let Some(meta) = mcmeta_at(&parts[..data]) {
-        return resolve(&meta, None, &join(&parts[data..]), &parts[..data], files, env);
-    }
-    if data >= 1
-        && let Some(meta) = mcmeta_at(&parts[..data - 1])
-    {
-        let folder = parts[data - 1];
-        if !listed_overlays(&meta).contains(folder) {
-            return FileLoad::Unlisted { folder: folder.to_string() };
+    for (data, part) in parts.iter().enumerate() {
+        if *part != "data" && *part != "assets" {
+            continue;
         }
-        return resolve(&meta, Some(folder), &join(&parts[data..]), &parts[..data - 1], files, env);
+        if let Some(meta) = mcmeta_at(&parts[..data]) {
+            return resolve(&meta, None, &join(&parts[data..]), &parts[..data], files, env);
+        }
+        if data >= 1
+            && let Some(meta) = mcmeta_at(&parts[..data - 1])
+        {
+            let folder = parts[data - 1];
+            if !listed_overlays(&meta).contains(folder) {
+                return FileLoad::Unlisted { folder: folder.to_string() };
+            }
+            return resolve(&meta, Some(folder), &join(&parts[data..]), &parts[..data - 1], files, env);
+        }
     }
     FileLoad::Loaded
 }
@@ -195,6 +199,33 @@ fn neoforge_conditions_hold(entry: &JsonNode, mods: &HashSet<String>) -> bool {
     }
 }
 
+pub fn has_conditional_overlays(meta: &JsonNode) -> bool {
+    sections(meta).any(|(section, entry)| match section {
+        "overlays" => entry.get("neoforge:conditions").is_some(),
+        "neoforge:overlays" | "fabric:overlays" => true,
+        _ => false,
+    })
+}
+
+/// Returns whether a pack's `pack.mcmeta` `filter.block` list suppresses `(namespace, path)`.
+#[allow(dead_code)]
+pub fn pack_filter_blocks(meta: &JsonNode, namespace: &str, path: &str) -> bool {
+    let Some(JsonKind::Array(entries)) = meta.get("filter").and_then(|f| f.get("block")).map(|b| &b.kind) else {
+        return false;
+    };
+    entries.iter().any(|entry| {
+        let ns_match = match entry.get("namespace").and_then(JsonNode::as_str) {
+            Some(pat) => regex::Regex::new(pat).is_ok_and(|re| re.is_match(namespace)),
+            None => true,
+        };
+        let path_match = match entry.get("path").and_then(JsonNode::as_str) {
+            Some(pat) => regex::Regex::new(pat).is_ok_and(|re| re.is_match(path)),
+            None => true,
+        };
+        ns_match && path_match
+    })
+}
+
 /// Evaluates the NeoForge (or Forge) load conditions we can decide from the installed mods.
 /// Returns `None` for any other condition, like `neoforge:item_exists`.
 pub fn neoforge_condition(node: &JsonNode, mods: &HashSet<String>) -> Option<bool> {
@@ -205,7 +236,7 @@ pub fn neoforge_condition(node: &JsonNode, mods: &HashSet<String>) -> Option<boo
         "not" => neoforge_condition(node.get("value")?, mods).map(|v| !v),
         "and" => all(list(node, "values")?.iter().map(|c| neoforge_condition(c, mods))),
         "or" => any(list(node, "values")?.iter().map(|c| neoforge_condition(c, mods))),
-        "true" => Some(true),
+        "true" | "always" => Some(true),
         "false" | "never" => Some(false),
         _ => None,
     }
@@ -216,7 +247,7 @@ pub fn fabric_condition(node: &JsonNode, mods: &HashSet<String>) -> Option<bool>
     let ids = |node: &JsonNode| -> Option<Vec<String>> { Some(list(node, "values")?.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()) };
     match node.get("condition")?.as_str()? {
         "fabric:all_mods_loaded" => Some(ids(node)?.iter().all(|m| mods.contains(m))),
-        "fabric:any_mods_loaded" => Some(ids(node)?.iter().any(|m| mods.contains(m))),
+        "fabric:any_mod_loaded" | "fabric:any_mods_loaded" => Some(ids(node)?.iter().any(|m| mods.contains(m))),
         "fabric:not" => fabric_condition(node.get("value")?, mods).map(|v| !v),
         "fabric:and" => all(list(node, "values")?.iter().map(|c| fabric_condition(c, mods))),
         "fabric:or" => any(list(node, "values")?.iter().map(|c| fabric_condition(c, mods))),
@@ -382,7 +413,37 @@ mod tests {
             Some(false)
         );
         assert_eq!(neoforge_condition(&node(r#"{"type": "neoforge:item_exists", "item": "a:b"}"#), &mods), None);
+        assert_eq!(neoforge_condition(&node(r#"{"type": "neoforge:always"}"#), &mods), Some(true));
+        assert_eq!(neoforge_condition(&node(r#"{"type": "neoforge:not", "value": {"type": "neoforge:always"}}"#), &mods), Some(false));
+        assert_eq!(fabric_condition(&node(r#"{"condition": "fabric:any_mod_loaded", "values": ["x", "create"]}"#), &mods), Some(true));
         assert_eq!(fabric_condition(&node(r#"{"condition": "fabric:any_mods_loaded", "values": ["x", "create"]}"#), &mods), Some(true));
         assert_eq!(fabric_condition(&node(r#"{"condition": "fabric:all_mods_loaded", "values": ["x", "create"]}"#), &mods), Some(false));
+    }
+
+    #[test]
+    fn resolves_data_segment_with_pack_mcmeta_above_or_nested_data_folders() {
+        let mods = HashSet::new();
+        let files = Files(HashMap::from([
+            ("data/packs/geo.jar/pack.mcmeta", GEOPHILIC),
+            ("data/packs/geo.jar/data/geophilic/loot_table/data/x.json", "{}"),
+            ("data/packs/geo.jar/f41data/data/geophilic/loot_table/data/x.json", "{}"),
+        ]));
+        let env = env("1.21.1", 48, 0, &mods);
+        assert_eq!(
+            file_load("data/packs/geo.jar/data/geophilic/loot_table/data/x.json", &files, &env),
+            FileLoad::Replaced {
+                overlay: "f41data".into(),
+                by: "data/packs/geo.jar/f41data/data/geophilic/loot_table/data/x.json".into(),
+            }
+        );
+
+        let filter_meta = json_parser::parse(
+            r#"{"filter": {"block": [{"namespace": "^minecraft$", "path": "^recipe/.*"}]}}"#,
+            false,
+        )
+        .root
+        .unwrap();
+        assert!(pack_filter_blocks(&filter_meta, "minecraft", "recipe/stick.json"));
+        assert!(!pack_filter_blocks(&filter_meta, "create", "recipe/stick.json"));
     }
 }

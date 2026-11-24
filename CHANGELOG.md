@@ -2,6 +2,18 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4]
+### Added
+- Resource pack/assets validation, autocomplete, and hover docs *(again, mostly relying on misode's excellent [vanilla mcdoc](https://github.com/SpyglassMC/vanilla-mcdoc))*:
+- - For now, covers models, block states, item definitions, equipment, atlases, fonts, particles, `sounds.json`, lang files, texture `.mcmeta`, shaders, post effects, and waypoint styles.
+- - All types/ids are checked against your pack version's assets, including the game version and all mods you have installed. *One limitation: runtime resource packs that add new assets are not yet detected. This might be added later if needed)*
+- Datapack support extended to include advancement criteria, block state variants, SNBT, NBT paths, entity selectors, and commands inside JSON.
+- - Not yet covered: `.mcfunction` files. Soon!
+- More dynamic keys autocomplete/validate like recipe keys: advancement criteria, model texture slots, translation keys, block and fluid state properties, scoreboard objectives, item slots, and component removals.
+- Small notice on files in folders your Minecraft version doesn't load.
+- Hover docs now render formatting and links, and also now work in read-only files such as when viewing inside zips.
+- Deprecated fields and values are now rendered with ~~strikethrough~~ in autocomplete.
+
 ## [0.7.3] - 2026-11-23
 ### Added
 - Support for mcdoc dynamic keys in recipes, so the `key` fields will suggest letters you've already entered in the `pattern`. Much more to come here, to support other dynamically keyed fields.

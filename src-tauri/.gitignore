@@ -2,4 +2,6 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
-/target-scripted/
+# Extra Cargo target directories (scripted instances, test runs).
+# MUST STAY GITIGNORED! Otherwise Tauri's dev watcher will pollute/stall `tauri dev` when these builds run
+/target-*/

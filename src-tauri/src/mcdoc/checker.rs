@@ -5,12 +5,14 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use regex::Regex;
 
 use super::json_parser::{Diagnostic, JsonKind, JsonNode, JsonString, Severity, Span};
-use super::registries::{lengthen_id, normalize_category, IdLookup, RegistryIndex};
+use super::registries::{is_asset_category, lengthen_id, normalize_category, IdLookup, RegistryIndex};
 use super::types::{
     AccessorKey, Attribute, AttributeValue, DynamicKeyword, EnumField, EnumKind, EnumValue, Index, LiteralValue, LongRange, McdocType, NumericRange, RangeKind,
     StructField, StructKey, SymbolTables,
 };
-use super::version::{attr_number, attr_string, parse_id_attribute, parse_integer_attribute, TagMode, VersionContext};
+use super::version::{
+    attr_number, attr_string, item_slots_for_version, parse_game_rule_attribute, parse_id_attribute, parse_integer_attribute, TagMode, VersionContext,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct JsonId(pub usize);
@@ -102,6 +104,7 @@ pub struct CheckOutput {
     pub arena: JsonArena,
     pub diagnostics: Vec<Diagnostic>,
     pub attached: HashMap<JsonId, AttachedInfo>,
+    pub embedded_nbt_targets: HashMap<JsonId, McdocType>,
 }
 
 pub struct CheckEnv<'a> {
@@ -119,6 +122,10 @@ pub struct CheckEnv<'a> {
 }
 
 pub fn check_json_with_type(root: &JsonNode, root_type: &McdocType, env: &CheckEnv<'_>) -> CheckOutput {
+    check_json_for_block(root, root_type, env, None)
+}
+
+pub fn check_json_for_block(root: &JsonNode, root_type: &McdocType, env: &CheckEnv<'_>, current_block_id: Option<&str>) -> CheckOutput {
     let arena = JsonArena::from_root(root);
     let root_id = arena.root.unwrap();
     // Modpacks commonly disable a mod's datapack file by overriding it with only an unconditionally-false
@@ -135,16 +142,42 @@ pub fn check_json_with_type(root: &JsonNode, root_type: &McdocType, env: &CheckE
     let mut engine = Engine {
         arena: &arena,
         env,
+        nbt_mode: false,
+        current_block_id,
         groups: Vec::new(),
         defs: Vec::new(),
         node_groups: vec![Vec::new(); arena.nodes.len()],
         diagnostics: Vec::new(),
         attached: HashMap::new(),
+        embedded_nbt_targets: HashMap::new(),
     };
     engine.run(root_id, effective_root);
     let diagnostics = engine.diagnostics;
     let attached = engine.attached;
-    CheckOutput { arena, diagnostics, attached }
+    let embedded_nbt_targets = engine.embedded_nbt_targets;
+    CheckOutput { arena, diagnostics, attached, embedded_nbt_targets }
+}
+
+pub(crate) fn check_nbt_with_type(root: &JsonNode, root_type: &McdocType, env: &CheckEnv<'_>) -> CheckOutput {
+    let arena = JsonArena::from_root(root);
+    let root_id = arena.root.unwrap();
+    let mut engine = Engine {
+        arena: &arena,
+        env,
+        nbt_mode: true,
+        current_block_id: None,
+        groups: Vec::new(),
+        defs: Vec::new(),
+        node_groups: vec![Vec::new(); arena.nodes.len()],
+        diagnostics: Vec::new(),
+        attached: HashMap::new(),
+        embedded_nbt_targets: HashMap::new(),
+    };
+    engine.run(root_id, root_type);
+    let diagnostics = engine.diagnostics;
+    let attached = engine.attached;
+    let embedded_nbt_targets = engine.embedded_nbt_targets;
+    CheckOutput { arena, diagnostics, attached, embedded_nbt_targets }
 }
 
 fn is_unconditionally_disabled_stub(root: &JsonNode) -> bool {
@@ -418,11 +451,14 @@ struct ChildDefSpec {
 struct Engine<'a> {
     arena: &'a JsonArena,
     env: &'a CheckEnv<'a>,
+    nbt_mode: bool,
+    current_block_id: Option<&'a str>,
     groups: Vec<GroupNode>,
     defs: Vec<DefIdNode>,
     node_groups: Vec<Vec<GroupId>>,
     diagnostics: Vec<Diagnostic>,
     attached: HashMap<JsonId, AttachedInfo>,
+    embedded_nbt_targets: HashMap<JsonId, McdocType>,
 }
 
 type DefIdNode = DefNode;
@@ -502,6 +538,10 @@ impl<'a> Engine<'a> {
         // Attach resolved type info and run leaf attribute/registry checks.
         self.attach_and_check_attributes(root_id);
         self.check_crafting_symbols();
+        self.check_criterion_symbols();
+        self.check_texture_slots(root_id);
+        self.check_timeline_markers(root_id);
+        self.check_block_state_definition(root_id);
 
         // Emit condensed diagnostics from the root group(s).
         let root_errors: Vec<RuntimeError> = self.node_groups[root_id.0]
@@ -569,7 +609,7 @@ impl<'a> Engine<'a> {
         if value_kind_of(&inferred) != expected_kind {
             if let Some(converted) = self.read_primitive_as_string(node, expected_kind) {
                 inferred = converted;
-            } else if let Some(converted) = try_convert_json(node, expected_kind) {
+            } else if let Some(converted) = try_convert_json(node, expected_kind, self.nbt_mode) {
                 inferred = converted;
             } else if let Some((converted, read_as)) = java_integer_conversion(node, expected_kind) {
                 inferred = converted;
@@ -613,6 +653,10 @@ impl<'a> Engine<'a> {
                     McdocType::Literal { value, .. } => {
                         values.iter().any(|ef| enum_value_matches(&ef.value, value))
                             || matches!(value, LiteralValue::String { value } if self.accepts_unlisted_enum_value(values, attributes, value))
+                            || matches!(value, LiteralValue::String { value } if has_attr(attributes, BLEND_FACTOR_ATTR) && {
+                                let normalized = normalize_blend_factor(value);
+                                values.iter().any(|ef| matches!(&ef.value, EnumValue::String(s) if normalize_blend_factor(s) == normalized))
+                            })
                     }
                     _ => false,
                 };
@@ -1056,11 +1100,15 @@ impl<'a> Engine<'a> {
                 }
             }
             McdocType::Dispatcher { registry, parallel_indices, .. } => {
-                // Vanilla-mcdoc names these `mcdoc:*`. We answer them from the pack's block states.
+                // Vanilla-mcdoc names these `mcdoc:*`. We answer them from the pack's block, fluid, and advancement indices.
                 match registry.as_str() {
                     "minecraft:block_states" | "mcdoc:block_states" => return self.simplify_block_states(parallel_indices, node, is_member, false),
                     STATE_PREDICATE_DISPATCHER => return self.simplify_block_states(parallel_indices, node, is_member, true),
                     "mcdoc:block_state_keys" => return self.simplify_block_state_keys(parallel_indices, node, is_member),
+                    "mcdoc:block_item_states" => return self.simplify_block_item_states(parallel_indices, node, is_member),
+                    "mcdoc:fluid_states" => return self.simplify_fluid_states(parallel_indices, node, is_member),
+                    "mcdoc:fluid_state_keys" => return self.simplify_fluid_state_keys(parallel_indices, node, is_member),
+                    ADVANCEMENT_CRITERIA_DISPATCHER => return self.simplify_advancement_criteria(parallel_indices, node, is_member),
                     _ => {}
                 }
                 let Some(entries) = self.env.tables.dispatchers.get(registry) else {
@@ -1439,6 +1487,189 @@ impl<'a> Engine<'a> {
         }
     }
 
+    fn simplify_fluid_states(&self, parallel_indices: &[Index], node: JsonId, is_member: bool) -> McdocType {
+        let mut lookups = Vec::new();
+        for idx in parallel_indices {
+            match idx {
+                Index::Static { value } => lookups.push(lengthen_id(value)),
+                Index::Dynamic { accessor } => {
+                    for v in self.resolve_dynamic_accessor(accessor, node, is_member) {
+                        if !v.starts_with('%') {
+                            lookups.push(lengthen_id(&v));
+                        }
+                    }
+                }
+            }
+        }
+        let mut fields = Vec::new();
+        let mut matched_any = false;
+        for fluid_id in lookups {
+            if let Some(props) = vanilla_fluid_states(&fluid_id) {
+                matched_any = true;
+                for &(prop, vals) in props {
+                    let enum_vals: Vec<EnumField> = vals
+                        .iter()
+                        .map(|v| EnumField {
+                            identifier: (*v).to_string(),
+                            value: EnumValue::String((*v).to_string()),
+                            desc: None,
+                            attributes: Vec::new(),
+                        })
+                        .collect();
+                    fields.push(StructField::Pair {
+                        key: StructKey::Literal(prop.to_string()),
+                        field_type: McdocType::Enum {
+                            enum_kind: Some(EnumKind::String),
+                            values: enum_vals,
+                            attributes: Vec::new(),
+                        },
+                        optional: true,
+                        deprecated: false,
+                        desc: None,
+                        attributes: Vec::new(),
+                    });
+                }
+            }
+        }
+        if matched_any {
+            McdocType::Struct { fields, attributes: Vec::new() }
+        } else {
+            McdocType::Any { attributes: Vec::new() }
+        }
+    }
+
+    fn simplify_fluid_state_keys(&self, parallel_indices: &[Index], node: JsonId, is_member: bool) -> McdocType {
+        match self.simplify_fluid_states(parallel_indices, node, is_member) {
+            McdocType::Struct { fields, .. } => McdocType::Union {
+                members: fields
+                    .into_iter()
+                    .filter_map(|f| match f {
+                        StructField::Pair { key: StructKey::Literal(name), .. } => {
+                            Some(McdocType::Literal { value: LiteralValue::String { value: name }, attributes: Vec::new() })
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                attributes: Vec::new(),
+            },
+            other => other,
+        }
+    }
+
+    fn simplify_block_item_states(&self, parallel_indices: &[Index], node: JsonId, is_member: bool) -> McdocType {
+        let mut block_ids = Vec::new();
+        for idx in parallel_indices {
+            match idx {
+                Index::Static { value } => block_ids.extend(block_ids_for_item(&lengthen_id(value))),
+                Index::Dynamic { accessor } => {
+                    for v in self.resolve_dynamic_accessor(accessor, node, is_member) {
+                        if !v.starts_with('%') {
+                            block_ids.extend(block_ids_for_item(&lengthen_id(&v)));
+                        }
+                    }
+                }
+            }
+        }
+        let mut fields = Vec::new();
+        let mut seen = HashSet::new();
+        let mut matched_any = false;
+        for block_id in block_ids {
+            if let Some(props) = self.env.registries.block_states.get(&block_id) {
+                matched_any = true;
+                for (prop, vals) in props {
+                    if !seen.insert(prop.clone()) {
+                        continue;
+                    }
+                    let enum_vals: Vec<EnumField> = vals
+                        .iter()
+                        .map(|v| EnumField {
+                            identifier: v.clone(),
+                            value: EnumValue::String(v.clone()),
+                            desc: None,
+                            attributes: Vec::new(),
+                        })
+                        .collect();
+                    fields.push(StructField::Pair {
+                        key: StructKey::Literal(prop.clone()),
+                        field_type: McdocType::Enum {
+                            enum_kind: Some(EnumKind::String),
+                            values: enum_vals,
+                            attributes: Vec::new(),
+                        },
+                        optional: true,
+                        deprecated: false,
+                        desc: None,
+                        attributes: Vec::new(),
+                    });
+                }
+            }
+        }
+        if matched_any {
+            McdocType::Struct { fields, attributes: Vec::new() }
+        } else {
+            McdocType::Struct {
+                fields: vec![StructField::Pair {
+                    key: StructKey::Dynamic(McdocType::String { length_range: None, attributes: Vec::new() }),
+                    field_type: McdocType::String { length_range: None, attributes: Vec::new() },
+                    optional: true,
+                    deprecated: false,
+                    desc: None,
+                    attributes: Vec::new(),
+                }],
+                attributes: Vec::new(),
+            }
+        }
+    }
+
+    fn simplify_advancement_criteria(&self, parallel_indices: &[Index], node: JsonId, is_member: bool) -> McdocType {
+        let mut fields = Vec::new();
+        let mut seen = HashSet::new();
+        let mut matched_any = false;
+        for idx in parallel_indices {
+            let adv_ids: Vec<String> = match idx {
+                Index::Static { value } => vec![lengthen_id(value)],
+                Index::Dynamic { accessor } => self
+                    .resolve_dynamic_accessor(accessor, node, is_member)
+                    .into_iter()
+                    .filter(|v| !v.starts_with('%'))
+                    .map(|v| lengthen_id(&v))
+                    .collect(),
+            };
+            for adv_id in adv_ids {
+                if let Some(crits) = self.env.registries.advancement_criteria.get(&adv_id) {
+                    matched_any = true;
+                    for crit in crits {
+                        if seen.insert(crit.clone()) {
+                            fields.push(StructField::Pair {
+                                key: StructKey::Literal(crit.clone()),
+                                field_type: McdocType::Boolean { attributes: Vec::new() },
+                                optional: true,
+                                deprecated: false,
+                                desc: Some(format!("Criterion defined in advancement `{adv_id}`.")),
+                                attributes: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        if matched_any {
+            McdocType::Struct { fields, attributes: Vec::new() }
+        } else {
+            McdocType::Struct {
+                fields: vec![StructField::Pair {
+                    key: StructKey::Dynamic(McdocType::String { length_range: None, attributes: Vec::new() }),
+                    field_type: McdocType::Boolean { attributes: Vec::new() },
+                    optional: true,
+                    deprecated: false,
+                    desc: None,
+                    attributes: Vec::new(),
+                }],
+                attributes: Vec::new(),
+            }
+        }
+    }
+
     fn resolve_dynamic_accessor(&self, accessor: &[AccessorKey], node: JsonId, is_member: bool) -> Vec<String> {
         let start = if is_member { Some(node) } else { self.arena.get(node).parent };
         let mut curr: Vec<(Option<JsonId>, Option<JsonId>)> = vec![(start, self.arena.get(node).pair_key)];
@@ -1588,6 +1819,309 @@ impl<'a> Engine<'a> {
         }
     }
 
+    // Vanilla's `AdvancementRequirements.validate` rejects any mismatch between `criteria` keys and
+    // `requirements` entries when `requirements` is present.
+    fn check_criterion_symbols(&mut self) {
+        let mut defined: Vec<(Span, String)> = Vec::new();
+        let mut referenced: Vec<(Span, String)> = Vec::new();
+        let mut has_requirements = false;
+        for (id, info) in &self.attached {
+            let node = self.arena.get(*id);
+            match (&node.kind, criterion_role(&info.type_def)) {
+                (ArenaKind::String(s), Some(CraftingRole::Definition)) => defined.push((s.span, s.value.clone())),
+                (ArenaKind::String(s), Some(CraftingRole::Reference)) => {
+                    has_requirements = true;
+                    referenced.push((s.span, s.value.clone()));
+                }
+                _ => {}
+            }
+            if !has_requirements
+                && let ArenaKind::Object(pairs) = &node.kind
+                && pairs.iter().any(|(kid, _)| matches!(&self.arena.get(*kid).kind, ArenaKind::String(s) if s.value == "criteria"))
+                && pairs.iter().any(|(kid, vid)| {
+                    matches!(&self.arena.get(*kid).kind, ArenaKind::String(s) if s.value == "requirements") && vid.is_some()
+                })
+            {
+                has_requirements = true;
+            }
+        }
+        if defined.is_empty() && referenced.is_empty() {
+            return;
+        }
+        defined.sort_by_key(|(span, _)| span.start);
+        referenced.sort_by_key(|(span, _)| span.start);
+        let defined_set: HashSet<&str> = defined.iter().map(|(_, name)| name.as_str()).collect();
+        let referenced_set: HashSet<&str> = referenced.iter().map(|(_, name)| name.as_str()).collect();
+
+        for (span, name) in &referenced {
+            if !defined_set.contains(name.as_str()) {
+                self.diagnostics.push(Diagnostic {
+                    span: *span,
+                    severity: Severity::Error,
+                    message: format!("Unknown criterion \"{name}\"."),
+                });
+            }
+        }
+        if has_requirements {
+            for (span, name) in &defined {
+                if !referenced_set.contains(name.as_str()) {
+                    self.diagnostics.push(Diagnostic {
+                        span: *span,
+                        severity: Severity::Error,
+                        message: format!("Criterion \"{name}\" isn't included in requirements."),
+                    });
+                }
+            }
+        }
+    }
+
+    // Checks `#[texture_slot(kind="reference"|"value")]` against in-file `Model.textures` keys
+    // and any indexed `parent` model chain.
+    fn check_texture_slots(&mut self, root_id: JsonId) {
+        let mut defined: HashSet<String> = HashSet::new();
+        let mut refs: Vec<(Span, String, bool)> = Vec::new(); // (span, value, require_hash)
+        for (id, info) in &self.attached {
+            let ArenaKind::String(s) = &self.arena.get(*id).kind else { continue };
+            match texture_slot_kind(&info.type_def) {
+                Some("definition") => {
+                    defined.insert(s.value.clone());
+                }
+                Some("reference") => refs.push((s.span, s.value.clone(), true)),
+                Some("value") => refs.push((s.span, s.value.clone(), false)),
+                _ => {}
+            }
+        }
+        if refs.is_empty() {
+            return;
+        }
+        let mut chain_complete = true;
+        if let ArenaKind::Object(pairs) = &self.arena.get(root_id).kind {
+            let mut next_parent = pairs.iter().find_map(|&(kid, vid)| {
+                let ArenaKind::String(ks) = &self.arena.get(kid).kind else { return None };
+                if ks.value != "parent" {
+                    return None;
+                }
+                let ArenaKind::String(vs) = &self.arena.get(vid?).kind else { return None };
+                Some(lengthen_id(&vs.value))
+            });
+            let mut visited = HashSet::new();
+            while let Some(parent_id) = next_parent.take() {
+                if !visited.insert(parent_id.clone()) {
+                    break;
+                }
+                match self.env.registries.model_textures.get(&parent_id) {
+                    Some(info) => {
+                        for slot in &info.slots {
+                            defined.insert(slot.clone());
+                        }
+                        next_parent = info.parent.clone();
+                    }
+                    None => {
+                        chain_complete = false;
+                        break;
+                    }
+                }
+            }
+        }
+        refs.sort_by_key(|(span, _, _)| span.start);
+        for (span, val, require_hash) in refs {
+            if let Some(slot) = val.strip_prefix('#') {
+                if slot.is_empty() {
+                    self.diagnostics.push(Diagnostic {
+                        span,
+                        severity: Severity::Error,
+                        message: "Expected a texture slot name after '#'.".into(),
+                    });
+                } else if chain_complete && !defined.contains(slot) {
+                    self.diagnostics.push(Diagnostic {
+                        span,
+                        severity: Severity::Error,
+                        message: format!("Unknown texture slot \"#{slot}\"."),
+                    });
+                }
+            } else if require_hash {
+                self.diagnostics.push(Diagnostic {
+                    span,
+                    severity: Severity::Error,
+                    message: "Expected a texture slot reference starting with '#'.".into(),
+                });
+            } else if !is_valid_resource_location(&val) {
+                self.diagnostics.push(Diagnostic {
+                    span,
+                    severity: Severity::Error,
+                    message: format!("\"{val}\" is not a valid texture resource location."),
+                });
+            }
+        }
+    }
+
+    // Validates `BlockStateDefinition.variants` (`prop=val,...`) and `multipart[].when` conditions
+    // against `env.registries.block_states` for the block derived from `assets/<ns>/blockstates/<id>.json`.
+    fn check_block_state_definition(&mut self, root_id: JsonId) {
+        let Some(block_id) = self.current_block_id else { return };
+        let canonical = lengthen_id(block_id);
+        let Some(props) = self.env.registries.block_states.get(&canonical) else { return };
+        let ArenaKind::Object(pairs) = &self.arena.get(root_id).kind else { return };
+
+        for &(kid, vid) in pairs {
+            let ArenaKind::String(ks) = &self.arena.get(kid).kind else { continue };
+            let Some(val_id) = vid else { continue };
+            if ks.value == "variants"
+                && let ArenaKind::Object(variant_pairs) = &self.arena.get(val_id).kind
+            {
+                for &(vk, _) in variant_pairs {
+                    let ArenaKind::String(vs) = &self.arena.get(vk).kind else { continue };
+                    if vs.value.is_empty() {
+                        continue;
+                    }
+                    let mut seen_props = HashSet::new();
+                    for part in vs.value.split(',') {
+                        let Some((prop, val)) = part.split_once('=') else {
+                            self.diagnostics.push(Diagnostic {
+                                span: vs.span,
+                                severity: Severity::Error,
+                                message: format!("Invalid block state variant key \"{part}\" (expected \"property=value\")."),
+                            });
+                            continue;
+                        };
+                        if !seen_props.insert(prop) {
+                            self.diagnostics.push(Diagnostic {
+                                span: vs.span,
+                                severity: Severity::Error,
+                                message: format!("Duplicate block state property \"{prop}\" in variant key."),
+                            });
+                            continue;
+                        }
+                        match props.get(prop) {
+                            None => self.diagnostics.push(Diagnostic {
+                                span: vs.span,
+                                severity: Severity::Warning,
+                                message: format!("Block \"{canonical}\" has no property \"{prop}\"."),
+                            }),
+                            Some(allowed) if !allowed.iter().any(|a| a == val) => self.diagnostics.push(Diagnostic {
+                                span: vs.span,
+                                severity: Severity::Warning,
+                                message: format!("Invalid value \"{val}\" for property \"{prop}\" on \"{canonical}\"."),
+                            }),
+                            _ => {}
+                        }
+                    }
+                }
+            } else if ks.value == "multipart"
+                && let ArenaKind::Array(parts) = &self.arena.get(val_id).kind
+            {
+                for &part_id in parts {
+                    let ArenaKind::Object(part_fields) = &self.arena.get(part_id).kind else { continue };
+                    for &(pk, pv) in part_fields {
+                        if matches!(&self.arena.get(pk).kind, ArenaKind::String(s) if s.value == "when")
+                            && let Some(when_id) = pv
+                        {
+                            self.check_multipart_when(when_id, &canonical, props);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_multipart_when(&mut self, node_id: JsonId, block_id: &str, props: &BTreeMap<String, Vec<String>>) {
+        let ArenaKind::Object(pairs) = &self.arena.get(node_id).kind else { return };
+        for &(kid, vid) in pairs {
+            let ArenaKind::String(ks) = &self.arena.get(kid).kind else { continue };
+            let Some(val_id) = vid else { continue };
+            if matches!(ks.value.as_str(), "OR" | "AND") {
+                if let ArenaKind::Array(children) = &self.arena.get(val_id).kind {
+                    for &child in children {
+                        self.check_multipart_when(child, block_id, props);
+                    }
+                }
+                continue;
+            }
+            match props.get(&ks.value) {
+                None => self.diagnostics.push(Diagnostic {
+                    span: ks.span,
+                    severity: Severity::Warning,
+                    message: format!("Block \"{block_id}\" has no property \"{}\".", ks.value),
+                }),
+                Some(allowed) => {
+                    let val_node = self.arena.get(val_id);
+                    let raw = match &val_node.kind {
+                        ArenaKind::String(s) => s.value.clone(),
+                        ArenaKind::Boolean(b) => b.to_string(),
+                        ArenaKind::Number { raw, .. } => raw.clone(),
+                        _ => continue,
+                    };
+                    for item in raw.split('|') {
+                        if !allowed.iter().any(|a| a == item) {
+                            self.diagnostics.push(Diagnostic {
+                                span: val_node.span,
+                                severity: Severity::Warning,
+                                message: format!("Invalid value \"{item}\" for property \"{}\" on \"{block_id}\".", ks.value),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Vanilla's `Timeline.validateInternal` requires marker IDs to be unique (after canonicalization)
+    // and every marker tick to fall within `0..<period_ticks` when `period_ticks` is set.
+    fn check_timeline_markers(&mut self, root_id: JsonId) {
+        let ArenaKind::Object(pairs) = &self.arena.get(root_id).kind else { return };
+        let mut period_ticks: Option<i64> = None;
+        let mut markers_obj: Option<JsonId> = None;
+        for &(kid, vid) in pairs {
+            let ArenaKind::String(ks) = &self.arena.get(kid).kind else { continue };
+            match (ks.value.as_str(), vid) {
+                ("period_ticks", Some(v)) => {
+                    if let ArenaKind::Number { int_value: Some(n), .. } = &self.arena.get(v).kind
+                        && *n > 0
+                    {
+                        period_ticks = Some(*n);
+                    }
+                }
+                ("time_markers", Some(v)) => markers_obj = Some(v),
+                _ => {}
+            }
+        }
+        let Some(markers_id) = markers_obj else { return };
+        let ArenaKind::Object(marker_pairs) = &self.arena.get(markers_id).kind else { return };
+        let mut seen_canonical: HashSet<String> = HashSet::new();
+        for &(kid, vid) in marker_pairs {
+            let ArenaKind::String(ks) = &self.arena.get(kid).kind else { continue };
+            let canonical = lengthen_id(&ks.value);
+            if !seen_canonical.insert(canonical.clone()) {
+                self.diagnostics.push(Diagnostic {
+                    span: ks.span,
+                    severity: Severity::Error,
+                    message: format!("Duplicate time marker \"{canonical}\"."),
+                });
+            }
+            if let Some(period) = period_ticks
+                && let Some(val_id) = vid
+            {
+                let tick_node = match &self.arena.get(val_id).kind {
+                    ArenaKind::Number { .. } => Some(val_id),
+                    ArenaKind::Object(fields) => fields.iter().find_map(|&(fk, fv)| {
+                        matches!(&self.arena.get(fk).kind, ArenaKind::String(s) if s.value == "ticks").then_some(fv).flatten()
+                    }),
+                    _ => None,
+                };
+                if let Some(tid) = tick_node
+                    && let ArenaKind::Number { int_value: Some(ticks), .. } = &self.arena.get(tid).kind
+                    && (*ticks < 0 || *ticks >= period)
+                {
+                    self.diagnostics.push(Diagnostic {
+                        span: self.arena.get(tid).span,
+                        severity: Severity::Error,
+                        message: format!("Time marker \"{}\" must be in range 0..<{period}.", ks.value),
+                    });
+                }
+            }
+        }
+    }
+
     fn check_leaf_attributes(&mut self, node_id: JsonId, type_def: &McdocType) {
         let node = self.arena.get(node_id);
         for attr in type_def.attributes() {
@@ -1610,6 +2144,23 @@ impl<'a> Engine<'a> {
                             });
                             continue;
                         }
+                    }
+                    let has_hash = raw.starts_with('#');
+                    if has_hash && matches!(cfg.tags, None | Some(TagMode::Implicit)) {
+                        self.diagnostics.push(Diagnostic {
+                            span: s.span,
+                            severity: Severity::Error,
+                            message: "Tags are not allowed here.".into(),
+                        });
+                        continue;
+                    }
+                    if !has_hash && cfg.tags == Some(TagMode::Required) {
+                        self.diagnostics.push(Diagnostic {
+                            span: s.span,
+                            severity: Severity::Error,
+                            message: "Only tags are allowed here.".into(),
+                        });
+                        continue;
                     }
                     let body = raw.strip_prefix('#').unwrap_or(raw);
                     if !is_valid_resource_location(body) {
@@ -1656,11 +2207,14 @@ impl<'a> Engine<'a> {
                         match self.env.registries.lookup(&lookup_reg, &lookup_target, allow_tag, require_tag) {
                             IdLookup::Known => {}
                             IdLookup::UnknownAuthoritative => {
-                                self.diagnostics.push(Diagnostic {
-                                    span: s.span,
-                                    severity: Severity::Warning,
-                                    message: format!("Unknown {lookup_reg} \"{raw}\"."),
-                                });
+                                let shown = if cfg.path.is_some() { format!("\"{raw}\" ({full})") } else { format!("\"{raw}\"") };
+                                // Mods can generate assets while the game runs, so we only say where we looked.
+                                let message = if is_asset_category(&lookup_reg) {
+                                    format!("We didn't find {lookup_reg} {shown} in vanilla or this pack's mods and resource packs.")
+                                } else {
+                                    format!("Unknown {lookup_reg} {shown}.")
+                                };
+                                self.diagnostics.push(Diagnostic { span: s.span, severity: Severity::Warning, message });
                             }
                             IdLookup::UnknownUnverified => {
                                 self.diagnostics.push(Diagnostic {
@@ -1675,14 +2229,27 @@ impl<'a> Engine<'a> {
                 "divisible_by" => {
                     if let Some(div) = attr_number(attr)
                         && div != 0.0
-                        && let ArenaKind::Number { value, .. } = &node.kind
-                        && (*value % div).abs() > 1e-9
                     {
-                        self.diagnostics.push(Diagnostic {
-                            span: node.span,
-                            severity: Severity::Warning,
-                            message: format!("{value} is not divisible by {div}."),
-                        });
+                        match &node.kind {
+                            ArenaKind::Number { int_value: Some(iv), .. } if div.fract() == 0.0 && div >= i64::MIN as f64 && div <= i64::MAX as f64 => {
+                                let d = div as i64;
+                                if d != 0 && iv % d != 0 {
+                                    self.diagnostics.push(Diagnostic {
+                                        span: node.span,
+                                        severity: Severity::Warning,
+                                        message: format!("{iv} is not divisible by {d}."),
+                                    });
+                                }
+                            }
+                            ArenaKind::Number { value, .. } if (*value % div).abs() > 1e-9 => {
+                                self.diagnostics.push(Diagnostic {
+                                    span: node.span,
+                                    severity: Severity::Warning,
+                                    message: format!("{value} is not divisible by {div}."),
+                                });
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 "regex_pattern" => {
@@ -1751,26 +2318,32 @@ impl<'a> Engine<'a> {
                 }
                 "uuid" => {
                     if let ArenaKind::String(s) = &node.kind
-                        && !is_valid_uuid(&s.value)
+                        && parse_java_uuid(&s.value).is_none()
                     {
                         self.diagnostics.push(Diagnostic {
                             span: s.span,
-                            severity: Severity::Warning,
+                            severity: Severity::Error,
                             message: format!("\"{}\" is not a valid UUID.", s.value),
                         });
                     }
                 }
                 "integer" => {
                     if let ArenaKind::String(s) = &node.kind {
-                        match s.value.parse::<i64>() {
-                            Err(_) => {
+                        let strict_digits = !s.value.is_empty()
+                            && match s.value.strip_prefix('-') {
+                                Some(rest) => !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()),
+                                None => s.value.bytes().all(|b| b.is_ascii_digit()),
+                            };
+                        match if strict_digits { s.value.parse::<i32>().ok() } else { None } {
+                            None => {
                                 self.diagnostics.push(Diagnostic {
                                     span: s.span,
                                     severity: Severity::Error,
                                     message: format!("Expected an integer string, got \"{}\".", s.value),
                                 });
                             }
-                            Ok(val) => {
+                            Some(val) => {
+                                let val = i64::from(val);
                                 if let Some(cfg) = parse_integer_attribute(attr) {
                                     if cfg.min.is_some_and(|m| val < m) || cfg.max.is_some_and(|m| val > m) {
                                         let min_s = cfg.min.map(|m| m.to_string()).unwrap_or_default();
@@ -1786,38 +2359,242 @@ impl<'a> Engine<'a> {
                         }
                     }
                 }
-                "text_component" => {
+                "item_slots" => {
                     if let ArenaKind::String(s) = &node.kind {
-                        let trimmed = s.value.trim_start();
-                        // Minecraft parses stringified text components with Gson lenient mode, which allows single-quoted JSON.
-                        if (trimmed.starts_with('{') || trimmed.starts_with('['))
-                            && !trimmed.starts_with("{'")
-                            && !trimmed.starts_with("[{'")
-                            && !trimmed.starts_with("['")
-                        {
-                            let parsed = super::json_parser::parse(&s.value, false);
-                            for diag in parsed.diagnostics {
+                        let valid = item_slots_for_version(self.env.version.minecraft.as_deref());
+                        if !valid.iter().any(|slot| slot == &s.value) {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.span,
+                                severity: Severity::Error,
+                                message: format!("\"{}\" is not a valid item slot.", s.value),
+                            });
+                        }
+                    }
+                }
+                "game_rule" => {
+                    if let ArenaKind::String(s) = &node.kind
+                        && let Some(kind) = parse_game_rule_attribute(attr)
+                    {
+                        let pool = match kind {
+                            "boolean" => &self.env.registries.game_rules.boolean,
+                            "int" => &self.env.registries.game_rules.int,
+                            _ => continue,
+                        };
+                        if !pool.is_empty() && pool.binary_search(&s.value).is_err() {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.span,
+                                severity: Severity::Error,
+                                message: format!("Unknown {kind} game rule \"{}\".", s.value),
+                            });
+                        }
+                    }
+                }
+                QUADRANT_ATTR => {
+                    if let ArenaKind::Number { int_value: Some(value), .. } = &node.kind
+                        && value.rem_euclid(90) != 0
+                    {
+                        self.diagnostics.push(Diagnostic {
+                            span: node.span,
+                            severity: Severity::Error,
+                            message: format!("Minecraft only accepts multiples of 90 here, not {value}."),
+                        });
+                    }
+                }
+                "translation_value" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        let rewritten_by_language = has_attr(type_def.attributes(), LANG_VALUE_ATTR);
+                        for (start, end, msg) in validate_translation_value(&s.value, rewritten_by_language) {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.map.span_to_source(start, end),
+                                severity: Severity::Warning,
+                                message: msg,
+                            });
+                        }
+                    }
+                }
+                "nbt" => {
+                    if let ArenaKind::String(s) = &node.kind
+                        && let Some(AttributeValue::Type(raw_target)) = &attr.value
+                    {
+                        let parsed = super::snbt::parse_snbt(&s.value, self.env.version.minecraft.as_deref());
+                        for diag in parsed.diagnostics {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.map.span_to_source(diag.span.start, diag.span.end),
+                                severity: diag.severity,
+                                message: diag.message,
+                            });
+                        }
+                        let resolved_target = self.simplify(raw_target, node_id, false, &[], None, 0);
+                        self.embedded_nbt_targets.insert(node_id, resolved_target.clone());
+                        if let Some(root) = &parsed.root {
+                            let nested = check_nbt_with_type(root, &resolved_target, self.env);
+                            for diag in nested.diagnostics {
                                 self.diagnostics.push(Diagnostic {
                                     span: s.map.span_to_source(diag.span.start, diag.span.end),
                                     severity: diag.severity,
                                     message: diag.message,
                                 });
                             }
-                            if let Some(root) = &parsed.root
-                                && self.env.tables.mcdoc.contains_key("::java::util::text::Text")
+                        }
+                    }
+                }
+                "nbt_path" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        for diag in super::snbt::validate_nbt_path(&s.value, self.env.version.minecraft.as_deref()) {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.map.span_to_source(diag.span.start, diag.span.end),
+                                severity: diag.severity,
+                                message: diag.message,
+                            });
+                        }
+                    }
+                }
+                "block_predicate" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        for diag in super::snbt::validate_block_predicate(&s.value, self.env) {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.map.span_to_source(diag.span.start, diag.span.end),
+                                severity: diag.severity,
+                                message: diag.message,
+                            });
+                        }
+                    }
+                }
+                "translation_key" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        let is_def_or_meta = matches!(
+                            &attr.value,
+                            Some(AttributeValue::Tree(t))
+                                if t.values.get("definition").is_some()
+                                    || t.values.get("renamed").is_some()
+                                    || t.values.get("removed").is_some()
+                        );
+                        if !is_def_or_meta {
+                            if self.env.registries.deprecated_translation_keys.contains(&s.value) {
+                                self.diagnostics.push(Diagnostic {
+                                    span: s.span,
+                                    severity: Severity::Warning,
+                                    message: format!("Translation key \"{}\" is deprecated.", s.value),
+                                });
+                            } else if self.env.registries.has_vanilla_translation_keys
+                                && self.env.registries.translation_keys.binary_search(&s.value).is_err()
                             {
-                                let text_ty = McdocType::Reference {
-                                    path: Some("::java::util::text::Text".into()),
-                                    attributes: Vec::new(),
-                                };
-                                let nested = check_json_with_type(root, &text_ty, self.env);
-                                for diag in nested.diagnostics {
-                                    self.diagnostics.push(Diagnostic {
-                                        span: s.map.span_to_source(diag.span.start, diag.span.end),
-                                        severity: diag.severity,
-                                        message: diag.message,
-                                    });
-                                }
+                                self.diagnostics.push(Diagnostic {
+                                    span: s.span,
+                                    severity: Severity::Warning,
+                                    message: format!("We didn't find translation key \"{}\" in vanilla's or this pack's lang files.", s.value),
+                                });
+                            }
+                        }
+                    }
+                }
+                "objective" | "team" | "tag" => {
+                    if let ArenaKind::String(s) = &node.kind
+                        && (s.value.is_empty() || s.value.bytes().any(|b| b.is_ascii_whitespace()))
+                    {
+                        self.diagnostics.push(Diagnostic {
+                            span: s.span,
+                            severity: Severity::Error,
+                            message: format!("\"{}\" is not a valid {}.", s.value, attr.name),
+                        });
+                    }
+                }
+                "entity" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        let (amount, kind) = parse_entity_attribute(attr);
+                        for diag in super::mcfunction::validate_entity_selector(&s.value, amount, kind, self.env.version.minecraft.as_deref()) {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.map.span_to_source(diag.span.start, diag.span.end),
+                                severity: diag.severity,
+                                message: diag.message,
+                            });
+                        }
+                    }
+                }
+                "score_holder" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        let amount = parse_score_holder_amount(attr);
+                        for diag in super::mcfunction::validate_score_holder(&s.value, amount, self.env.version.minecraft.as_deref()) {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.map.span_to_source(diag.span.start, diag.span.end),
+                                severity: diag.severity,
+                                message: diag.message,
+                            });
+                        }
+                    }
+                }
+                "command" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        let (slash, macro_implicit, empty_allowed, incomplete, max_length) = parse_command_attribute(attr);
+                        for diag in super::mcfunction::validate_command(&s.value, slash, macro_implicit, empty_allowed, incomplete, max_length) {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.map.span_to_source(diag.span.start, diag.span.end),
+                                severity: diag.severity,
+                                message: diag.message,
+                            });
+                        }
+                    }
+                }
+                "url" => {
+                    if let ArenaKind::String(s) = &node.kind
+                        && let Some(msg) = super::mcfunction::validate_url(&s.value)
+                    {
+                        self.diagnostics.push(Diagnostic { span: s.span, severity: Severity::Error, message: msg });
+                    }
+                }
+                "time_pattern" => {
+                    if let ArenaKind::String(s) = &node.kind
+                        && let Some(msg) = super::mcfunction::validate_time_pattern(&s.value)
+                    {
+                        self.diagnostics.push(Diagnostic { span: s.span, severity: Severity::Error, message: msg });
+                    }
+                }
+                "vector" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        let (dim, integer) = parse_vector_attribute(attr);
+                        if let Some(msg) = super::mcfunction::validate_vector(&s.value, dim, integer) {
+                            self.diagnostics.push(Diagnostic { span: s.span, severity: Severity::Error, message: msg });
+                        }
+                    }
+                }
+                "text_component" => {
+                    if let ArenaKind::String(s) = &node.kind {
+                        // Minecraft parses stringified text components with Gson lenient mode, so
+                        // single-quoted JSON and unquoted keys load; we forward syntax errors and
+                        // full Text schema diagnostics.
+                        let parsed = super::json_parser::parse_as(&s.value, false, Some(super::json_parser::JsonDialect::Lenient));
+                        let mut had_syntax_error = false;
+                        for diag in parsed.diagnostics {
+                            if diag.severity == Severity::Error {
+                                had_syntax_error = true;
+                                self.diagnostics.push(Diagnostic {
+                                    span: s.map.span_to_source(diag.span.start, diag.span.end),
+                                    severity: diag.severity,
+                                    message: diag.message,
+                                });
+                            }
+                        }
+                        if parsed.root.is_none() && !had_syntax_error {
+                            self.diagnostics.push(Diagnostic {
+                                span: s.span,
+                                severity: Severity::Error,
+                                message: "Expected a text component.".into(),
+                            });
+                        }
+                        if let Some(root) = &parsed.root
+                            && self.env.tables.mcdoc.contains_key("::java::util::text::Text")
+                        {
+                            let text_ty = McdocType::Reference {
+                                path: Some("::java::util::text::Text".into()),
+                                attributes: Vec::new(),
+                            };
+                            let nested = check_json_with_type(root, &text_ty, self.env);
+                            for diag in nested.diagnostics {
+                                self.diagnostics.push(Diagnostic {
+                                    span: s.map.span_to_source(diag.span.start, diag.span.end),
+                                    severity: diag.severity,
+                                    message: diag.message,
+                                });
                             }
                         }
                     }
@@ -1957,12 +2734,15 @@ fn condense_errors_and_filter_siblings(defs: &[(DefId, Vec<RuntimeError>)]) -> (
     let mut valid: Vec<(DefId, Vec<RuntimeError>)> = defs.to_vec();
     let mut errors = Vec::new();
 
-    // 1. TypeMismatch
+    // 1. TypeMismatch and Internal (attribute-gated shallow mismatches like `#[color="hex_rgb"]`
+    //    or `#[id(prefix="!")]`). Treating them in the same tier prevents an attribute-gated
+    //    string branch from narrowing away enum/literal siblings when the user is mid-edit.
     let (next, errs) = condense_layer(
         &valid,
-        |e| matches!(e.kind, RuntimeErrorKind::TypeMismatch { .. }),
+        |e| matches!(e.kind, RuntimeErrorKind::TypeMismatch { .. } | RuntimeErrorKind::Internal),
         |a, b| match (&a.kind, &b.kind) {
             (RuntimeErrorKind::TypeMismatch { expected: ea }, RuntimeErrorKind::TypeMismatch { expected: eb }) => ea == eb,
+            (RuntimeErrorKind::Internal, RuntimeErrorKind::Internal) => true,
             _ => false,
         },
         Some(|group: &[RuntimeError]| {
@@ -1976,7 +2756,11 @@ fn condense_errors_and_filter_siblings(defs: &[(DefId, Vec<RuntimeError>)]) -> (
                     }
                 }
             }
-            RuntimeError { node: group[0].node, kind: RuntimeErrorKind::TypeMismatch { expected: merged }, conflicting_nodes: None }
+            if merged.is_empty() {
+                group[0].clone()
+            } else {
+                RuntimeError { node: group[0].node, kind: RuntimeErrorKind::TypeMismatch { expected: merged }, conflicting_nodes: None }
+            }
         }),
     );
     valid = next;
@@ -2101,17 +2885,7 @@ fn condense_errors_and_filter_siblings(defs: &[(DefId, Vec<RuntimeError>)]) -> (
     valid = next;
     errors.extend(errs);
 
-    // 5. Internal
-    let (next, errs) = condense_layer(
-        &valid,
-        |e| matches!(e.kind, RuntimeErrorKind::Internal),
-        |_, _| false,
-        None::<fn(&[RuntimeError]) -> RuntimeError>,
-    );
-    valid = next;
-    errors.extend(errs);
-
-    // 6. State predicate values the block doesn't have. These load but never match.
+    // 5. State predicate values the block doesn't have. These load but never match.
     let (next, errs) = condense_layer(
         &valid,
         |e| matches!(e.kind, RuntimeErrorKind::StateNeverMatches),
@@ -2297,6 +3071,281 @@ fn loader_ignored(attributes: &[Attribute], ignored: &[&str]) -> bool {
 /// those symbols through this dispatcher to warn instead of erroring.
 pub const STATE_PREDICATE_DISPATCHER: &str = "packraven:block_state_predicate";
 const STATE_PREDICATE_ATTR: &str = "packraven_state_predicate";
+pub const ADVANCEMENT_CRITERIA_DISPATCHER: &str = "packraven:advancement_criteria";
+pub const MOD_ID_ATTR: &str = "packraven_mod_id";
+pub const SUGGEST_ATTR: &str = "packraven_suggest";
+pub const LANG_CODE_ATTR: &str = "packraven_lang_code";
+const LANG_VALUE_ATTR: &str = "packraven_lang_value";
+const BLEND_FACTOR_ATTR: &str = "packraven_blend_factor";
+const QUADRANT_ATTR: &str = "packraven_quadrant";
+
+/// Relaxes vanilla-mcdoc asset schemas that are stricter than vanilla's own parsers:
+/// - Vanilla reads atlas source types as resource locations in every version (`SpriteSources`),
+///   but vanilla-mcdoc only allows a namespace from 1.21.5.
+/// - `ParticleDescription.fromJson` treats `textures` as optional.
+/// - `BlendMode.stringToBlendFactor` normalizes spellings like `ONE_MINUS_SRC_ALPHA`.
+/// - Block state variants take any multiple of 90 for `x`, `y` and `z`, since vanilla reads them modulo 360.
+///
+/// It also marks lang file values, since vanilla's `Language` rewrites their `%d`/`%f` placeholders.
+pub fn relax_asset_schemas(tables: &mut SymbolTables) {
+    if let Some(McdocType::Struct { fields, .. }) = tables.mcdoc.get_mut("::java::assets::block_state_definition::ModelVariantBase") {
+        for field in fields {
+            if let StructField::Pair { key: StructKey::Literal(name), field_type, .. } = field
+                && matches!(name.as_str(), "x" | "y" | "z")
+            {
+                *field_type = McdocType::Int {
+                    value_range: None,
+                    attributes: vec![Attribute { name: QUADRANT_ATTR.into(), value: None }],
+                };
+            }
+        }
+    }
+    if let Some(McdocType::Struct { fields, .. }) = tables.mcdoc.get_mut("::java::assets::atlas::SpriteSource") {
+        for field in fields {
+            if let StructField::Pair { key: StructKey::Literal(name), field_type, .. } = field
+                && name == "type"
+            {
+                *field_type = McdocType::Reference {
+                    path: Some("::java::assets::atlas::SpriteSourceType".into()),
+                    attributes: vec![Attribute { name: "id".into(), value: None }],
+                };
+            }
+        }
+    }
+    if let Some(McdocType::Struct { fields, .. }) = tables.mcdoc.get_mut("::java::assets::particle::Particle") {
+        for field in fields {
+            if let StructField::Pair { key: StructKey::Literal(name), optional, .. } = field
+                && name == "textures"
+            {
+                *optional = true;
+            }
+        }
+    }
+    if let Some(McdocType::Enum { attributes, .. }) = tables.mcdoc.get_mut("::java::assets::shader::program::BlendFactor") {
+        attributes.push(Attribute { name: BLEND_FACTOR_ATTR.into(), value: None });
+    }
+    if let Some(McdocType::Struct { fields, .. }) = tables.mcdoc.get_mut("::java::assets::lang::Lang") {
+        for field in fields {
+            if let StructField::Pair { key: StructKey::Dynamic(_), field_type, .. } = field {
+                field_type.attributes_mut().push(Attribute { name: LANG_VALUE_ATTR.into(), value: None });
+            }
+        }
+    }
+}
+
+fn normalize_blend_factor(value: &str) -> String {
+    value.trim().to_lowercase().replace('_', "").replace("one", "1").replace("zero", "0").replace("minus", "-")
+}
+
+/// Patches vanilla and partner symbol tables with Packraven-specific dynamic-key enhancements:
+/// cross-file advancement criteria lookup, Fabric mod ID / entrypoint suggestions, language codes,
+/// and avatar property suggestions.
+pub fn enhance_symbol_tables(tables: &mut SymbolTables) {
+    let adv_criteria_dispatch = McdocType::Dispatcher {
+        registry: ADVANCEMENT_CRITERIA_DISPATCHER.into(),
+        parallel_indices: vec![Index::Dynamic {
+            accessor: vec![AccessorKey::Keyword { keyword: DynamicKeyword::Key }],
+        }],
+        attributes: Vec::new(),
+    };
+    if tables.mcdoc.contains_key("::java::data::advancement::predicate::PlayerAdvancementCriteria") {
+        tables
+            .mcdoc
+            .insert("::java::data::advancement::predicate::PlayerAdvancementCriteria".into(), adv_criteria_dispatch.clone());
+    }
+    if let Some(McdocType::Struct { fields, .. }) = tables.mcdoc.get_mut("::java::data::advancement::predicate::PlayerAdvancements") {
+        for field in fields {
+            if let StructField::Pair { field_type: McdocType::Union { members, .. }, .. } = field {
+                for m in members {
+                    if matches!(m, McdocType::Struct { .. }) {
+                        *m = adv_criteria_dispatch.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    let tag_dynamic_key = |tables: &mut SymbolTables, symbol: &str, attr_name: &str, value: Option<&str>| {
+        if let Some(McdocType::Struct { fields, .. }) = tables.mcdoc.get_mut(symbol) {
+            for field in fields {
+                if let StructField::Pair { key: StructKey::Dynamic(kty), .. } = field {
+                    let attr = Attribute {
+                        name: attr_name.into(),
+                        value: value.map(|v| {
+                            AttributeValue::Type(McdocType::Literal {
+                                value: LiteralValue::String { value: v.into() },
+                                attributes: Vec::new(),
+                            })
+                        }),
+                    };
+                    kty.attributes_mut().push(attr);
+                }
+            }
+        }
+    };
+
+    for sym in ["::partner::fabric::Dependencies", "::partner::fabric::Overrides", "::fabric::Dependencies", "::fabric::Overrides"] {
+        tag_dynamic_key(tables, sym, MOD_ID_ATTR, None);
+    }
+    for sym in ["::partner::fabric::Entrypoints", "::fabric::Entrypoints"] {
+        tag_dynamic_key(tables, sym, SUGGEST_ATTR, Some("main,client,server"));
+    }
+    tag_dynamic_key(tables, "::java::util::avatar::ProfilePropertyMap", SUGGEST_ATTR, Some("textures"));
+    tag_dynamic_key(tables, "::java::pack::Languages", LANG_CODE_ATTR, None);
+}
+
+fn block_ids_for_item(item_id: &str) -> Vec<String> {
+    let mapped: &[&str] = match item_id {
+        "minecraft:brain_coral_fan" => &["minecraft:brain_coral_fan", "minecraft:brain_coral_wall_fan"],
+        "minecraft:bubble_coral_fan" => &["minecraft:bubble_coral_fan", "minecraft:bubble_coral_wall_fan"],
+        "minecraft:fire_coral_fan" => &["minecraft:fire_coral_fan", "minecraft:fire_coral_wall_fan"],
+        "minecraft:horn_coral_fan" => &["minecraft:horn_coral_fan", "minecraft:horn_coral_wall_fan"],
+        "minecraft:tube_coral_fan" => &["minecraft:tube_coral_fan", "minecraft:tube_coral_wall_fan"],
+        "minecraft:dead_brain_coral_fan" => &["minecraft:dead_brain_coral_fan", "minecraft:dead_brain_coral_wall_fan"],
+        "minecraft:dead_bubble_coral_fan" => &["minecraft:dead_bubble_coral_fan", "minecraft:dead_bubble_coral_wall_fan"],
+        "minecraft:dead_fire_coral_fan" => &["minecraft:dead_fire_coral_fan", "minecraft:dead_fire_coral_wall_fan"],
+        "minecraft:dead_horn_coral_fan" => &["minecraft:dead_horn_coral_fan", "minecraft:dead_horn_coral_wall_fan"],
+        "minecraft:dead_tube_coral_fan" => &["minecraft:dead_tube_coral_fan", "minecraft:dead_tube_coral_wall_fan"],
+        "minecraft:creeper_head" => &["minecraft:creeper_head", "minecraft:creeper_wall_head"],
+        "minecraft:dragon_head" => &["minecraft:dragon_head", "minecraft:dragon_wall_head"],
+        "minecraft:player_head" => &["minecraft:player_head", "minecraft:player_wall_head"],
+        "minecraft:skeleton_skull" => &["minecraft:skeleton_skull", "minecraft:skeleton_wall_skull"],
+        "minecraft:wither_skeleton_skull" => &["minecraft:wither_skeleton_skull", "minecraft:wither_skeleton_wall_skull"],
+        "minecraft:torch" => &["minecraft:torch", "minecraft:wall_torch"],
+        "minecraft:soul_torch" => &["minecraft:soul_torch", "minecraft:soul_wall_torch"],
+        "minecraft:redstone_torch" => &["minecraft:redstone_torch", "minecraft:redstone_wall_torch"],
+        "minecraft:beetroot_seeds" => &["minecraft:beetroots"],
+        "minecraft:carrot" => &["minecraft:carrots"],
+        "minecraft:cocoa_beans" => &["minecraft:cocoa"],
+        "minecraft:glow_berries" => &["minecraft:cave_vines"],
+        "minecraft:melon_seeds" => &["minecraft:melon_stem"],
+        "minecraft:potato" => &["minecraft:potatoes"],
+        "minecraft:pumpkin_seeds" => &["minecraft:pumpkin_stem"],
+        "minecraft:redstone" => &["minecraft:redstone_wire"],
+        "minecraft:string" => &["minecraft:tripwire"],
+        "minecraft:sweet_berries" => &["minecraft:sweet_berry_bush"],
+        "minecraft:wheat_seeds" => &["minecraft:wheat"],
+        _ => return vec![item_id.to_string()],
+    };
+    mapped.iter().map(|s| (*s).to_string()).collect()
+}
+
+pub(crate) fn texture_slot_kind(ty: &McdocType) -> Option<&'static str> {
+    if let McdocType::Union { members, .. } = ty {
+        return members.iter().find_map(texture_slot_kind);
+    }
+    let attr = ty.attributes().iter().find(|a| a.name == "texture_slot")?;
+    let kind = match &attr.value {
+        Some(AttributeValue::Tree(t)) => t.values.get("kind").and_then(|v| match v {
+            AttributeValue::Type(McdocType::Literal { value: LiteralValue::String { value }, .. }) => Some(value.as_str()),
+            AttributeValue::Type(McdocType::Reference { path: Some(p), .. }) => Some(p.rsplit("::").next().unwrap_or(p.as_str())),
+            _ => None,
+        }),
+        _ => None,
+    };
+    match kind {
+        Some("definition") => Some("definition"),
+        Some("reference") => Some("reference"),
+        _ => Some("value"),
+    }
+}
+
+/// Returns each distinct texture slot defined in the model or its indexed parent chain.
+pub(crate) fn defined_texture_slots(check: &CheckOutput, env: &CheckEnv<'_>) -> Vec<String> {
+    let mut defs: Vec<(usize, String)> = check
+        .attached
+        .iter()
+        .filter(|(_, info)| texture_slot_kind(&info.type_def) == Some("definition"))
+        .filter_map(|(id, _)| match &check.arena.get(*id).kind {
+            ArenaKind::String(s) => Some((s.span.start, s.value.clone())),
+            _ => None,
+        })
+        .collect();
+    defs.sort_by_key(|(start, _)| *start);
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for (_, name) in defs {
+        if seen.insert(name.clone()) {
+            out.push(name);
+        }
+    }
+    if let Some(root_id) = check.arena.root
+        && let ArenaKind::Object(pairs) = &check.arena.get(root_id).kind
+    {
+        let mut next_parent = pairs.iter().find_map(|&(kid, vid)| {
+            let ArenaKind::String(ks) = &check.arena.get(kid).kind else { return None };
+            if ks.value != "parent" {
+                return None;
+            }
+            let ArenaKind::String(vs) = &check.arena.get(vid?).kind else { return None };
+            Some(lengthen_id(&vs.value))
+        });
+        let mut visited = HashSet::new();
+        while let Some(parent_id) = next_parent.take() {
+            if !visited.insert(parent_id.clone()) {
+                break;
+            }
+            if let Some(info) = env.registries.model_textures.get(&parent_id) {
+                for slot in &info.slots {
+                    if seen.insert(slot.clone()) {
+                        out.push(slot.clone());
+                    }
+                }
+                next_parent = info.parent.clone();
+            }
+        }
+    }
+    out
+}
+
+fn tree_str<'a>(attr: &'a Attribute, key: &str) -> Option<&'a str> {
+    let AttributeValue::Tree(t) = attr.value.as_ref()? else { return None };
+    match t.values.get(key)? {
+        AttributeValue::Type(McdocType::Literal { value: LiteralValue::String { value }, .. }) => Some(value.as_str()),
+        AttributeValue::Type(McdocType::Reference { path: Some(p), .. }) => Some(p.rsplit("::").next().unwrap_or(p.as_str())),
+        _ => None,
+    }
+}
+
+fn parse_entity_attribute(attr: &Attribute) -> (&str, &str) {
+    let amount = tree_str(attr, "amount").unwrap_or("multiple");
+    let kind = tree_str(attr, "type").unwrap_or("entities");
+    (amount, kind)
+}
+
+fn parse_score_holder_amount(attr: &Attribute) -> &str {
+    tree_str(attr, "amount").unwrap_or("multiple")
+}
+
+fn parse_command_attribute(attr: &Attribute) -> (Option<&str>, bool, bool, bool, Option<usize>) {
+    let slash = tree_str(attr, "slash");
+    let macro_implicit = tree_str(attr, "macro") == Some("implicit");
+    let empty_allowed = tree_str(attr, "empty") == Some("allowed");
+    let incomplete = tree_str(attr, "incomplete") == Some("allowed");
+    let max_length = match &attr.value {
+        Some(AttributeValue::Tree(t)) => match t.values.get("max_length") {
+            Some(AttributeValue::Type(McdocType::Literal { value: LiteralValue::Int { value }, .. })) => Some(*value as usize),
+            Some(AttributeValue::Type(McdocType::Literal { value: LiteralValue::Long { value }, .. })) => usize::try_from(*value).ok(),
+            _ => None,
+        },
+        _ => None,
+    };
+    (slash, macro_implicit, empty_allowed, incomplete, max_length)
+}
+
+fn parse_vector_attribute(attr: &Attribute) -> (usize, bool) {
+    let Some(AttributeValue::Tree(t)) = &attr.value else { return (3, false) };
+    let dim = match t.values.get("dimension") {
+        Some(AttributeValue::Type(McdocType::Literal { value: LiteralValue::Int { value }, .. })) => (*value as usize).max(1),
+        Some(AttributeValue::Type(McdocType::Literal { value: LiteralValue::Long { value }, .. })) => usize::try_from(*value).unwrap_or(3).max(1),
+        _ => 3,
+    };
+    let integer = matches!(
+        t.values.get("integer"),
+        Some(AttributeValue::Type(McdocType::Literal { value: LiteralValue::Boolean { value: true }, .. }))
+    );
+    (dim, integer)
+}
 
 /// Vanilla-mcdoc requires loot entry `weight` to be at least 1, but vanilla has never checked it
 /// (`GsonHelper.getAsInt` on 1.20.1, `Codec.INT` since), and an entry with weight 0 just never rolls.
@@ -2449,6 +3498,119 @@ pub(crate) fn pattern_symbols(check: &CheckOutput) -> Vec<char> {
     symbols
 }
 
+pub(crate) fn criterion_role(ty: &McdocType) -> Option<CraftingRole> {
+    if let McdocType::Union { members, .. } = ty {
+        return members.iter().find_map(criterion_role);
+    }
+    let attr = ty.attributes().iter().find(|a| a.name == "criterion")?;
+    let defines = match &attr.value {
+        Some(AttributeValue::Tree(tree)) => matches!(
+            tree.values.get("definition"),
+            Some(AttributeValue::Type(McdocType::Literal { value: LiteralValue::Boolean { value: true }, .. }))
+        ),
+        _ => false,
+    };
+    Some(if defines { CraftingRole::Definition } else { CraftingRole::Reference })
+}
+
+/// Returns each distinct criterion key defined in the advancement, in source order.
+pub(crate) fn defined_criteria(check: &CheckOutput) -> Vec<String> {
+    let mut defs: Vec<(usize, &str)> = check
+        .attached
+        .iter()
+        .filter(|(_, info)| criterion_role(&info.type_def) == Some(CraftingRole::Definition))
+        .filter_map(|(id, _)| match &check.arena.get(*id).kind {
+            ArenaKind::String(s) => Some((s.span.start, s.value.as_str())),
+            _ => None,
+        })
+        .collect();
+    defs.sort_by_key(|(start, _)| *start);
+    let mut out = Vec::new();
+    for (_, name) in defs {
+        if !out.iter().any(|existing: &String| existing == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+fn vanilla_fluid_states(fluid_id: &str) -> Option<&'static [(&'static str, &'static [&'static str])]> {
+    const BOOL: &[&str] = &["false", "true"];
+    const LEVELS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8"];
+    const FLOWING: &[(&str, &[&str])] = &[("falling", BOOL), ("level", LEVELS)];
+    const STILL: &[(&str, &[&str])] = &[("falling", BOOL)];
+    match fluid_id {
+        "minecraft:flowing_lava" | "minecraft:flowing_water" => Some(FLOWING),
+        "minecraft:lava" | "minecraft:water" => Some(STILL),
+        _ => None,
+    }
+}
+
+// Mirrors how vanilla formats translations. `Language` rewrites `%d` and `%f` placeholders
+// (`%(\d+\$)?[\d.]*[df]`) to `%s` when it loads a lang file, but not in a text component's
+// `fallback`. `TranslatableContents.decomposeTemplate` then rejects any other `%` use, and the
+// string still loads but shows as raw text without its arguments. So a lone `%` (as in "50% faster")
+// only matters when the string also has placeholders to fill in.
+fn validate_translation_value(s: &str, rewritten_by_language: bool) -> Vec<(usize, usize, String)> {
+    let bytes = s.as_bytes();
+    let mut placeholders = 0usize;
+    let mut unsupported = Vec::new();
+    let mut lone = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        i += 1;
+        let index_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i > index_start && bytes.get(i) == Some(&b'$') {
+            i += 1;
+        } else {
+            i = index_start;
+        }
+        let precision_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        let bare = i == precision_start;
+        match bytes.get(i) {
+            Some(b'd' | b'f') if rewritten_by_language => placeholders += 1,
+            Some(b's') if bare => placeholders += 1,
+            Some(b'%') if i == start + 1 => {}
+            // Mods substitute their own tokens like `%COST%` themselves, so we only treat a lone letter
+            // as an attempted placeholder.
+            Some(c) if c.is_ascii_alphabetic() && !bytes.get(i + 1).is_some_and(|n| n.is_ascii_alphanumeric() || *n == b'_') => {
+                unsupported.push((start, i + 1));
+            }
+            _ => {
+                lone.push((start, start + 1));
+                i = start + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    let mut out: Vec<(usize, usize, String)> = unsupported
+        .into_iter()
+        .map(|(from, to)| {
+            let placeholder = &s[from..to];
+            (from, to, format!("Minecraft doesn't support \"{placeholder}\" here, so it shows this whole string as raw text without filling in its arguments. Use \"%s\" or \"%1$s\"."))
+        })
+        .collect();
+    if placeholders > 0 {
+        out.extend(lone.into_iter().map(|(from, to)| {
+            (from, to, "Minecraft shows this whole string as raw text without filling in its arguments, because of this lone \"%\". Use \"%%\" for a literal \"%\".".to_string())
+        }));
+    }
+    out.sort_by_key(|(from, _, _)| *from);
+    out
+}
+
 fn single_char(s: &str) -> Option<char> {
     let mut chars = s.chars();
     let c = chars.next()?;
@@ -2573,7 +3735,7 @@ fn value_kind_of(ty: &McdocType) -> &'static str {
     }
 }
 
-fn try_convert_json(node: &ArenaNode, target_kind: &str) -> Option<McdocType> {
+fn try_convert_json(node: &ArenaNode, target_kind: &str, nbt_mode: bool) -> Option<McdocType> {
     match &node.kind {
         ArenaKind::Array(_) => match target_kind {
             "list" => Some(McdocType::List {
@@ -2587,7 +3749,27 @@ fn try_convert_json(node: &ArenaNode, target_kind: &str) -> Option<McdocType> {
             "tuple" => Some(McdocType::Tuple { items: Vec::new(), attributes: Vec::new() }),
             _ => None,
         },
+        ArenaKind::Boolean(b) if nbt_mode => {
+            let n = if *b { 1.0 } else { 0.0 };
+            let i = i64::from(*b);
+            let lit = match target_kind {
+                "byte" => Some(LiteralValue::Byte { value: n }),
+                "short" => Some(LiteralValue::Short { value: n }),
+                "int" => Some(LiteralValue::Int { value: n }),
+                "long" => Some(LiteralValue::Long { value: i }),
+                "float" => Some(LiteralValue::Float { value: n }),
+                "double" => Some(LiteralValue::Double { value: n }),
+                _ => None,
+            }?;
+            Some(McdocType::Literal { value: lit, attributes: Vec::new() })
+        }
         ArenaKind::Number { value, is_int, int_value, .. } => {
+            if nbt_mode && target_kind == "boolean" && *is_int && matches!(int_value, Some(0 | 1)) {
+                return Some(McdocType::Literal {
+                    value: LiteralValue::Boolean { value: *int_value == Some(1) },
+                    attributes: Vec::new(),
+                });
+            }
             // Vanilla reads integers with `Number::intValue` (DFU's `Codec.INT`, Gson's `getAsInt`), so it
             // accepts `1.0`, which vanilla's own datagen writes for loot table `rolls`.
             let int_value = &if *is_int { *int_value } else { whole_number(*value) };
@@ -2736,13 +3918,12 @@ fn format_actual_node(kind: &ArenaKind, show_literal: bool) -> String {
     }
 }
 
-fn is_valid_resource_location(s: &str) -> bool {
+pub(crate) fn is_valid_resource_location(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
     if let Some((ns, path)) = s.split_once(':') {
-        !ns.is_empty()
-            && !path.is_empty()
+        !path.is_empty()
             && ns.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.'))
             && path.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/'))
     } else {
@@ -2750,16 +3931,34 @@ fn is_valid_resource_location(s: &str) -> bool {
     }
 }
 
-fn is_valid_uuid(s: &str) -> bool {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 {
-        return false;
+/// Parses a UUID the way Java's `UUID.fromString` does (JDK 17 to 25), returning the 4 signed 32-bit
+/// ints Minecraft stores in `[I; ...]`.
+pub(crate) fn parse_java_uuid(s: &str) -> Option<[i32; 4]> {
+    if s.len() > 36 {
+        return None;
     }
-    let expected = [8, 4, 4, 4, 12];
-    parts
-        .iter()
-        .zip(expected)
-        .all(|(p, len)| p.len() == len && p.bytes().all(|b| b.is_ascii_hexdigit()))
+    let mut iter = s.split('-');
+    let parts = [iter.next()?, iter.next()?, iter.next()?, iter.next()?, iter.next()?];
+    if iter.next().is_some() {
+        return None;
+    }
+    let mut nums = [0u64; 5];
+    for (i, p) in parts.iter().enumerate() {
+        // Java parses each group with `Long.parseLong(.., 16)`, which takes a leading `+`.
+        let digits = p.strip_prefix('+').unwrap_or(p);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let val = u64::from_str_radix(digits, 16).ok()?;
+        if val > i64::MAX as u64 {
+            return None;
+        }
+        nums[i] = val;
+    }
+    // Java masks each group to its width, so oversized groups like `1ffff` silently drop their high bits.
+    let msb = ((nums[0] & 0xffff_ffff) << 32) | ((nums[1] & 0xffff) << 16) | (nums[2] & 0xffff);
+    let lsb = ((nums[3] & 0xffff) << 48) | (nums[4] & 0xffff_ffff_ffff);
+    Some([(msb >> 32) as i32, msb as i32, (lsb >> 32) as i32, lsb as i32])
 }
 
 #[cfg(test)]
@@ -3086,5 +4285,503 @@ dispatch minecraft:loot_function["minecraft:set_name"] to struct {
             let o = check_json_with_type(p.root.as_ref().unwrap(), &loot_type, &env);
             eprintln!("=== {label} ===\n{:#?}", o.diagnostics);
         }
+    }
+
+    #[test]
+    fn enforces_tag_prefix_as_error_and_accepts_empty_namespace() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+            struct Sample {
+                plain?: #[id="item"] string,
+                req?: #[id(registry="item", tags="required")] string,
+                bare?: #[id] string,
+            }
+            "#,
+            "::test",
+            &mut tables,
+        )
+        .unwrap();
+        let mut registries = RegistryIndex::default();
+        registries.insert_entries("item", ["minecraft:stone".into()]);
+        registries.insert_entries("tag/item", ["minecraft:planks".into()]);
+        registries.finalize();
+        let version = VersionContext::default();
+        let env = CheckEnv {
+            tables: &tables,
+            registries: &registries,
+            version: &version,
+            require_canonical: false,
+            allow_missing_keys: false,
+            primitives_read_as_strings: false,
+            ignored_loaders: &[],
+        };
+        let root_type = McdocType::Reference { path: Some("::test::Sample".into()), attributes: Vec::new() };
+
+        let ok = json_parser::parse(r##"{"plain": ":stone", "req": "#:planks", "bare": ":custom"}"##, false);
+        let ok_out = check_json_with_type(ok.root.as_ref().unwrap(), &root_type, &env);
+        assert!(ok_out.diagnostics.is_empty(), "{:?}", ok_out.diagnostics);
+
+        let bad = json_parser::parse(r##"{"plain": "#minecraft:planks", "req": "minecraft:stone", "bare": "#nope"}"##, false);
+        let bad_out = check_json_with_type(bad.root.as_ref().unwrap(), &root_type, &env);
+        assert!(bad_out.diagnostics.iter().any(|d| d.severity == Severity::Error && d.message == "Tags are not allowed here."), "{:?}", bad_out.diagnostics);
+        assert!(bad_out.diagnostics.iter().any(|d| d.severity == Severity::Error && d.message == "Only tags are allowed here."), "{:?}", bad_out.diagnostics);
+        assert_eq!(bad_out.diagnostics.iter().filter(|d| d.severity == Severity::Error).count(), 3, "{:?}", bad_out.diagnostics);
+    }
+
+    #[test]
+    fn checks_criteria_item_slots_fluid_states_game_rules_and_translation_value() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+            struct Adv {
+                criteria: struct { [#[criterion(definition=true)] string]: struct { trigger: string } },
+                requirements?: [[#[criterion] string]],
+            }
+            struct Phase2 {
+                adv?: Adv,
+                slot?: #[item_slots] string,
+                fluid?: struct {
+                    id: #[id="fluid"] string,
+                    properties?: mcdoc:fluid_states[[id]],
+                },
+                fluid_pred?: struct {
+                    fluid: #[id="fluid"] string,
+                    state?: struct { [mcdoc:fluid_state_keys[[%parent.fluid]]]: string },
+                },
+                bool_rule?: #[game_rule(type="boolean")] string,
+                int_rule?: #[game_rule(type="int")] string,
+                fallback?: #[translation_value] string,
+            }
+            "#,
+            "::test",
+            &mut tables,
+        )
+        .unwrap();
+        let mut registries = RegistryIndex::default();
+        registries.insert_entries("fluid", ["minecraft:water".into(), "minecraft:flowing_lava".into()]);
+        registries.game_rules.boolean = vec!["keepInventory".into()];
+        registries.game_rules.int = vec!["randomTickSpeed".into()];
+        registries.finalize();
+        let root_type = McdocType::Reference { path: Some("::test::Phase2".into()), attributes: Vec::new() };
+        let check_ver = |mc: &str, src: &str| {
+            let version = VersionContext { minecraft: Some(mc.into()), neoforge: None };
+            let env = CheckEnv {
+                tables: &tables,
+                registries: &registries,
+                version: &version,
+                require_canonical: false,
+                allow_missing_keys: false,
+                primitives_read_as_strings: false,
+                ignored_loaders: &[],
+            };
+            check_json_with_type(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env).diagnostics
+        };
+
+        // Valid advancement (explicit requirements + omitted requirements)
+        let ok = r#"{
+            "adv": {"criteria": {"a": {"trigger": "t"}, "b": {"trigger": "t"}}, "requirements": [["a", "b"]]},
+            "slot": "horse.saddle",
+            "fluid": {"id": "minecraft:flowing_lava", "properties": {"falling": "false", "level": "4"}},
+            "fluid_pred": {"fluid": "minecraft:water", "state": {"falling": "true"}},
+            "bool_rule": "keepInventory",
+            "int_rule": "randomTickSpeed",
+            "fallback": "Hello %s, %% and %1$s!"
+        }"#;
+        assert!(check_ver("1.21.1", ok).is_empty(), "{:?}", check_ver("1.21.1", ok));
+        assert!(check_ver("1.21.1", r#"{"adv": {"criteria": {"a": {"trigger": "t"}}}}"#).is_empty());
+
+        // Criterion errors: unknown requirement + missing defined criterion
+        let bad_adv = check_ver("1.21.1", r#"{"adv": {"criteria": {"a": {"trigger": "t"}}, "requirements": [["ghost"]]}}"#);
+        assert!(bad_adv.iter().any(|d| d.severity == Severity::Error && d.message.contains("Unknown criterion \"ghost\"")), "{bad_adv:?}");
+        assert!(bad_adv.iter().any(|d| d.severity == Severity::Error && d.message.contains("Criterion \"a\"")), "{bad_adv:?}");
+
+        // Version-aware item slots
+        assert!(!check_ver("1.21.1", r#"{"slot": "saddle"}"#).is_empty());
+        assert!(check_ver("1.21.5", r#"{"slot": "saddle"}"#).is_empty());
+        assert!(check_ver("1.21.1", r#"{"slot": "villager.0"}"#).is_empty());
+        assert!(!check_ver("26.1", r#"{"slot": "villager.0"}"#).is_empty());
+        assert!(check_ver("26.1", r#"{"slot": "mob.inventory.0"}"#).is_empty());
+
+        // Fluid state properties: still water has no `level`, flowing lava level must be 1..8
+        assert!(!check_ver("1.21.1", r#"{"fluid": {"id": "minecraft:water", "properties": {"level": "1"}}}"#).is_empty());
+        assert!(!check_ver("1.21.1", r#"{"fluid": {"id": "minecraft:flowing_lava", "properties": {"level": "9"}}}"#).is_empty());
+        assert!(!check_ver("1.21.1", r#"{"fluid_pred": {"fluid": "minecraft:water", "state": {"level": "1"}}}"#).is_empty());
+
+        // Game rules & translation value
+        assert!(check_ver("1.21.1", r#"{"bool_rule": "randomTickSpeed"}"#).iter().any(|d| d.message.contains("Unknown boolean game rule")));
+        assert!(check_ver("1.21.1", r#"{"int_rule": "keepInventory"}"#).iter().any(|d| d.message.contains("Unknown int game rule")));
+        assert!(!check_ver("1.21.1", r#"{"fallback": "bad %1s"}"#).is_empty());
+        assert!(!check_ver("1.21.1", r#"{"fallback": "bad %d"}"#).is_empty());
+    }
+
+    #[test]
+    fn parses_uuids_like_java() {
+        assert_eq!(parse_java_uuid("f81d4fae-7dec-11d0-a765-00a0c91e6bf6"), Some([-132296786, 2112623056, -1486552928, -920753162]));
+        assert_eq!(parse_java_uuid("1-2-3-4-5"), Some([1, 0x0002_0003, 0x0004_0000, 5]));
+        // Java masks oversized groups and accepts a leading `+`.
+        assert_eq!(parse_java_uuid("1-1ffff-2-3-4"), parse_java_uuid("1-ffff-2-3-4"));
+        assert_eq!(parse_java_uuid("+1-2-3-4-5"), parse_java_uuid("1-2-3-4-5"));
+        assert_eq!(parse_java_uuid("0000000000001-2-3-4-5-0000000000000000000000"), None);
+        assert_eq!(parse_java_uuid("1-2-3-4"), None);
+        assert_eq!(parse_java_uuid("1--3-4-5"), None);
+    }
+
+    #[test]
+    fn checks_uuid_divisible_by_integer_and_timeline_markers() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+            struct Checks {
+                id?: #[uuid] string,
+                even_long?: #[divisible_by=2] long,
+                num?: #[integer(min=-100, max=100)] string,
+                period_ticks?: int,
+                time_markers?: struct { [#[id] string]: (int | struct { ticks: int }) },
+            }
+            "#,
+            "::test",
+            &mut tables,
+        )
+        .unwrap();
+        let registries = RegistryIndex::default();
+        let version = VersionContext::default();
+        let env = CheckEnv {
+            tables: &tables,
+            registries: &registries,
+            version: &version,
+            require_canonical: false,
+            allow_missing_keys: false,
+            primitives_read_as_strings: false,
+            ignored_loaders: &[],
+        };
+        let root_type = McdocType::Reference { path: Some("::test::Checks".into()), attributes: Vec::new() };
+        let check = |src: &str| check_json_with_type(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env).diagnostics;
+
+        // Java UUID.fromString accepts short hex groups, rejects invalid as Error
+        assert!(check(r#"{"id": "0-0-0-0-1"}"#).is_empty());
+        let bad_uuid = check(r#"{"id": "not-a-uuid"}"#);
+        assert!(bad_uuid.iter().any(|d| d.severity == Severity::Error && d.message.contains("UUID")), "{bad_uuid:?}");
+
+        // Exact i64 modulo on Long beyond f64 2^53 precision
+        assert!(check(r#"{"even_long": 9007199254740992}"#).is_empty());
+        assert!(check(r#"{"even_long": 9007199254740993}"#).iter().any(|d| d.message.contains("not divisible by 2")));
+
+        // Strict #[integer] rejects leading '+' and values outside i32
+        assert!(check(r#"{"num": "-42"}"#).is_empty());
+        assert!(check(r#"{"num": "+5"}"#).iter().any(|d| d.severity == Severity::Error));
+        assert!(check(r#"{"num": "2147483648"}"#).iter().any(|d| d.severity == Severity::Error));
+
+        // Timeline marker canonical duplicates and period_ticks bounds
+        assert!(check(r#"{"period_ticks": 24000, "time_markers": {"sunrise": 0, "sunset": {"ticks": 23999}}}"#).is_empty());
+        let bad_tl = check(r#"{"period_ticks": 24000, "time_markers": {"sunrise": 0, "minecraft:sunrise": 100, "late": 24000, "early": {"ticks": -1}}}"#);
+        assert!(bad_tl.iter().any(|d| d.message.contains("Duplicate time marker")), "{bad_tl:?}");
+        assert!(bad_tl.iter().filter(|d| d.message.contains("range 0..<24000")).count() == 2, "{bad_tl:?}");
+    }
+
+    #[test]
+    fn checks_embedded_nbt_nbt_path_text_component_and_block_predicate() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+            type Text = (string | boolean | int | [Text] | struct {
+                text?: string,
+                color?: ("gold" | "red"),
+            })
+            "#,
+            "::java::util::text",
+            &mut tables,
+        )
+        .unwrap();
+        parse_and_bind(
+            r#"
+            dispatch minecraft:item["minecraft:diamond_sword"] to struct {
+                /// Whether the item takes damage.
+                Unbreakable?: boolean,
+                Damage?: int @ 0..,
+                CustomName?: #[text_component] string,
+            }
+            dispatch minecraft:block["minecraft:chest"] to struct {
+                Lock?: string,
+            }
+            struct Phase3 {
+                item?: #[id="item"] string,
+                nbt?: #[nbt=minecraft:item[[item]]] string,
+                path?: #[nbt_path] string,
+                typed_path?: #[nbt_path=minecraft:item[%fallback]] string,
+                name?: #[text_component] string,
+                can_destroy?: #[block_predicate] string,
+            }
+            "#,
+            "::test",
+            &mut tables,
+        )
+        .unwrap();
+        let mut registries = RegistryIndex::default();
+        registries.insert_entries("item", ["minecraft:diamond_sword".into()]);
+        registries.insert_entries("block", ["minecraft:chest".into()]);
+        let mut chest_props = BTreeMap::new();
+        chest_props.insert("facing".into(), vec!["north".into(), "south".into()]);
+        registries.block_states.insert("minecraft:chest".into(), chest_props);
+        registries.finalize();
+        let root_type = McdocType::Reference { path: Some("::test::Phase3".into()), attributes: Vec::new() };
+        let check = |mc: &str, src: &str| {
+            let version = VersionContext { minecraft: Some(mc.into()), neoforge: None };
+            let env = CheckEnv {
+                tables: &tables,
+                registries: &registries,
+                version: &version,
+                require_canonical: false,
+                allow_missing_keys: false,
+                primitives_read_as_strings: false,
+                ignored_loaders: &[],
+            };
+            check_json_with_type(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env).diagnostics
+        };
+
+        // Valid SNBT with dynamic dispatcher resolution (`minecraft:item[[item]]`), 1b -> boolean,
+        // nested `#[text_component]` inside SNBT, single-quoted lenient text component, nbt paths, and block predicate.
+        let ok = r#"{
+            "item": "minecraft:diamond_sword",
+            "nbt": "{Unbreakable: 1b, Damage: 5, CustomName: \"{'text':'Excalibur','color':'gold'}\"}",
+            "path": "Items[0].id",
+            "typed_path": "Inventory[{Slot: 0b}].tag",
+            "name": "{'text': 'Sword', 'color': 'red'}",
+            "can_destroy": "minecraft:chest[facing=north]{Lock: \"key\"}"
+        }"#;
+        assert!(check("1.21.1", ok).is_empty(), "{:?}", check("1.21.1", ok));
+
+        // Plain JSON string / boolean / number text components are valid; empty or broken ones error.
+        assert!(check("1.21.1", r#"{"name": "\"hello\""}"#).is_empty());
+        assert!(check("1.21.1", r#"{"name": "'hello'"}"#).is_empty());
+        assert!(check("1.21.1", r#"{"name": "true"}"#).is_empty());
+        assert!(!check("1.21.1", r#"{"name": ""}"#).is_empty());
+        assert!(!check("1.21.1", r#"{"name": "{'color': 'purple'}"}"#).is_empty());
+
+        // SNBT type error and unknown key error mapped back to JSON string
+        let bad_nbt = check("1.21.1", r#"{"item": "minecraft:diamond_sword", "nbt": "{Damage: -1, Bogus: 1}"}"#);
+        assert!(bad_nbt.len() >= 2, "{bad_nbt:?}");
+
+        // Invalid NBT path and invalid block predicate
+        assert!(!check("1.21.1", r#"{"path": "Items[bad]"}"#).is_empty());
+        assert!(!check("1.20.1", r#"{"can_destroy": "minecraft:chest[facing=up]{Lock: 5}"}"#).is_empty());
+    }
+
+    #[test]
+    fn checks_phase4_assets_mcfunction_attrs_cross_file_criteria_and_block_item_states() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+            struct PlayerAdvancements {
+                [#[id="advancement"] string]: (boolean | struct { [string]: boolean }),
+            }
+            "#,
+            "::java::data::advancement::predicate",
+            &mut tables,
+        )
+        .unwrap();
+        parse_and_bind(
+            r#"
+            struct Phase4 {
+                parent?: #[id="model"] string,
+                textures?: struct {
+                    [#[texture_slot(kind="definition")] string]: #[texture_slot(kind="value")] string,
+                },
+                face_tex?: #[texture_slot(kind="reference")] string,
+                translate?: #[translation_key] string,
+                obj?: #[objective] string,
+                team?: #[team] string,
+                tag?: #[tag] string,
+                sel?: #[entity(amount="single", type="players")] string,
+                holder?: #[score_holder(amount="single")] string,
+                cmd?: #[command(slash="required")] string,
+                link?: #[url] string,
+                pattern?: #[time_pattern] string,
+                pos?: #[vector(dimension=3, integer=true)] string,
+                advs?: ::java::data::advancement::predicate::PlayerAdvancements,
+                item_stack?: struct {
+                    id: #[id="item"] string,
+                    block_state?: mcdoc:block_item_states[[id]],
+                },
+                variants?: struct { [string]: struct {} },
+                multipart?: [struct { when?: struct { [string]: any } }],
+            }
+            "#,
+            "::test",
+            &mut tables,
+        )
+        .unwrap();
+        enhance_symbol_tables(&mut tables);
+
+        let mut registries = RegistryIndex::default();
+        registries.insert_entries("advancement", ["demo:story/root".into()]);
+        registries.insert_entries("item", ["minecraft:oak_stairs".into(), "minecraft:torch".into()]);
+        let mut stair_props = BTreeMap::new();
+        stair_props.insert("facing".into(), vec!["north".into(), "south".into()]);
+        stair_props.insert("half".into(), vec!["top".into(), "bottom".into()]);
+        registries.block_states.insert("minecraft:oak_stairs".into(), stair_props);
+        let mut wall_torch_props = BTreeMap::new();
+        wall_torch_props.insert("facing".into(), vec!["east".into(), "west".into()]);
+        registries.block_states.insert("minecraft:wall_torch".into(), wall_torch_props);
+        registries.translation_keys = vec!["block.minecraft.stone".into(), "demo.greeting".into()];
+        registries.has_vanilla_translation_keys = true;
+        registries.deprecated_translation_keys.insert("demo.old_key".into());
+        registries.advancement_criteria.insert("demo:story/root".into(), vec!["got_wood".into(), "crafted".into()]);
+        registries.model_textures.insert(
+            "demo:block/base".into(),
+            crate::mcdoc::registries::ModelTextureInfo { parent: None, slots: vec!["inherited".into()] },
+        );
+        registries.finalize();
+
+        let version = VersionContext { minecraft: Some("1.21.1".into()), neoforge: None };
+        let env = CheckEnv {
+            tables: &tables,
+            registries: &registries,
+            version: &version,
+            require_canonical: false,
+            allow_missing_keys: false,
+            primitives_read_as_strings: false,
+            ignored_loaders: &[],
+        };
+        let root_type = McdocType::Reference { path: Some("::test::Phase4".into()), attributes: Vec::new() };
+        let check = |src: &str, block_id: Option<&str>| {
+            check_json_for_block(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env, block_id).diagnostics
+        };
+
+        // Valid everything: parent model texture chain, translation key, mcfunction attrs, cross-file criteria, block_item_states, blockstate variants/multipart.
+        let ok = r##"{
+            "parent": "demo:block/base",
+            "textures": {"side": "minecraft:block/stone"},
+            "face_tex": "#inherited",
+            "translate": "demo.greeting",
+            "obj": "kills",
+            "team": "red",
+            "tag": "winner",
+            "sel": "@p",
+            "holder": "#total",
+            "cmd": "/say hi",
+            "link": "https://example.com",
+            "pattern": "HH:mm:ss",
+            "pos": "~ ~1 ~",
+            "advs": {"demo:story/root": {"got_wood": true}},
+            "item_stack": {"id": "minecraft:torch", "block_state": {"facing": "east"}},
+            "variants": {"facing=north,half=top": {}},
+            "multipart": [{"when": {"OR": [{"facing": "north|south"}]}}]
+        }"##;
+        assert!(check(ok, Some("minecraft:oak_stairs")).is_empty(), "{:?}", check(ok, Some("minecraft:oak_stairs")));
+
+        // Unknown texture slot with resolved chain
+        let bad_slot = check(r##"{"parent": "demo:block/base", "face_tex": "#missing"}"##, None);
+        assert!(bad_slot.iter().any(|d| d.message.contains("Unknown texture slot")), "{bad_slot:?}");
+        // Unindexed vanilla parent does not false-positive
+        assert!(check(r##"{"parent": "minecraft:block/cube_all", "face_tex": "#all"}"##, None).is_empty());
+
+        // Deprecated & unknown translation keys
+        assert!(check(r#"{"translate": "demo.old_key"}"#, None).iter().any(|d| d.message.contains("deprecated")));
+        assert!(check(r#"{"translate": "demo.missing"}"#, None).iter().any(|d| d.message.contains("didn't find translation key")));
+
+        // Cross-file advancement criteria catches unknown criterion key
+        let bad_crit = check(r#"{"advs": {"demo:story/root": {"typo": true}}}"#, None);
+        assert!(bad_crit.iter().any(|d| d.message.contains("Unknown key \"typo\"")), "{bad_crit:?}");
+
+        // mcdoc:block_item_states catches invalid state value
+        let bad_bis = check(r#"{"item_stack": {"id": "minecraft:oak_stairs", "block_state": {"facing": "up"}}}"#, None);
+        assert!(!bad_bis.is_empty(), "expected invalid block_item_states value error");
+
+        // BlockStateDefinition variants & multipart validation
+        let bad_bs = check(r#"{"variants": {"facing=up": {}}, "multipart": [{"when": {"bogus": "1"}}]}"#, Some("minecraft:oak_stairs"));
+        assert!(bad_bs.iter().any(|d| d.message.contains("Invalid value \"up\"")), "{bad_bs:?}");
+        assert!(bad_bs.iter().any(|d| d.message.contains("no property \"bogus\"")), "{bad_bs:?}");
+
+        // mcfunction & low-priority attributes error cases
+        assert!(!check(r#"{"sel": "@a"}"#, None).is_empty());
+        assert!(!check(r#"{"holder": "*"}"#, None).is_empty());
+        assert!(!check(r#"{"cmd": "no_slash"}"#, None).is_empty());
+        assert!(!check(r#"{"link": "ftp://bad"}"#, None).is_empty());
+        assert!(!check(r#"{"pattern": "JJ:mm"}"#, None).is_empty());
+        assert!(!check(r#"{"pos": "^ ~ 0"}"#, None).is_empty());
+    }
+
+    #[test]
+    fn validates_translation_values_like_vanilla() {
+        let warnings = |s: &str, lang: bool| validate_translation_value(s, lang).len();
+        assert_eq!(warnings("50% faster", true), 0);
+        assert_eq!(warnings("Hello %s, %% and %1$s!", false), 0);
+        assert_eq!(warnings("%d items at %.1f%%", true), 0);
+        assert_eq!(warnings("%2$d of %1$d", true), 0);
+        assert_eq!(warnings("%d items", false), 1, "fallbacks skip the lang file rewrite");
+        assert_eq!(warnings("%s is 50% done", true), 1);
+        assert_eq!(warnings("bad %1s", false), 1);
+        assert_eq!(warnings("%x marks", true), 1);
+        assert_eq!(warnings("%COST%: costs %TAKEN_DAMAGE% damage", true), 0);
+        assert_eq!(warnings("%s costs %COST%", true), 2, "mod tokens still break real placeholders");
+    }
+
+    #[test]
+    fn relaxes_asset_schemas_to_match_vanilla_parsers() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+            enum(string) SpriteSourceType { Single = "single", Directory = "directory" }
+            struct SpriteSource { type: (#[until="1.21.5"] SpriteSourceType | #[since="1.21.5"] #[id] SpriteSourceType) }
+            "#,
+            "::java::assets::atlas",
+            &mut tables,
+        )
+        .unwrap();
+        parse_and_bind("struct Particle { textures: [string] }", "::java::assets::particle", &mut tables).unwrap();
+        parse_and_bind(
+            r#"enum(string) BlendFactor { Zero = "0", Zero2 = "zero", One = "1", SrcAlpha = "srcalpha", OneSrcAlpha = "1-srcalpha" }"#,
+            "::java::assets::shader::program",
+            &mut tables,
+        )
+        .unwrap();
+        parse_and_bind("struct Lang { [string]: #[translation_value] string }", "::java::assets::lang", &mut tables).unwrap();
+        parse_and_bind(
+            "struct ModelVariantBase { model: string, x?: (0 | 90 | 180 | 270), y?: (0 | 90 | 180 | 270) }",
+            "::java::assets::block_state_definition",
+            &mut tables,
+        )
+        .unwrap();
+        relax_asset_schemas(&mut tables);
+
+        let registries = RegistryIndex::default();
+        let version = VersionContext { minecraft: Some("1.20.1".into()), neoforge: None };
+        let env = CheckEnv {
+            tables: &tables,
+            registries: &registries,
+            version: &version,
+            require_canonical: false,
+            allow_missing_keys: false,
+            primitives_read_as_strings: false,
+            ignored_loaders: &[],
+        };
+        let check = |symbol: &str, src: &str| {
+            let root_type = McdocType::Reference { path: Some(symbol.into()), attributes: Vec::new() };
+            check_json_with_type(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env).diagnostics
+        };
+
+        let source = "::java::assets::atlas::SpriteSource";
+        assert!(check(source, r#"{"type": "minecraft:single"}"#).is_empty(), "{:?}", check(source, r#"{"type": "minecraft:single"}"#));
+        assert!(check(source, r#"{"type": "directory"}"#).is_empty());
+        assert!(!check(source, r#"{"type": "Not An ID"}"#).is_empty());
+
+        assert!(check("::java::assets::particle::Particle", "{}").is_empty());
+
+        let blend = "::java::assets::shader::program::BlendFactor";
+        for spelling in [r#""ONE_MINUS_SRC_ALPHA""#, r#""src_alpha""#, r#""one""#, r#""1-srcalpha""#] {
+            assert!(check(blend, spelling).is_empty(), "{spelling}: {:?}", check(blend, spelling));
+        }
+        assert!(!check(blend, r#""src_colour""#).is_empty());
+
+        let lang = "::java::assets::lang::Lang";
+        assert!(check(lang, r#"{"a": "50% faster", "b": "%d items"}"#).is_empty());
+        let lone = check(lang, r#"{"a": "%s is 50% done"}"#);
+        assert!(lone.len() == 1 && lone[0].severity == Severity::Warning, "{lone:?}");
+
+        let variant = "::java::assets::block_state_definition::ModelVariantBase";
+        assert!(check(variant, r#"{"model": "a", "x": 360, "y": -90}"#).is_empty());
+        let off_grid = check(variant, r#"{"model": "a", "y": 41}"#);
+        assert!(off_grid.len() == 1 && off_grid[0].message.contains("multiples of 90"), "{off_grid:?}");
     }
 }

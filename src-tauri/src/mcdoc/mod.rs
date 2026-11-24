@@ -4,10 +4,12 @@ pub mod fetch;
 #[cfg(test)]
 mod golden_tests;
 pub mod json_parser;
+pub mod mcfunction;
 pub mod overlays;
 pub mod parser;
 pub mod proberaven;
 pub mod registries;
+pub mod snbt;
 pub mod types;
 pub mod version;
 
@@ -23,7 +25,7 @@ use checker::{check_json_with_type, resource_root_type, CheckEnv};
 use completer::{byte_to_utf16, CompleteOptions, CompletionResult, HoverInfo};
 use json_parser::Severity;
 use registries::{
-    parse_data_file_path, read_proberaven_dump, scan_loader_jars_data, scan_mod_jars_data, scan_pack_data, CodeRegistrySource, RegistryIndex,
+    parse_data_file_path, read_proberaven_dump, scan_conditional_overlay_jars, scan_loader_jars_data, CodeRegistrySource, RegistryIndex,
 };
 use types::SymbolTables;
 use version::VersionContext;
@@ -92,6 +94,9 @@ impl DatapackIndex {
         if name.eq_ignore_ascii_case("fabric.mod.json") {
             return Some("fabric:fabric_mod_json".into());
         }
+        if name.eq_ignore_ascii_case("fabric_loader_dependencies.json") {
+            return Some("fabric:dependency_overrides".into());
+        }
         if let Some(after_data) = norm.strip_prefix("data/").or_else(|| norm.find("/data/").map(|i| &norm[i + 6..]))
             && let Some(stripped) = after_data.strip_suffix(".json")
             && let Some((namespace, rest)) = stripped.split_once('/')
@@ -112,7 +117,9 @@ impl DatapackIndex {
                 return Some(rule.category.clone());
             }
         }
-        parse_data_file_path(&norm, &self.registries.known).map(|(cat, _)| cat)
+        parse_data_file_path(&norm, &self.registries.known)
+            .or_else(|| registries::parse_asset_file_path(&norm))
+            .map(|(cat, _)| cat)
     }
 
     /// Returns how this pack's Minecraft version and loader parse the file at `path`.
@@ -167,8 +174,8 @@ impl DatapackIndex {
         let mut diagnostics = parsed.diagnostics;
 
         let file_start = json_parser::Span::new(0, text.len().min(1));
-        if let Some(message) = self.version.minecraft.as_deref().and_then(|mc| unloaded_folder_message(path, mc)) {
-            diagnostics.push(json_parser::Diagnostic { span: file_start, severity: Severity::Warning, message });
+        if let Some((severity, message)) = self.version.minecraft.as_deref().and_then(|mc| unloaded_folder_message(path, mc)) {
+            diagnostics.push(json_parser::Diagnostic { span: file_start, severity, message });
         } else if let Some(message) = foreign_loader_folder_message(path, self.foreign_loader_folders) {
             diagnostics.push(json_parser::Diagnostic { span: file_start, severity: Severity::Info, message });
         } else if let Some(root) = &parsed.root
@@ -184,7 +191,8 @@ impl DatapackIndex {
                 primitives_read_as_strings: self.reads_primitives_as_strings(path),
                 ignored_loaders: &self.ignored_loaders,
             };
-            let checked = check_json_with_type(root, &root_type, &env);
+            let block_id = block_id_for_path(path);
+            let checked = checker::check_json_for_block(root, &root_type, &env, block_id.as_deref());
             let gated_on_missing_mod = requires_missing_mod(root, &self.registries.mod_ids);
             // Minecraft never loads a file whose load conditions need a missing mod, and that mod's IDs
             // are exactly what such compat files reference, so we don't report them as unknown.
@@ -456,11 +464,24 @@ impl DatapackCache {
             {
                 let root_for_scan = root.clone();
                 let lock_for_scan = lock.clone();
+                let mc_for_scan = version.minecraft.clone();
+                let neoforge_for_scan = version.neoforge.is_some();
+                let fabric_api_for_scan = !ignored_loaders.contains(&"fabric");
                 let registries = tokio::task::spawn_blocking(move || {
                     let known = registries.known.clone();
-                    for (cat, ids) in scan_pack_data(&root_for_scan, lock_for_scan.as_ref(), &known) {
+                    let overlay_env = mc_for_scan.as_deref().zip(data_pack_format).map(|(mc, format)| overlays::OverlayEnv {
+                        minecraft: mc,
+                        format,
+                        neoforge: neoforge_for_scan,
+                        fabric_api: fabric_api_for_scan,
+                        mods: &registries.mod_ids,
+                    });
+                    let (pack_entries, pack_extras) =
+                        registries::scan_pack_data_with_extras(&root_for_scan, lock_for_scan.as_ref(), &known, overlay_env.as_ref());
+                    for (cat, ids) in pack_entries {
                         registries.insert_entries(&cat, ids);
                     }
+                    registries.merge_extras(pack_extras);
                     registries.finalize();
                     registries
                 })
@@ -561,27 +582,74 @@ impl DatapackCache {
         let muon_manifest = muon_manifest_res.ok();
         let misode_config = misode_cfg_res.ok();
 
-        let (vanilla_regs, vanilla_blocks, data_pack_format) = if let Some(mc) = minecraft.as_deref() {
-            let (r, b, f) = tokio::join!(
+        let (vanilla_regs, vanilla_blocks, data_pack_format, mcmeta_versions, game_rules, vanilla_lang_keys) = if let Some(mc) = minecraft.as_deref() {
+            let (r, b, f, v, g, l) = tokio::join!(
                 fetch::load_mcmeta_registries(mc, force),
                 fetch::load_mcmeta_block_states(mc, force),
                 fetch::load_mcmeta_data_pack_format(mc, force),
+                fetch::load_mcmeta_versions(force),
+                fetch::load_mcmeta_game_rules(mc, force),
+                // The launcher's client jar has `en_us.json` too, so we only download it without one.
+                async {
+                    if registries::client_jar_path(&install_dir, mc).is_file() {
+                        Err(anyhow::anyhow!("using the launcher's client jar"))
+                    } else {
+                        fetch::load_mcmeta_lang_keys(mc, force).await
+                    }
+                },
             );
-            (r.ok(), b.ok(), f.ok())
+            (r.ok(), b.ok(), f.ok(), v.ok(), g.ok(), l.ok())
         } else {
-            (None, None, None)
+            (None, None, None, fetch::load_mcmeta_versions(force).await.ok(), None, None)
         };
+        let resolved_minecraft = minecraft.as_deref().map(|mc| {
+            mcmeta_versions
+                .as_deref()
+                .and_then(|vers| fetch::resolve_snapshot_version(mc, vers))
+                .unwrap_or_else(|| mc.to_string())
+        });
+        let data_pack_formats = mcmeta_versions
+            .as_deref()
+            .map(fetch::data_pack_formats_from_versions)
+            .unwrap_or_default();
 
         let root_for_scan = root.clone();
         let lock_for_scan = lock.clone();
-        let (base_registries, pack_entries) = tokio::task::spawn_blocking(move || {
+        let mc_for_scan = resolved_minecraft.clone();
+        let launcher_version = minecraft.clone();
+        let neoforge_for_scan = neoforge.is_some();
+        let (base_registries, pack_entries, pack_extras) = tokio::task::spawn_blocking(move || {
             let mut reg = RegistryIndex::default();
+            reg.data_pack_formats = data_pack_formats;
+            if let Some(rules) = game_rules {
+                reg.game_rules = rules;
+            }
             if let Some(v) = vanilla_regs {
                 reg.apply_vanilla_registries(v);
             }
             if let Some(b) = vanilla_blocks {
                 reg.apply_vanilla_block_states(b);
             }
+            if let Some(keys) = vanilla_lang_keys {
+                reg.has_vanilla_translation_keys = true;
+                reg.translation_keys.extend(keys);
+            }
+            if let Some(mc) = launcher_version.as_deref() {
+                let client = registries::scan_vanilla_client_assets(&install_dir, mc);
+                if !client.translation_keys.is_empty() {
+                    reg.has_vanilla_translation_keys = true;
+                    reg.translation_keys.extend(client.translation_keys);
+                }
+                for (cat, ids) in client.entries {
+                    reg.vanilla_asset_kinds.insert(cat.clone());
+                    reg.insert_entries(&cat, ids);
+                }
+            }
+            // Seed vanilla built-ins absent from `misode/mcmeta` `registries/data.min.json`.
+            if mc_for_scan.as_deref().is_some_and(|mc| version::compare_version(mc, "1.21.2") == std::cmp::Ordering::Less) {
+                reg.insert_entries("loot_table", ["minecraft:empty".into()]);
+            }
+            reg.insert_entries("tag/function", ["minecraft:load".into(), "minecraft:tick".into()]);
             // We read the dump first because its registry names tell us how to read modded tag folders,
             // and a fresh dump already has the full mod list so we don't need to decompress nested jars.
             let dump = read_proberaven_dump(&root_for_scan);
@@ -589,15 +657,27 @@ impl DatapackCache {
             for name in dump.iter().flat_map(|d| d.registries.keys()) {
                 reg.known.insert(name);
             }
+            let initial_mods: std::collections::HashSet<String> = dump.iter().flat_map(|d| d.mods.iter().cloned()).collect();
+            let mod_loader = lock_for_scan.as_ref().and_then(|l| l.mod_loader().ok());
+            let initial_fabric_api = !loaders_the_pack_ignores(mod_loader.as_ref(), &initial_mods).contains(&"fabric");
+            let initial_overlay_env = mc_for_scan.as_deref().zip(data_pack_format).map(|(mc, format)| overlays::OverlayEnv {
+                minecraft: mc,
+                format,
+                neoforge: neoforge_for_scan,
+                fabric_api: initial_fabric_api,
+                mods: &initial_mods,
+            });
             let known = reg.known.clone();
-            for (cat, ids) in scan_loader_jars_data(&install_dir, lock_for_scan.as_ref(), &known) {
+            for (cat, ids) in scan_loader_jars_data(&install_dir, lock_for_scan.as_ref(), &known, initial_overlay_env.as_ref()) {
                 reg.insert_entries(&cat, ids);
             }
-            let (jar_entries, jar_mods) = scan_mod_jars_data(&root_for_scan, &known, !dump_is_fresh);
+            let (jar_entries, jar_mods, conditional_jars, jar_extras) =
+                registries::scan_mod_jars_data_with_extras(&root_for_scan, &known, !dump_is_fresh, initial_overlay_env.as_ref());
             reg.mod_ids.extend(jar_mods);
             for (cat, ids) in jar_entries {
                 reg.insert_entries(&cat, ids);
             }
+            reg.merge_extras(jar_extras);
             // A fresh ProbeRaven dump already covers every code registry. A stale one misses mods you added
             // since, so we still merge ProbeJS typings for those.
             if !dump_is_fresh
@@ -611,8 +691,26 @@ impl DatapackCache {
                 }
                 reg.apply_proberaven(dump);
             }
-            let pack_entries = scan_pack_data(&root_for_scan, lock_for_scan.as_ref(), &known);
-            (reg, pack_entries)
+            let final_fabric_api = !loaders_the_pack_ignores(mod_loader.as_ref(), &reg.mod_ids).contains(&"fabric");
+            let final_mods = reg.mod_ids.clone();
+            let final_overlay_env = mc_for_scan.as_deref().zip(data_pack_format).map(|(mc, format)| overlays::OverlayEnv {
+                minecraft: mc,
+                format,
+                neoforge: neoforge_for_scan,
+                fabric_api: final_fabric_api,
+                mods: &final_mods,
+            });
+            if !dump_is_fresh
+                && !conditional_jars.is_empty()
+                && let Some(env) = final_overlay_env.as_ref()
+            {
+                for (cat, ids) in scan_conditional_overlay_jars(&conditional_jars, &known, env) {
+                    reg.insert_entries(&cat, ids);
+                }
+            }
+            let (pack_entries, pack_extras) =
+                registries::scan_pack_data_with_extras(&root_for_scan, lock_for_scan.as_ref(), &known, final_overlay_env.as_ref());
+            (reg, pack_entries, pack_extras)
         })
         .await
         .unwrap_or_default();
@@ -673,8 +771,10 @@ impl DatapackCache {
         fetch::bridge_partner_dispatchers(&mut tables, extra_bridges);
         checker::mark_block_state_predicates(&mut tables);
         checker::relax_loot_entry_weight(&mut tables);
+        checker::relax_asset_schemas(&mut tables);
+        checker::enhance_symbol_tables(&mut tables);
 
-        let version = VersionContext { minecraft: minecraft.clone(), neoforge };
+        let version = VersionContext { minecraft: resolved_minecraft.clone(), neoforge };
         let mut base_registries = base_registries;
         seed_condition_registries(&mut base_registries, &tables, &version);
         let mod_loader = lock.as_ref().and_then(|l| l.mod_loader().ok());
@@ -686,6 +786,7 @@ impl DatapackCache {
         for (cat, ids) in pack_entries {
             registries.insert_entries(&cat, ids);
         }
+        registries.merge_extras(pack_extras);
         registries.finalize();
 
         let symbol_count = tables.mcdoc.len();
@@ -808,12 +909,126 @@ fn foreign_loader_folder_message(path: &str, folders: &[(&str, &str)]) -> Option
     Some(format!("Only {label} loads files in {folder}/, so we don't check this file."))
 }
 
-/// Explains why Minecraft won't load a data file that sits in the other version's folder name.
-fn unloaded_folder_message(path: &str, minecraft: &str) -> Option<String> {
+/// Folders Minecraft renamed in 26.3: (before, from 26.3 on).
+const RENAMED_WORLDGEN_26_3: &[(&str, &str)] = &[("configured_carver", "carver"), ("configured_feature", "feature")];
+
+/// Vanilla data folders that only exist in a subset of Minecraft versions: `(folder, since, until)`.
+/// Matches Spyglass's `packages/java-edition/src/binder/index.ts`.
+const VERSIONED_DATA_FOLDERS: &[(&str, Option<&str>, Option<&str>)] = &[
+    ("banner_pattern", Some("1.20.5"), None),
+    ("block_sound_set", Some("26.4"), None),
+    ("block_transformer", Some("26.3"), None),
+    ("cat_sound_variant", Some("26.1"), None),
+    ("cat_variant", Some("1.21.5"), None),
+    ("chat_type", Some("1.19"), None),
+    ("chicken_sound_variant", Some("26.1"), None),
+    ("chicken_variant", Some("1.21.5"), None),
+    ("context_float_provider", Some("26.3"), None),
+    ("context_int_provider", Some("26.3"), None),
+    ("cow_sound_variant", Some("26.1"), None),
+    ("cow_variant", Some("1.21.5"), None),
+    ("damage_type", Some("1.19.4"), None),
+    ("decorated_pot_pattern", Some("26.3"), None),
+    ("dialog", Some("1.21.6"), None),
+    ("dimension", Some("1.16"), None),
+    ("dimension_type", Some("1.16"), None),
+    ("dispense_behavior", Some("26.4"), None),
+    ("enchantment", Some("1.21"), None),
+    ("enchantment_provider", Some("1.21"), None),
+    ("frog_variant", Some("1.21.5"), None),
+    ("instrument", Some("1.21.2"), None),
+    ("jukebox_song", Some("1.21"), None),
+    ("painting_variant", Some("1.21"), None),
+    ("pig_sound_variant", Some("26.1"), None),
+    ("pig_variant", Some("1.21.5"), None),
+    ("slot_source", Some("26.3"), None),
+    ("sulfur_cube_archetype", Some("26.2"), None),
+    ("test_environment", Some("1.21.5"), None),
+    ("test_instance", Some("1.21.5"), None),
+    ("timeline", Some("1.21.11"), None),
+    ("trade_set", Some("26.1"), None),
+    ("trial_spawner", Some("1.21.2"), None),
+    ("trim_material", Some("1.19.4"), None),
+    ("trim_pattern", Some("1.19.4"), None),
+    ("villager_trade", Some("26.1"), None),
+    ("wolf_sound_variant", Some("1.21.5"), None),
+    ("wolf_variant", Some("1.20.5"), None),
+    ("world_clock", Some("26.1"), None),
+    ("zombie_nautilus_variant", Some("1.21.11"), None),
+    ("worldgen/biome", Some("1.16.2"), None),
+    ("worldgen/block_state_provider", Some("26.3"), None),
+    ("worldgen/configured_structure_feature", Some("1.16.2"), Some("1.19")),
+    ("worldgen/configured_surface_builder", Some("1.16.2"), Some("1.18")),
+    ("worldgen/density_function", Some("1.18.2"), None),
+    ("worldgen/flat_level_generator_preset", Some("1.19"), None),
+    ("worldgen/material_condition", Some("26.3"), None),
+    ("worldgen/material_rule", Some("26.3"), None),
+    ("worldgen/multi_noise_biome_source_parameter_list", Some("1.19.4"), None),
+    ("worldgen/noise", Some("1.18"), None),
+    ("worldgen/noise_settings", Some("1.16.2"), None),
+    ("worldgen/placed_feature", Some("1.18"), None),
+    ("worldgen/processor_list", Some("1.16.2"), None),
+    ("worldgen/structure", Some("1.19"), None),
+    ("worldgen/structure_set", Some("1.18.2"), None),
+    ("worldgen/template_pool", Some("1.16.2"), None),
+    ("worldgen/world_preset", Some("1.19"), None),
+];
+
+/// Resource-pack folders that only exist in a subset of Minecraft versions: `(folder, since, until)`.
+const VERSIONED_ASSET_FOLDERS: &[(&str, Option<&str>, Option<&str>)] = &[
+    ("atlases", Some("1.19.3"), None),
+    ("equipment", Some("1.21.4"), None),
+    ("font", Some("1.16"), None),
+    ("items", Some("1.21.4"), None),
+    ("post_effect", Some("1.21.2"), None),
+    ("waypoint_style", Some("1.21.6"), None),
+];
+
+/// Returns the block ID (`namespace:path`) when `path` is a `blockstates/*.json` asset file.
+fn block_id_for_path(path: &str) -> Option<String> {
+    let (cat, id) = registries::parse_asset_file_path(path)?;
+    (cat == "block_definition").then_some(id)
+}
+
+/// Explains why Minecraft won't load a data or asset file that sits in another version's folder name
+/// (a warning) or a folder introduced/removed in another version (info, since a mod may read it).
+fn unloaded_folder_message(path: &str, minecraft: &str) -> Option<(Severity, String)> {
     let norm = path.replace('\\', "/");
+    if let Some(after_assets) = norm.strip_prefix("assets/").or_else(|| norm.find("/assets/").map(|i| &norm[i + 8..]))
+        && let Some((_, rest)) = after_assets.split_once('/')
+        && let Some((folder, file)) = rest.split_once('/')
+    {
+        // Minecraft 1.21.2 moved post effect chains from shaders/post/ to post_effect/ and stopped
+        // reading the old folder.
+        if folder == "shaders" && file.starts_with("post/") && version::compare_version(minecraft, "1.21.2") != std::cmp::Ordering::Less {
+            return Some((Severity::Warning, format!("Minecraft {minecraft} doesn't load assets/shaders/post/, since 1.21.2 moved post effects to assets/post_effect/.")));
+        }
+        // Minecraft 1.21.5 moved core shader programs into code, and only reads `.vsh`, `.fsh` and `.glsl`
+        // files under shaders/ since. Mods ported from older versions often still ship the JSON programs.
+        if folder == "shaders" && file.ends_with(".json") && version::compare_version(minecraft, "1.21.5") != std::cmp::Ordering::Less {
+            return Some((
+                Severity::Info,
+                format!("Minecraft {minecraft} doesn't load shader program JSON files (they were removed in 1.21.5), so we don't check this file. A mod could still read it."),
+            ));
+        }
+        return version_gated_folder_message(VERSIONED_ASSET_FOLDERS, folder, &format!("assets/{folder}"), minecraft);
+    }
     let after_data = norm.strip_prefix("data/").or_else(|| norm.find("/data/").map(|i| &norm[i + 6..]))?;
     let (_, rest) = after_data.split_once('/')?;
     let (folder, rest) = rest.split_once('/')?;
+    if folder == "worldgen" {
+        let sub = rest.split_once('/')?.0;
+        let modern_26_3 = version::compare_version(minecraft, "26.3") != std::cmp::Ordering::Less;
+        if let Some(msg) = RENAMED_WORLDGEN_26_3.iter().find_map(|&(before, after)| match (modern_26_3, sub) {
+            (true, n) if n == before => Some(format!("Minecraft {minecraft} doesn't load worldgen/{before}/, since 26.3 renamed it to worldgen/{after}/.")),
+            (false, n) if n == after => Some(format!("Minecraft {minecraft} doesn't load worldgen/{after}/, since it uses worldgen/{before}/ until 26.3.")),
+            _ => None,
+        }) {
+            return Some((Severity::Warning, msg));
+        }
+        let shown = format!("worldgen/{sub}");
+        return version_gated_folder_message(VERSIONED_DATA_FOLDERS, &shown, &shown, minecraft);
+    }
     let (shown, renames) = match folder {
         "tags" => (format!("tags/{}", rest.split_once('/')?.0), RENAMED_TAG_FOLDERS),
         _ => (folder.to_string(), RENAMED_DATA_FOLDERS),
@@ -821,11 +1036,43 @@ fn unloaded_folder_message(path: &str, minecraft: &str) -> Option<String> {
     let name = shown.rsplit('/').next().unwrap_or(&shown);
     let modern = version::compare_version(minecraft, "1.21") != std::cmp::Ordering::Less;
     let prefix = shown.strip_suffix(name).unwrap_or_default();
-    renames.iter().find_map(|&(before, after)| match (modern, name) {
+    if let Some(msg) = renames.iter().find_map(|&(before, after)| match (modern, name) {
         (true, n) if n == before => Some(format!("Minecraft {minecraft} doesn't load {shown}/, since 1.21 renamed it to {prefix}{after}/.")),
         (false, n) if n == after => Some(format!("Minecraft {minecraft} doesn't load {shown}/, since it uses {prefix}{before}/ until 1.21.")),
         _ => None,
-    })
+    }) {
+        return Some((Severity::Warning, msg));
+    }
+    if folder != "tags" {
+        return version_gated_folder_message(VERSIONED_DATA_FOLDERS, &shown, &shown, minecraft);
+    }
+    None
+}
+
+/// Mods can register reload listeners for a folder vanilla doesn't read in this version (backports and
+/// multi-version jars both do), so we only mention it rather than warn.
+fn version_gated_folder_message(
+    folders: &[(&str, Option<&str>, Option<&str>)],
+    folder: &str,
+    shown: &str,
+    minecraft: &str,
+) -> Option<(Severity, String)> {
+    let &(_, since, until) = folders.iter().find(|&&(f, _, _)| f == folder)?;
+    let reason = if let Some(min) = since
+        && version::compare_version(minecraft, min) == std::cmp::Ordering::Less
+    {
+        format!("added in {min}")
+    } else if let Some(max) = until
+        && version::compare_version(minecraft, max) != std::cmp::Ordering::Less
+    {
+        format!("removed in {max}")
+    } else {
+        return None;
+    };
+    Some((
+        Severity::Info,
+        format!("Minecraft {minecraft} doesn't load {shown}/ (it was {reason}), so we don't check this file. A mod could still read it."),
+    ))
 }
 
 /// Returns whether the file's top-level load conditions fail for this pack's mods. We only decide
@@ -847,6 +1094,7 @@ fn requires_missing_mod(root: &json_parser::JsonNode, mod_ids: &std::collections
 fn is_unknown_id_warning(diagnostic: &json_parser::Diagnostic) -> bool {
     diagnostic.severity == Severity::Warning
         && ((diagnostic.message.starts_with("Unknown ") && !diagnostic.message.starts_with("Unknown key"))
+            || diagnostic.message.starts_with("We didn't find ")
             || diagnostic.message.starts_with("Packraven doesn't know this"))
 }
 
@@ -1162,6 +1410,9 @@ dispatch minecraft:resource["worldgen/noise"] to struct { name: string }
 
     #[test]
     fn flags_data_folders_this_version_does_not_load() {
+        let unloaded_folder_message = |path: &str, mc: &str| unloaded_folder_message(path, mc).map(|(_, message)| message);
+        assert!(matches!(super::unloaded_folder_message("data/x/recipes/a.json", "1.21.1"), Some((Severity::Warning, _))));
+        assert!(matches!(super::unloaded_folder_message("data/x/dialog/greet.json", "1.21.1"), Some((Severity::Info, _))));
         assert_eq!(
             unloaded_folder_message("data/apotheosis/recipes/broadhead_arrow.json", "1.21.1").as_deref(),
             Some("Minecraft 1.21.1 doesn't load recipes/, since 1.21 renamed it to recipe/.")
@@ -1173,6 +1424,44 @@ dispatch minecraft:resource["worldgen/noise"] to struct { name: string }
         assert_eq!(unloaded_folder_message("data/x/recipe/a.json", "26.1.2"), None);
         assert_eq!(unloaded_folder_message("data/x/recipes/a.json", "1.20.1"), None);
         assert_eq!(unloaded_folder_message("data/x/tags/worldgen/biome/a.json", "1.21.1"), None);
+
+        // 26.3 worldgen renames
+        assert_eq!(
+            unloaded_folder_message("data/x/worldgen/configured_feature/a.json", "26.3").as_deref(),
+            Some("Minecraft 26.3 doesn't load worldgen/configured_feature/, since 26.3 renamed it to worldgen/feature/.")
+        );
+        assert_eq!(
+            unloaded_folder_message("data/x/worldgen/feature/a.json", "1.21.1").as_deref(),
+            Some("Minecraft 1.21.1 doesn't load worldgen/feature/, since it uses worldgen/configured_feature/ until 26.3.")
+        );
+        assert_eq!(unloaded_folder_message("data/x/worldgen/feature/a.json", "26.3"), None);
+
+        // Per-category since/until versioned data folders
+        assert_eq!(
+            unloaded_folder_message("data/x/dialog/greet.json", "1.21.1").as_deref(),
+            Some("Minecraft 1.21.1 doesn't load dialog/ (it was added in 1.21.6), so we don't check this file. A mod could still read it.")
+        );
+        assert_eq!(unloaded_folder_message("data/x/dialog/greet.json", "1.21.6"), None);
+        assert_eq!(
+            unloaded_folder_message("data/x/worldgen/configured_surface_builder/a.json", "1.21.1").as_deref(),
+            Some("Minecraft 1.21.1 doesn't load worldgen/configured_surface_builder/ (it was removed in 1.18), so we don't check this file. A mod could still read it.")
+        );
+        assert_eq!(unloaded_folder_message("data/x/worldgen/configured_surface_builder/a.json", "1.17"), None);
+
+        // Versioned resource-pack asset folders
+        assert_eq!(
+            unloaded_folder_message("assets/x/items/sword.json", "1.21.1").as_deref(),
+            Some("Minecraft 1.21.1 doesn't load assets/items/ (it was added in 1.21.4), so we don't check this file. A mod could still read it.")
+        );
+        assert_eq!(unloaded_folder_message("assets/x/items/sword.json", "1.21.4"), None);
+        assert_eq!(unloaded_folder_message("assets/minecraft/shaders/post/blur.json", "1.21.1"), None);
+        assert_eq!(unloaded_folder_message("assets/x/shaders/core/glow.json", "1.21.4"), None);
+        assert!(matches!(super::unloaded_folder_message("assets/x/shaders/core/glow.json", "1.21.5"), Some((Severity::Info, _))));
+        assert_eq!(unloaded_folder_message("assets/x/shaders/core/glow.vsh", "26.1.2"), None);
+        assert_eq!(
+            unloaded_folder_message("assets/minecraft/shaders/post/blur.json", "26.1.2").as_deref(),
+            Some("Minecraft 26.1.2 doesn't load assets/shaders/post/, since 1.21.2 moved post effects to assets/post_effect/.")
+        );
     }
 
     #[test]

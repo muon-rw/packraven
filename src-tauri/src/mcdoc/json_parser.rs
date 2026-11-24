@@ -49,6 +49,7 @@ pub enum JsonDialect {
 enum Nonstandard {
     Comment,
     ControlCharacter,
+    EscapedSingleQuote,
     TrailingCommaInArray,
     TrailingCommaInObject,
     UnquotedKey,
@@ -60,6 +61,7 @@ impl Nonstandard {
         match self {
             Self::Comment => "comments",
             Self::ControlCharacter => "line breaks or other control characters inside strings",
+            Self::EscapedSingleQuote => "escaped single quotes (\\')",
             Self::TrailingCommaInArray | Self::TrailingCommaInObject => "trailing commas",
             Self::UnquotedKey => "unquoted keys",
             Self::SingleQuotes => "single-quoted strings",
@@ -71,7 +73,7 @@ impl Nonstandard {
             // Gson rejects a trailing comma in an object even when lenient.
             (Self::TrailingCommaInObject, _) => false,
             (_, JsonDialect::Lenient) => true,
-            (Self::ControlCharacter, JsonDialect::LegacyStrict) => true,
+            (Self::ControlCharacter | Self::EscapedSingleQuote, JsonDialect::LegacyStrict) => true,
             _ => false,
         }
     }
@@ -82,8 +84,8 @@ impl Nonstandard {
 pub struct StringMap {
     /// Source offset right after the opening `"`.
     pub content_start: usize,
-    /// `(unescaped_byte_offset, source_byte_offset)` pairs for escape sequences that shifted offsets.
-    entries: Vec<(usize, usize)>,
+    /// `(u_before, s_before, u_after, s_after)` tuples for each escape sequence.
+    entries: Vec<(usize, usize, usize, usize)>,
 }
 
 impl StringMap {
@@ -91,18 +93,45 @@ impl StringMap {
         Self { content_start, entries: Vec::new() }
     }
 
+    pub fn push_escape(&mut self, u_before: usize, s_before: usize, u_after: usize, s_after: usize) {
+        self.entries.push((u_before, s_before, u_after, s_after));
+    }
+
     /// Translates an offset inside the unescaped string to its byte offset in the raw JSON text.
     pub fn to_source(&self, unescaped_offset: usize) -> usize {
-        let mut base_unesc = 0usize;
-        let mut base_src = self.content_start;
-        for &(u, s) in &self.entries {
-            if u > unescaped_offset {
-                break;
+        let mut u_cur = 0usize;
+        let mut s_cur = self.content_start;
+        for &(u_b, s_b, u_a, s_a) in &self.entries {
+            if unescaped_offset <= u_b {
+                return s_cur + (unescaped_offset - u_cur);
             }
-            base_unesc = u;
-            base_src = s;
+            if unescaped_offset < u_a {
+                return s_b;
+            }
+            u_cur = u_a;
+            s_cur = s_a;
         }
-        base_src + (unescaped_offset - base_unesc)
+        s_cur + (unescaped_offset - u_cur)
+    }
+
+    /// Translates a byte offset in the raw JSON source into an offset in the unescaped string.
+    pub fn from_source(&self, source_offset: usize, unescaped_len: usize) -> Option<usize> {
+        if source_offset < self.content_start {
+            return None;
+        }
+        let mut u_cur = 0usize;
+        let mut s_cur = self.content_start;
+        for &(u_b, s_b, u_a, s_a) in &self.entries {
+            if source_offset <= s_b {
+                return Some((u_cur + (source_offset - s_cur)).min(unescaped_len));
+            }
+            if source_offset < s_a {
+                return Some(u_b.min(unescaped_len));
+            }
+            u_cur = u_a;
+            s_cur = s_a;
+        }
+        Some((u_cur + (source_offset - s_cur)).min(unescaped_len))
     }
 
     pub fn span_to_source(&self, start: usize, end: usize) -> Span {
@@ -423,11 +452,20 @@ impl<'a> Parser<'a> {
                         self.parse_value()
                     };
                     let pair_end = value.as_ref().map_or(colon + 1, |v| v.span.end);
-                    seen.insert(key.value.clone());
+                    if !seen.insert(key.value.clone()) {
+                        self.warn(key.span, format!("Duplicate key \"{}\"", key.value));
+                    }
                     pairs.push(JsonPair { span: Span::new(pair_start, pair_end), key, colon: Some(colon), value });
                     self.skip_ws_and_comments();
                     match self.peek() {
-                        Some(b',') => self.pos += 1,
+                        Some(b',') => {
+                            let comma = self.pos;
+                            self.pos += 1;
+                            self.skip_ws_and_comments();
+                            if self.peek() == Some(b'}') {
+                                self.nonstandard(Span::new(comma, comma + 1), Nonstandard::TrailingCommaInObject);
+                            }
+                        }
                         Some(b'}') | None => {}
                         _ => self.error(Span::new(self.pos, self.pos), "Expected a comma"),
                     }
@@ -561,6 +599,7 @@ impl<'a> Parser<'a> {
                 }
                 b'\\' => {
                     let esc_start = self.pos;
+                    let u_before = out.len();
                     self.pos += 1;
                     if self.pos >= self.bytes.len() {
                         self.error(Span::new(esc_start, self.pos), "Invalid escape sequence");
@@ -570,7 +609,12 @@ impl<'a> Parser<'a> {
                     self.pos += 1;
                     match esc {
                         b'"' => out.push('"'),
-                        b'\'' => out.push('\''),
+                        b'\'' => {
+                            if matches!(self.dialect, Some(JsonDialect::Strict) | None) {
+                                self.nonstandard(Span::new(esc_start, self.pos), Nonstandard::EscapedSingleQuote);
+                            }
+                            out.push('\'');
+                        }
                         b'\\' => out.push('\\'),
                         b'/' => out.push('/'),
                         b'b' => out.push('\x08'),
@@ -610,7 +654,7 @@ impl<'a> Parser<'a> {
                             self.error(Span::new(esc_start, self.pos), "Invalid escape sequence");
                         }
                     }
-                    map.entries.push((out.len(), self.pos));
+                    map.push_escape(u_before, esc_start, out.len(), self.pos);
                 }
                 0x00..=0x1F => {
                     let bad = self.pos;
@@ -749,5 +793,21 @@ mod tests {
         assert_eq!(parsed.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count(), 3);
         let jsonc = parse(src, true);
         assert_eq!(jsonc.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count(), 1);
+    }
+
+    #[test]
+    fn flags_unquoted_key_duplicates_trailing_commas_and_escaped_single_quotes() {
+        let unquoted = "{ a: 1, a: 2, }";
+        let lenient = parse_as(unquoted, false, Some(JsonDialect::Lenient));
+        assert!(lenient.diagnostics.iter().any(|d| d.severity == Severity::Warning && d.message.contains("Duplicate key \"a\"")), "{:?}", lenient.diagnostics);
+        assert!(lenient.diagnostics.iter().any(|d| d.severity == Severity::Error && d.message.contains("trailing commas")), "{:?}", lenient.diagnostics);
+
+        let escaped = r#"{"a": "don\'t"}"#;
+        let strict = parse_as(escaped, false, Some(JsonDialect::Strict));
+        assert!(strict.diagnostics.iter().any(|d| d.severity == Severity::Error && d.message.contains("escaped single quotes")), "{:?}", strict.diagnostics);
+        let legacy = parse_as(escaped, false, Some(JsonDialect::LegacyStrict));
+        assert!(legacy.diagnostics.is_empty(), "{:?}", legacy.diagnostics);
+        let lenient_esc = parse_as(escaped, false, Some(JsonDialect::Lenient));
+        assert!(lenient_esc.diagnostics.is_empty(), "{:?}", lenient_esc.diagnostics);
     }
 }

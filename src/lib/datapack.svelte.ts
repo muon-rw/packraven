@@ -2,7 +2,9 @@ import type { EditorState, Extension, Text } from '@codemirror/state'
 import { syntaxTree } from '@codemirror/language'
 import { ViewPlugin, hoverTooltip, type EditorView, type Tooltip, type ViewUpdate } from '@codemirror/view'
 import { autocompletion, completionStatus, startCompletion, type Completion, type CompletionContext, type CompletionResult } from '@codemirror/autocomplete'
+import { openUrl } from '@tauri-apps/plugin-opener'
 import { api, errorText, type DatapackStatusInfo } from './api'
+import { renderMarkdown } from './markdown'
 
 export type DatapackSchemaStatus = 'idle' | 'loading' | 'ready' | 'unavailable' | 'error'
 export type CodeRegistrySource = 'vanillaOnly' | 'probeJs' | 'probeRaven'
@@ -28,9 +30,12 @@ export function isDatapackJson(path: string): boolean {
   const norm = path.replace(/\\/g, '/')
   const lower = norm.toLowerCase()
   if (lower === 'pack.mcmeta' || lower.endsWith('/pack.mcmeta')) return true
-  // Minecraft only loads `.json` data files, so `.jsonc` files get the plain JSON checks.
+  if (lower === 'fabric.mod.json' || lower.endsWith('/fabric.mod.json')) return true
+  if (lower === 'fabric_loader_dependencies.json' || lower.endsWith('/fabric_loader_dependencies.json')) return true
+  if (/(?:^|\/)assets\/[^/]+\/textures\/.+\.png\.mcmeta$/i.test(norm)) return true
+  // Minecraft only loads `.json` data and asset files, so `.jsonc` files get the plain JSON checks.
   if (!lower.endsWith('.json')) return false
-  return /(?:^|\/)data\/[^/]+\/[^/]+\/.+\.json$/i.test(norm)
+  return /(?:^|\/)(?:data\/[^/]+\/[^/]+\/.+|assets\/[^/]+\/.+)\.json$/i.test(norm)
 }
 
 export function resetDatapack() {
@@ -114,10 +119,16 @@ function renderDocTooltip(signature: string, docs: string): HTMLElement {
     box.appendChild(code)
   }
   if (docs) {
-    const p = document.createElement('p')
-    p.className = 'cm-probejs-doc'
-    p.textContent = docs
-    box.appendChild(p)
+    const doc = document.createElement('div')
+    doc.className = 'cm-probejs-doc cm-mcdoc-md'
+    doc.innerHTML = renderMarkdown(docs)
+    doc.addEventListener('click', (event) => {
+      const link = (event.target as Element | null)?.closest<HTMLAnchorElement>('a[href]')
+      if (!link) return
+      event.preventDefault()
+      void openUrl(link.href)
+    })
+    box.appendChild(doc)
   }
   return box
 }
@@ -162,6 +173,9 @@ function stringContextAt(state: EditorState): StringContext | null {
 // Tracks completions opened automatically by cursor placement (not Ctrl+Space or editing) so we
 // can suppress a redundant 1-item popup when the cursor sits at the end of an already-valid ID.
 const autoTriggeredViews = new WeakSet<EditorView>()
+
+// Marks CodeMirror Completion objects that came from deprecated mcdoc fields or enum values.
+const deprecatedCompletions = new WeakSet<Completion>()
 
 // Strings the backend said have no choices (plain text like a name or description), by start offset.
 // Caret moves inside them don't ask again until the document changes.
@@ -222,7 +236,7 @@ function completionSource(path: string) {
     const options: Completion[] = res.items.map((item) => {
       const insert = item.insertText ?? item.label
       const customApply = suffix > 0 || item.cursorOffset != null || !!item.selectLen || item.consumeClosingQuote || item.retrigger
-      return {
+      const completion: Completion = {
         label: item.label,
         type: item.kind,
         detail: item.detail ?? undefined,
@@ -243,6 +257,8 @@ function completionSource(path: string) {
           : insert,
         info: item.signature || item.docs ? () => renderDocTooltip(item.signature ?? '', item.docs ?? '') : undefined,
       }
+      if (item.deprecated) deprecatedCompletions.add(completion)
+      return completion
     })
 
     // The backend filters and ranks by substring and caps the list, so we ask it again on every keystroke
@@ -264,7 +280,7 @@ function completionSource(path: string) {
 
 function hoverSource(path: string) {
   return async (view: EditorView, pos: number): Promise<Tooltip | null> => {
-    if (datapack.status !== 'ready') return null
+    if (datapack.status !== 'ready' && !(await ensureDatapack())) return null
     const hover = await api.datapackHover(path, view.state.doc.toString(), pos).catch(() => null)
     if (!hover || (!hover.signature && !hover.docs)) return null
     return {
@@ -276,8 +292,13 @@ function hoverSource(path: string) {
   }
 }
 
-export function datapackExtensions(path: string): Extension[] {
+export function datapackExtensions(path: string, readOnly = false): Extension[] {
   if (!isDatapackJson(path)) return []
+  const hover = hoverTooltip(hoverSource(path), { hoverTime: 350 })
+  if (readOnly) {
+    queueMicrotask(() => void ensureDatapack())
+    return [hover]
+  }
   const warmPlugin = ViewPlugin.fromClass(
     class {
       private destroyed = false
@@ -342,7 +363,8 @@ export function datapackExtensions(path: string): Extension[] {
       activateOnTypingDelay: 25,
       interactionDelay: 0,
       maxRenderedOptions: 100,
+      optionClass: (c) => (deprecatedCompletions.has(c) ? 'cm-completion-deprecated' : ''),
     }),
-    hoverTooltip(hoverSource(path), { hoverTime: 350 }),
+    hover,
   ]
 }

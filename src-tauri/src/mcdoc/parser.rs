@@ -34,15 +34,21 @@ pub fn parse_and_bind(src: &str, module_path: &str, tables: &mut SymbolTables) -
                     aliases.insert(local, resolved);
                 }
             }
-            TopItem::Struct { name: Some(name), .. }
-            | TopItem::Enum { name: Some(name), .. }
-            | TopItem::TypeAlias { name, .. } => {
-                aliases.insert(name.clone(), format!("{module_prefix}::{name}"));
-            }
-            TopItem::Dispatch { target, .. } => {
-                if let AstTypeKind::Struct { name: Some(name), .. } | AstTypeKind::Enum { name: Some(name), .. } = &target.kind {
+            TopItem::Struct { name, fields, .. } => {
+                if let Some(name) = name {
                     aliases.insert(name.clone(), format!("{module_prefix}::{name}"));
                 }
+                collect_nested_in_struct(fields, &module_prefix, &mut aliases);
+            }
+            TopItem::Enum { name: Some(name), .. } => {
+                aliases.insert(name.clone(), format!("{module_prefix}::{name}"));
+            }
+            TopItem::TypeAlias { name, target, .. } => {
+                aliases.insert(name.clone(), format!("{module_prefix}::{name}"));
+                collect_nested_in_type(target, &module_prefix, &mut aliases);
+            }
+            TopItem::Dispatch { target, .. } => {
+                collect_nested_in_type(target, &module_prefix, &mut aliases);
             }
             _ => {}
         }
@@ -54,6 +60,48 @@ pub fn parse_and_bind(src: &str, module_path: &str, tables: &mut SymbolTables) -
         binder.bind_top(item);
     }
     Ok(())
+}
+
+fn collect_nested_in_struct(fields: &[AstStructField], module_prefix: &str, aliases: &mut HashMap<String, String>) {
+    for field in fields {
+        match field {
+            AstStructField::Pair { key, ty, .. } => {
+                if let AstStructKey::Dynamic(kty) = key {
+                    collect_nested_in_type(kty, module_prefix, aliases);
+                }
+                collect_nested_in_type(ty, module_prefix, aliases);
+            }
+            AstStructField::Spread { ty, .. } => collect_nested_in_type(ty, module_prefix, aliases),
+        }
+    }
+}
+
+fn collect_nested_in_type(ty: &AstType, module_prefix: &str, aliases: &mut HashMap<String, String>) {
+    match &ty.kind {
+        AstTypeKind::Struct { name, fields } => {
+            if let Some(name) = name {
+                aliases.insert(name.clone(), format!("{module_prefix}::{name}"));
+            }
+            collect_nested_in_struct(fields, module_prefix, aliases);
+        }
+        AstTypeKind::Enum { name: Some(name), .. } => {
+            aliases.insert(name.clone(), format!("{module_prefix}::{name}"));
+        }
+        AstTypeKind::List { item, .. } => collect_nested_in_type(item, module_prefix, aliases),
+        AstTypeKind::Tuple(items) | AstTypeKind::Union(items) => {
+            for item in items {
+                collect_nested_in_type(item, module_prefix, aliases);
+            }
+        }
+        _ => {}
+    }
+    for suffix in &ty.suffixes {
+        if let AstTypeSuffix::TypeArgs(args) = suffix {
+            for arg in args {
+                collect_nested_in_type(arg, module_prefix, aliases);
+            }
+        }
+    }
 }
 
 fn normalize_module_prefix(module_path: &str) -> String {
@@ -252,18 +300,18 @@ impl<'a> Binder<'a> {
             .collect();
         let mut lowered = self.lower_type(target, &param_map);
         let extra_attrs = self.lower_attrs(attrs, &param_map);
-        if !extra_attrs.is_empty() {
-            let mut combined = extra_attrs;
-            combined.extend(lowered.attributes().iter().cloned());
-            *lowered.attributes_mut() = combined;
-        }
         if params.is_empty() {
+            if !extra_attrs.is_empty() {
+                let mut combined = extra_attrs;
+                combined.extend(lowered.attributes().iter().cloned());
+                *lowered.attributes_mut() = combined;
+            }
             lowered
         } else {
             McdocType::Template {
                 child: Box::new(lowered),
                 type_params: params,
-                attributes: Vec::new(),
+                attributes: extra_attrs,
             }
         }
     }
@@ -339,46 +387,52 @@ impl<'a> Binder<'a> {
     fn lower_type(&mut self, ty: AstType, params: &HashMap<String, String>) -> McdocType {
         let attributes = self.lower_attrs(ty.attrs, params);
         let mut base = match ty.kind {
-            AstTypeKind::Any => McdocType::Any { attributes },
-            AstTypeKind::Boolean => McdocType::Boolean { attributes },
-            AstTypeKind::String(length_range) => McdocType::String { length_range, attributes },
-            AstTypeKind::Byte(value_range) => McdocType::Byte { value_range, attributes },
-            AstTypeKind::Short(value_range) => McdocType::Short { value_range, attributes },
-            AstTypeKind::Int(value_range) => McdocType::Int { value_range, attributes },
-            AstTypeKind::Long(value_range) => McdocType::Long { value_range, attributes },
-            AstTypeKind::Float(value_range) => McdocType::Float { value_range, attributes },
-            AstTypeKind::Double(value_range) => McdocType::Double { value_range, attributes },
-            AstTypeKind::ByteArray { value, length } => McdocType::ByteArray { value_range: value, length_range: length, attributes },
-            AstTypeKind::IntArray { value, length } => McdocType::IntArray { value_range: value, length_range: length, attributes },
-            AstTypeKind::LongArray { value, length } => McdocType::LongArray { value_range: value, length_range: length, attributes },
-            AstTypeKind::Literal(value) => McdocType::Literal { value, attributes },
+            AstTypeKind::Any => McdocType::Any { attributes: Vec::new() },
+            AstTypeKind::Boolean => McdocType::Boolean { attributes: Vec::new() },
+            AstTypeKind::String(length_range) => McdocType::String { length_range, attributes: Vec::new() },
+            AstTypeKind::Byte(value_range) => McdocType::Byte { value_range, attributes: Vec::new() },
+            AstTypeKind::Short(value_range) => McdocType::Short { value_range, attributes: Vec::new() },
+            AstTypeKind::Int(value_range) => McdocType::Int { value_range, attributes: Vec::new() },
+            AstTypeKind::Long(value_range) => McdocType::Long { value_range, attributes: Vec::new() },
+            AstTypeKind::Float(value_range) => McdocType::Float { value_range, attributes: Vec::new() },
+            AstTypeKind::Double(value_range) => McdocType::Double { value_range, attributes: Vec::new() },
+            AstTypeKind::ByteArray { value, length } => McdocType::ByteArray { value_range: value, length_range: length, attributes: Vec::new() },
+            AstTypeKind::IntArray { value, length } => McdocType::IntArray { value_range: value, length_range: length, attributes: Vec::new() },
+            AstTypeKind::LongArray { value, length } => McdocType::LongArray { value_range: value, length_range: length, attributes: Vec::new() },
+            AstTypeKind::Literal(value) => McdocType::Literal { value, attributes: Vec::new() },
             AstTypeKind::List { item, length } => McdocType::List {
                 item: Box::new(self.lower_type(*item, params)),
                 length_range: length,
-                attributes,
+                attributes: Vec::new(),
             },
             AstTypeKind::Tuple(items) => McdocType::Tuple {
                 items: items.into_iter().map(|t| self.lower_type(t, params)).collect(),
-                attributes,
+                attributes: Vec::new(),
             },
             AstTypeKind::Union(members) => McdocType::Union {
                 members: members.into_iter().map(|t| self.lower_type(t, params)).collect(),
-                attributes,
+                attributes: Vec::new(),
             },
-            AstTypeKind::Struct { fields, .. } => {
-                let mut s = self.lower_struct(Vec::new(), fields, params);
-                *s.attributes_mut() = attributes;
+            AstTypeKind::Struct { name, fields } => {
+                let s = self.lower_struct(Vec::new(), fields, params);
+                if let Some(name) = name {
+                    let path = format!("{}::{name}", self.module_prefix);
+                    self.tables.mcdoc.insert(path, s.clone());
+                }
                 s
             }
-            AstTypeKind::Enum { kind, fields, .. } => {
-                let mut e = self.lower_enum(Vec::new(), kind, fields, params);
-                *e.attributes_mut() = attributes;
+            AstTypeKind::Enum { name, kind, fields } => {
+                let e = self.lower_enum(Vec::new(), kind, fields, params);
+                if let Some(name) = name {
+                    let path = format!("{}::{name}", self.module_prefix);
+                    self.tables.mcdoc.insert(path, e.clone());
+                }
                 e
             }
             AstTypeKind::Dispatcher { registry, indices } => McdocType::Dispatcher {
                 registry: lengthen_res_loc(&registry),
                 parallel_indices: lower_indices(indices),
-                attributes,
+                attributes: Vec::new(),
             },
             AstTypeKind::Reference(path) => {
                 let resolved = if !path.absolute && path.segments.len() == 1 {
@@ -389,7 +443,7 @@ impl<'a> Binder<'a> {
                 } else {
                     resolve_path(&path, self.module_prefix, self.aliases)
                 };
-                McdocType::Reference { path: Some(resolved), attributes }
+                McdocType::Reference { path: Some(resolved), attributes: Vec::new() }
             }
         };
 
@@ -407,6 +461,11 @@ impl<'a> Binder<'a> {
                 },
             };
         }
+        if !attributes.is_empty() {
+            let mut combined = attributes;
+            combined.extend(base.attributes().iter().cloned());
+            *base.attributes_mut() = combined;
+        }
         base
     }
 }
@@ -422,7 +481,9 @@ fn lower_indices(indices: Vec<AstIndex>) -> Vec<Index> {
 }
 
 fn lengthen_res_loc(s: &str) -> String {
-    if s.contains(':') {
+    if let Some(rest) = s.strip_prefix(':') {
+        format!("minecraft:{rest}")
+    } else if s.contains(':') {
         s.to_string()
     } else {
         format!("minecraft:{s}")
@@ -430,34 +491,31 @@ fn lengthen_res_loc(s: &str) -> String {
 }
 
 fn resolve_path(path: &AstPath, module_prefix: &str, aliases: &HashMap<String, String>) -> String {
-    if path.absolute {
-        return format!("::{}", path.segments.join("::"));
-    }
-    if let Some(first) = path.segments.first() {
-        if first == "super" {
-            let mut base_parts: Vec<&str> = module_prefix.split("::").filter(|s| !s.is_empty()).collect();
-            let mut idx = 0;
-            while idx < path.segments.len() && path.segments[idx] == "super" {
-                base_parts.pop();
-                idx += 1;
+    let mut parts: Vec<&str> = if path.absolute {
+        Vec::new()
+    } else if let Some(first) = path.segments.first()
+        && let Some(target) = aliases.get(first)
+    {
+        let mut expanded: Vec<&str> = target.split("::").filter(|s| !s.is_empty()).collect();
+        for seg in &path.segments[1..] {
+            if seg == "super" {
+                expanded.pop();
+            } else {
+                expanded.push(seg);
             }
-            for seg in &path.segments[idx..] {
-                base_parts.push(seg);
-            }
-            return format!("::{}", base_parts.join("::"));
         }
-        if let Some(target) = aliases.get(first) {
-            if path.segments.len() == 1 {
-                return target.clone();
-            }
-            return format!("{target}::{}", path.segments[1..].join("::"));
-        }
-    }
-    if module_prefix.is_empty() {
-        format!("::{}", path.segments.join("::"))
+        return format!("::{}", expanded.join("::"));
     } else {
-        format!("{module_prefix}::{}", path.segments.join("::"))
+        module_prefix.split("::").filter(|s| !s.is_empty()).collect()
+    };
+    for seg in &path.segments {
+        if seg == "super" {
+            parts.pop();
+        } else {
+            parts.push(seg);
+        }
     }
+    format!("::{}", parts.join("::"))
 }
 
 struct Parser<'a> {
@@ -611,7 +669,11 @@ impl<'a> Parser<'a> {
                         b't' => out.push('\t'),
                         b'b' => out.push('\x08'),
                         b'f' => out.push('\x0C'),
-                        other => out.push(other as char),
+                        _ => {
+                            let ch = self.src[self.pos - 1..].chars().next().unwrap();
+                            self.pos += ch.len_utf8() - 1;
+                            out.push(ch);
+                        }
                     }
                 }
                 _ => {
@@ -711,24 +773,32 @@ impl<'a> Parser<'a> {
             if self.eat(close) {
                 break;
             }
-            // Check for named entry: `(ident | string) (= value | tree)`
+            // Check for named entry: `(ident | string) (= value | tree)`.
+            // Type keywords like `struct { ... }` or `enum(...) { ... }` are positional values unless followed by `=`.
             let save = self.pos;
-            let named = if self.peek() == Some(b'"') {
-                self.parse_string().ok()
+            let (named, is_quoted) = if self.peek() == Some(b'"') {
+                (self.parse_string().ok(), true)
             } else {
-                self.parse_ident().ok()
+                (self.parse_ident().ok(), false)
             };
             self.skip_all_ws_and_comments();
-            if let Some(key) = named
-                && (self.starts_with("=") || matches!(self.peek(), Some(b'(' | b'[' | b'{')))
-            {
-                let val = if self.eat("=") {
-                    self.parse_attr_value()?
-                } else {
-                    self.parse_attr_tree()?
-                };
-                entries.push((Some(key), val));
-            } else {
+            let mut pushed = false;
+            if let Some(key) = named {
+                if self.eat("=") {
+                    let val = self.parse_attr_value()?;
+                    entries.push((Some(key), val));
+                    pushed = true;
+                } else if matches!(self.peek(), Some(b'(' | b'[' | b'{')) && (is_quoted || !is_type_keyword(&key)) {
+                    if let Ok(val) = self.parse_attr_tree() {
+                        self.skip_all_ws_and_comments();
+                        if self.starts_with(",") || self.starts_with(close) {
+                            entries.push((Some(key), val));
+                            pushed = true;
+                        }
+                    }
+                }
+            }
+            if !pushed {
                 self.pos = save;
                 let val = self.parse_attr_value()?;
                 entries.push((None, val));
@@ -790,12 +860,26 @@ impl<'a> Parser<'a> {
 
     fn skip_inject(&mut self) -> Result<(), String> {
         while self.pos < self.bytes.len() && self.bytes[self.pos] != b'{' {
-            self.pos += 1;
+            if self.starts_with("//") {
+                while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+                    self.pos += 1;
+                }
+            } else if self.bytes[self.pos] == b'"' {
+                let _ = self.parse_string();
+            } else {
+                self.pos += 1;
+            }
         }
         if self.peek() == Some(b'{') {
             self.pos += 1;
             let mut depth = 1usize;
             while self.pos < self.bytes.len() && depth > 0 {
+                if self.starts_with("//") {
+                    while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+                        self.pos += 1;
+                    }
+                    continue;
+                }
                 match self.bytes[self.pos] {
                     b'"' => {
                         let _ = self.parse_string();
@@ -882,11 +966,9 @@ impl<'a> Parser<'a> {
 
     fn parse_accessor_key(&mut self) -> Result<AccessorKey, String> {
         self.skip_all_ws_and_comments();
-        if self.starts_with("%key") {
-            self.pos += 4;
+        if self.eat_keyword("%key") {
             Ok(AccessorKey::Keyword { keyword: DynamicKeyword::Key })
-        } else if self.starts_with("%parent") {
-            self.pos += 7;
+        } else if self.eat_keyword("%parent") {
             Ok(AccessorKey::Keyword { keyword: DynamicKeyword::Parent })
         } else if self.peek() == Some(b'"') {
             Ok(AccessorKey::Field(self.parse_string()?))
@@ -1018,7 +1100,7 @@ impl<'a> Parser<'a> {
             }
         } else if self.peek() == Some(b'"') {
             AstTypeKind::Literal(LiteralValue::String { value: self.parse_string()? })
-        } else if matches!(self.peek(), Some(b'-' | b'+' | b'0'..=b'9')) {
+        } else if self.starts_number() {
             AstTypeKind::Literal(self.parse_typed_number()?)
         } else if self.eat_keyword("any") {
             AstTypeKind::Any
@@ -1107,20 +1189,36 @@ impl<'a> Parser<'a> {
         Ok(AstType { attrs, kind, suffixes })
     }
 
+    fn starts_number(&self) -> bool {
+        match self.peek() {
+            Some(b'0'..=b'9') => true,
+            Some(b'+' | b'-') => match self.bytes.get(self.pos + 1) {
+                Some(b'0'..=b'9') => true,
+                Some(b'.') => self.bytes.get(self.pos + 2).is_some_and(u8::is_ascii_digit),
+                _ => false,
+            },
+            Some(b'.') => self.bytes.get(self.pos + 1).is_some_and(u8::is_ascii_digit),
+            _ => false,
+        }
+    }
+
     fn parse_typed_number(&mut self) -> Result<LiteralValue, String> {
         self.skip_all_ws_and_comments();
         let start = self.pos;
         if matches!(self.peek(), Some(b'+' | b'-')) {
             self.pos += 1;
         }
+        let mut has_digits = false;
         let mut is_float = false;
         while matches!(self.peek(), Some(b'0'..=b'9')) {
+            has_digits = true;
             self.pos += 1;
         }
         if self.peek() == Some(b'.') && self.bytes.get(self.pos + 1) != Some(&b'.') {
             is_float = true;
             self.pos += 1;
             while matches!(self.peek(), Some(b'0'..=b'9')) {
+                has_digits = true;
                 self.pos += 1;
             }
         }
@@ -1135,7 +1233,7 @@ impl<'a> Parser<'a> {
             }
         }
         let num_str = &self.src[start..self.pos];
-        if num_str.is_empty() || num_str == "+" || num_str == "-" {
+        if !has_digits {
             return Err(format!("expected number at byte {start}"));
         }
         let suffix = self.peek().filter(|b| matches!(b, b'b' | b'B' | b's' | b'S' | b'l' | b'L' | b'f' | b'F' | b'd' | b'D'));
@@ -1143,9 +1241,10 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         match suffix.map(|b| b.to_ascii_lowercase()) {
-            Some(b'b') => Ok(LiteralValue::Byte { value: num_str.parse::<f64>().map_err(|e| e.to_string())? }),
-            Some(b's') => Ok(LiteralValue::Short { value: num_str.parse::<f64>().map_err(|e| e.to_string())? }),
-            Some(b'l') => Ok(LiteralValue::Long { value: num_str.parse::<i64>().map_err(|e| e.to_string())? }),
+            Some(b'b') if !is_float => Ok(LiteralValue::Byte { value: num_str.parse::<f64>().map_err(|e| e.to_string())? }),
+            Some(b's') if !is_float => Ok(LiteralValue::Short { value: num_str.parse::<f64>().map_err(|e| e.to_string())? }),
+            Some(b'l') if !is_float => Ok(LiteralValue::Long { value: num_str.parse::<i64>().map_err(|e| e.to_string())? }),
+            Some(b'b' | b's' | b'l') => Err(format!("float literal cannot use integer suffix at byte {start}")),
             Some(b'f') => Ok(LiteralValue::Float { value: num_str.parse::<f64>().map_err(|e| e.to_string())? }),
             Some(b'd') => Ok(LiteralValue::Double { value: num_str.parse::<f64>().map_err(|e| e.to_string())? }),
             _ if is_float => Ok(LiteralValue::Double { value: num_str.parse::<f64>().map_err(|e| e.to_string())? }),
@@ -1187,7 +1286,7 @@ impl<'a> Parser<'a> {
         }
         let min = self.read_number_token()?;
         if let Some(kind) = self.eat_range_delim() {
-            let max = if matches!(self.peek(), Some(b'-' | b'+' | b'0'..=b'9')) {
+            let max = if self.starts_number() {
                 Some(self.read_number_token()?)
             } else {
                 None
@@ -1246,6 +1345,13 @@ impl<'a> Parser<'a> {
     }
 }
 
+fn is_type_keyword(ident: &str) -> bool {
+    matches!(
+        ident,
+        "any" | "boolean" | "true" | "false" | "string" | "byte" | "short" | "int" | "long" | "float" | "double" | "struct" | "enum"
+    )
+}
+
 fn is_ident_start(ch: char) -> bool {
     ch.is_alphabetic() || ch == '_'
 }
@@ -1301,5 +1407,51 @@ enum(string) HeatMode {
         assert!(tables.dispatchers["minecraft:recipe_serializer"].contains_key("create:cutting"));
         assert!(tables.mcdoc.contains_key("::create::recipe::Weighted"));
         assert!(tables.mcdoc.contains_key("::create::recipe::HeatMode"));
+    }
+
+    #[test]
+    fn places_outer_attributes_on_templates_and_concrete_wrappers_and_hoists_nested_types() {
+        let src = r#"
+#[since="1.21"]
+dispatch minecraft:test["generic"]<T> to struct {
+    val: T,
+}
+
+type Box<T> = struct { v: T }
+
+struct Outer {
+    field: (#[since="1.21"] Box<int> | string),
+    nested: struct Inner {
+        mode: enum(string) Mode {
+            Fast = "fast",
+        },
+    },
+    again: Inner,
+    m: Mode,
+    pos_attr: #[foo(struct { a: int })] string,
+    enum_attr: #[bar(enum(string) { A = "a" })] string,
+    frac: float @ .5..1.5,
+}
+
+inject struct Ignored {
+    // comment with unmatched { and "
+    x: int,
+}
+"#;
+        let mut tables = SymbolTables::default();
+        parse_and_bind(src, "::test", &mut tables).unwrap();
+
+        let disp = &tables.dispatchers["minecraft:test"]["generic"];
+        assert!(matches!(disp, McdocType::Template { attributes, .. } if attributes.iter().any(|a| a.name == "since")), "{disp:?}");
+
+        assert!(tables.mcdoc.contains_key("::test::Inner"));
+        assert!(tables.mcdoc.contains_key("::test::Mode"));
+
+        let McdocType::Struct { fields, .. } = &tables.mcdoc["::test::Outer"] else { panic!() };
+        let StructField::Pair { field_type: McdocType::Union { members, .. }, .. } = &fields[0] else { panic!() };
+        assert!(matches!(&members[0], McdocType::Concrete { attributes, .. } if attributes.iter().any(|a| a.name == "since")), "{:?}", members[0]);
+
+        assert_eq!(lengthen_res_loc(":stone"), "minecraft:stone");
+        assert!(validate_syntax("type Bad = 1.5b").is_err());
     }
 }

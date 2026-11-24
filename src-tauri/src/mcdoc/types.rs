@@ -7,6 +7,7 @@ use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(from = "RawSymbolTables")]
 pub struct SymbolTables {
     #[serde(rename = "ref", default)]
     pub git_ref: Option<String>,
@@ -14,6 +15,30 @@ pub struct SymbolTables {
     pub mcdoc: HashMap<String, McdocType>,
     #[serde(rename = "mcdoc/dispatcher", default)]
     pub dispatchers: HashMap<String, HashMap<String, McdocType>>,
+}
+
+#[derive(Deserialize)]
+struct RawSymbolTables {
+    #[serde(rename = "ref", default)]
+    git_ref: Option<String>,
+    #[serde(default)]
+    mcdoc: HashMap<String, McdocType>,
+    #[serde(rename = "mcdoc/dispatcher", default)]
+    dispatchers: HashMap<String, HashMap<String, McdocType>>,
+}
+
+impl From<RawSymbolTables> for SymbolTables {
+    fn from(mut raw: RawSymbolTables) -> Self {
+        for ty in raw.mcdoc.values_mut() {
+            ty.normalize_long_enums();
+        }
+        for map in raw.dispatchers.values_mut() {
+            for ty in map.values_mut() {
+                ty.normalize_long_enums();
+            }
+        }
+        Self { git_ref: raw.git_ref, mcdoc: raw.mcdoc, dispatchers: raw.dispatchers }
+    }
 }
 
 impl SymbolTables {
@@ -548,6 +573,60 @@ impl McdocType {
         Self::Union { members: Vec::new(), attributes: Vec::new() }
     }
 
+    /// Converts stringified 64-bit integer values inside `long` enums (emitted when JS BigInts are
+    /// serialized to JSON) from `EnumValue::String` to `EnumValue::Int`.
+    pub fn normalize_long_enums(&mut self) {
+        match self {
+            Self::Enum { enum_kind: Some(EnumKind::Long), values, .. } => {
+                for field in values {
+                    if let EnumValue::String(s) = &field.value
+                        && let Ok(parsed) = s.parse::<i64>()
+                    {
+                        field.value = EnumValue::Int(parsed);
+                    }
+                }
+            }
+            Self::List { item, .. } => item.normalize_long_enums(),
+            Self::Tuple { items, .. } => {
+                for item in items {
+                    item.normalize_long_enums();
+                }
+            }
+            Self::Struct { fields, .. } => {
+                for field in fields {
+                    match field {
+                        StructField::Pair { key, field_type, .. } => {
+                            if let StructKey::Dynamic(kty) = key {
+                                kty.normalize_long_enums();
+                            }
+                            field_type.normalize_long_enums();
+                        }
+                        StructField::Spread { field_type, .. } => field_type.normalize_long_enums(),
+                    }
+                }
+            }
+            Self::Union { members, .. } => {
+                for member in members {
+                    member.normalize_long_enums();
+                }
+            }
+            Self::Indexed { child, .. } | Self::Template { child, .. } => child.normalize_long_enums(),
+            Self::Concrete { child, type_args, .. } => {
+                child.normalize_long_enums();
+                for arg in type_args {
+                    arg.normalize_long_enums();
+                }
+            }
+            Self::Mapped { child, mapping, .. } => {
+                child.normalize_long_enums();
+                for val in mapping.values_mut() {
+                    val.normalize_long_enums();
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn attributes(&self) -> &[Attribute] {
         match self {
             Self::Any { attributes }
@@ -887,5 +966,32 @@ mod tests {
         assert!(lr.contains(-2));
         assert!(lr.contains(i64::MAX));
         assert!(!lr.contains(-3));
+    }
+
+    #[test]
+    fn normalizes_stringified_long_enum_values() {
+        let raw = r#"{
+            "mcdoc": {
+                "::test::BigEnum": {
+                    "kind": "enum",
+                    "enumKind": "long",
+                    "values": [
+                        { "identifier": "Max", "value": "9223372036854775807" }
+                    ]
+                },
+                "::test::StrEnum": {
+                    "kind": "enum",
+                    "enumKind": "string",
+                    "values": [
+                        { "identifier": "NumStr", "value": "42" }
+                    ]
+                }
+            }
+        }"#;
+        let tables: SymbolTables = serde_json::from_str(raw).unwrap();
+        let McdocType::Enum { values, .. } = &tables.mcdoc["::test::BigEnum"] else { panic!() };
+        assert_eq!(values[0].value, EnumValue::Int(i64::MAX));
+        let McdocType::Enum { values, .. } = &tables.mcdoc["::test::StrEnum"] else { panic!() };
+        assert_eq!(values[0].value, EnumValue::String("42".into()));
     }
 }

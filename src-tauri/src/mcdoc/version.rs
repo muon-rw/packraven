@@ -63,10 +63,7 @@ impl VersionContext {
 }
 
 pub fn attr_string(attr: &Attribute) -> Option<&str> {
-    match attr.value.as_ref()? {
-        AttributeValue::Type(McdocType::Literal { value: LiteralValue::String { value }, .. }) => Some(value.as_str()),
-        _ => None,
-    }
+    val_as_string(attr.value.as_ref()?)
 }
 
 pub fn attr_number(attr: &Attribute) -> Option<f64> {
@@ -134,10 +131,10 @@ pub fn parse_id_attribute(attr: &Attribute) -> Option<IdConfig> {
         return Some(IdConfig::default());
     };
     match val {
-        AttributeValue::Type(McdocType::Literal { value: LiteralValue::String { value }, .. }) => Some(IdConfig {
-            registry: Some(value.clone()),
-            ..Default::default()
-        }),
+        AttributeValue::Type(ty) => match ty_as_string(ty) {
+            Some(s) => Some(IdConfig { registry: Some(s.to_string()), ..Default::default() }),
+            None => Some(IdConfig::default()),
+        },
         AttributeValue::Tree(tree) => {
             let mut cfg = IdConfig::default();
             for (k, v) in &tree.values {
@@ -156,9 +153,6 @@ pub fn parse_id_attribute(attr: &Attribute) -> Option<IdConfig> {
                     "path" => cfg.path = val_as_string(v).map(String::from),
                     "empty" => cfg.empty_allowed = val_as_string(v) == Some("allowed"),
                     "exclude" => match v {
-                        AttributeValue::Type(McdocType::Literal { value: LiteralValue::String { value }, .. }) => {
-                            cfg.exclude.push(value.clone());
-                        }
                         AttributeValue::Tree(list) => {
                             for item in list.values.values() {
                                 if let Some(s) = val_as_string(item) {
@@ -166,20 +160,33 @@ pub fn parse_id_attribute(attr: &Attribute) -> Option<IdConfig> {
                                 }
                             }
                         }
-                        _ => {}
+                        other => {
+                            if let Some(s) = val_as_string(other) {
+                                cfg.exclude.push(s.to_string());
+                            }
+                        }
                     },
                     _ => {}
                 }
             }
             Some(cfg)
         }
-        _ => Some(IdConfig::default()),
+    }
+}
+
+fn ty_as_string(ty: &McdocType) -> Option<&str> {
+    match ty {
+        McdocType::Literal { value: LiteralValue::String { value }, .. } => Some(value.as_str()),
+        // Spyglass `validator.string` also accepts bare identifier references (like `#[id(tags=allowed)]`),
+        // stripping any bound module prefix.
+        McdocType::Reference { path: Some(path), .. } => Some(path.rsplit("::").next().unwrap_or(path.as_str())),
+        _ => None,
     }
 }
 
 fn val_as_string(val: &AttributeValue) -> Option<&str> {
     match val {
-        AttributeValue::Type(McdocType::Literal { value: LiteralValue::String { value }, .. }) => Some(value.as_str()),
+        AttributeValue::Type(ty) => ty_as_string(ty),
         _ => None,
     }
 }
@@ -232,9 +239,87 @@ pub fn parse_integer_attribute(attr: &Attribute) -> Option<IntegerConfig> {
     Some(cfg)
 }
 
+pub fn is_weekly_snapshot(v: &str) -> bool {
+    let bytes = v.as_bytes();
+    let Some(w) = bytes.iter().position(|&b| b == b'w') else { return false };
+    w >= 2
+        && bytes[..w].iter().all(u8::is_ascii_digit)
+        && bytes.len() >= w + 3
+        && bytes[w + 1..bytes.len() - 1].iter().all(u8::is_ascii_digit)
+        && bytes[bytes.len() - 1].is_ascii_lowercase()
+}
+
+pub fn parse_game_rule_attribute(attr: &Attribute) -> Option<&str> {
+    if attr.name != "game_rule" {
+        return None;
+    }
+    let AttributeValue::Tree(tree) = attr.value.as_ref()? else { return None };
+    val_as_string(tree.values.get("type")?)
+}
+
+/// Vanilla's `SlotRanges` names, which every `#[item_slots]` field reads (they all exist from 1.20.5 on).
+/// `(name, count, since, until)`, where a count expands to `name.0` through `name.<count - 1>` plus `name.*`.
+/// TODO: Something like this should reside in vanilla mcdoc. Spyglass is currently hardcoding similar data.
+const ITEM_SLOTS: &[(&str, Option<u8>, Option<&str>, Option<&str>)] = &[
+    ("contents", None, None, None),
+    ("container", Some(54), None, None),
+    ("hotbar", Some(9), None, None),
+    ("inventory", Some(27), None, None),
+    ("enderchest", Some(27), None, None),
+    ("villager", Some(8), None, Some("26.1")),
+    ("mob.inventory", Some(8), Some("26.1"), None),
+    ("horse", Some(15), None, None),
+    ("weapon", None, None, None),
+    ("weapon.mainhand", None, None, None),
+    ("weapon.offhand", None, None, None),
+    ("weapon.*", None, None, None),
+    ("armor.head", None, None, None),
+    ("armor.chest", None, None, None),
+    ("armor.legs", None, None, None),
+    ("armor.feet", None, None, None),
+    ("armor.body", None, None, None),
+    ("armor.*", None, None, None),
+    ("horse.saddle", None, None, Some("1.21.5")),
+    ("saddle", None, Some("1.21.5"), None),
+    ("horse.chest", None, None, None),
+    ("player.cursor", None, None, None),
+    ("player.crafting", Some(4), None, None),
+];
+
+/// Returns the valid `#[item_slots]` values for `minecraft`, or the newest version's without one.
+pub fn item_slots_for_version(minecraft: Option<&str>) -> Vec<String> {
+    let at_least = |target: &str| minecraft.is_none_or(|mc| compare_version(mc, target) != Ordering::Less);
+    let mut out = Vec::with_capacity(180);
+    for &(name, count, since, until) in ITEM_SLOTS {
+        if since.is_some_and(|v| !at_least(v)) || until.is_some_and(at_least) {
+            continue;
+        }
+        match count {
+            Some(count) => {
+                out.extend((0..count).map(|n| format!("{name}.{n}")));
+                out.push(format!("{name}.*"));
+            }
+            None => out.push(name.to_string()),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_item_slots_like_vanilla() {
+        let slots = |mc| item_slots_for_version(Some(mc));
+        let mid = slots("1.21.1");
+        assert!(mid.contains(&"container.*".into()) && mid.contains(&"horse.saddle".into()) && mid.contains(&"villager.7".into()));
+        assert!(!mid.contains(&"saddle".into()) && !mid.contains(&"mob.inventory.0".into()));
+        let new = slots("26.1.2");
+        assert!(new.contains(&"mob.inventory.*".into()) && new.contains(&"saddle".into()) && new.contains(&"armor.*".into()));
+        assert!(!new.iter().any(|s| s.starts_with("villager.") || s == "horse.saddle"));
+        assert_eq!(new.len(), 1 + 55 + 10 + 28 + 28 + 9 + 16 + 4 + 6 + 1 + 1 + 1 + 5);
+    }
 
     #[test]
     fn compares_minecraft_and_neoforge_versions() {
@@ -262,5 +347,35 @@ mod tests {
         assert!(!ctx.keeps(&[attr("since", "1.21.4")]));
         assert!(ctx.keeps(&[attr("neoforge_until", "21.4.20")]));
         assert!(!ctx.keeps(&[attr("neoforge_since", "21.4.20")]));
+    }
+
+    #[test]
+    fn parses_bare_identifier_attribute_values() {
+        let mut tables = crate::mcdoc::types::SymbolTables::default();
+        crate::mcdoc::parser::parse_and_bind(
+            r#"
+            struct Sample {
+                a: #[id=item] string,
+                b: #[id(registry=item, tags=allowed, empty=allowed, exclude=[air])] string,
+                c: #[color=hex_rgb] string,
+            }
+            "#,
+            "::test",
+            &mut tables,
+        )
+        .unwrap();
+        let McdocType::Struct { fields, .. } = &tables.mcdoc["::test::Sample"] else { panic!() };
+        let field_attr = |idx: usize| match &fields[idx] {
+            crate::mcdoc::types::StructField::Pair { field_type, .. } => &field_type.attributes()[0],
+            _ => panic!(),
+        };
+        let a = parse_id_attribute(field_attr(0)).unwrap();
+        assert_eq!(a.registry.as_deref(), Some("item"));
+        let b = parse_id_attribute(field_attr(1)).unwrap();
+        assert_eq!(b.registry.as_deref(), Some("item"));
+        assert_eq!(b.tags, Some(TagMode::Allowed));
+        assert!(b.empty_allowed);
+        assert_eq!(b.exclude, vec!["air"]);
+        assert_eq!(attr_string(field_attr(2)), Some("hex_rgb"));
     }
 }

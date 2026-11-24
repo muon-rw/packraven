@@ -894,7 +894,7 @@ impl LintTally {
             };
             *count += 1;
             messages.entry(message_shape(&d.message)).or_insert_with(|| (0, format!("{rel}: {}", d.message))).0 += 1;
-            if let Some(rest) = d.message.strip_prefix("Unknown ")
+            if let Some(rest) = d.message.strip_prefix("Unknown ").or_else(|| d.message.strip_prefix("We didn't find "))
                 && let Some((registry, quoted)) = rest.split_once(" \"")
                 && registry != "key"
             {

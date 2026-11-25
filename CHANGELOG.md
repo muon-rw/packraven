@@ -2,6 +2,15 @@
 
 We record notable changes to packraven here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and packraven uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5]
+### Changed
+- Improved Discord Rich Presence for activities throughout the app
+- Discord Presence can now be entirely disabled
+
+### Fixed
+- (Harmless) error appearing when overriding an entire folder in a data or resource pack, rather than an individual file
+- Catch a few more modded recipe fields for autocomplete
+
 ## [0.7.4] - 2026-11-23
 ### Added
 - Resource pack/assets validation, autocomplete, and hover docs *(again, mostly relying on misode's excellent [vanilla mcdoc](https://github.com/SpyglassMC/vanilla-mcdoc))*:

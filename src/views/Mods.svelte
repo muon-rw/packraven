@@ -24,6 +24,7 @@
   import { commandKey, isMac, shortcut, trashName } from '../lib/platform'
   import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
+  import { presenceContext } from '../lib/presence.svelte'
 
   let {
     pack,
@@ -110,6 +111,16 @@
   // The Update button you just pressed turns into Cancel, so we hold back its red focus style
   // until focus leaves it and comes back.
   let pressed: string | null = $state(null)
+
+  $effect(() => {
+    presenceContext.modName = expanded ? (mods.find((m) => m.path === expanded)?.name ?? null) : null
+    presenceContext.modKind = kindFilter
+    presenceContext.modReviewing = !!reviewing
+    return () => {
+      presenceContext.modName = null
+      presenceContext.modReviewing = false
+    }
+  })
 
   function sameMods(a: InstalledMod[] | null, b: InstalledMod[]): boolean {
     if (!a || a.length !== b.length) return false

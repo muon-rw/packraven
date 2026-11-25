@@ -152,7 +152,11 @@ pub fn complete(text: &str, utf16_offset: usize, check: &CheckOutput, env: &Chec
                 return result;
             }
 
-            if let Some(info) = check.attached.get(&target_id) {
+            let attached_ty = check.attached.get(&target_id).map(|info| &info.type_def);
+            let is_concrete_attached = attached_ty.is_some_and(|ty| !matches!(ty, McdocType::Any { .. }));
+            if is_concrete_attached
+                && let Some(info) = check.attached.get(&target_id)
+            {
                 if !unquoted
                     && has_attr(&info.type_def, env.tables, "text_component", 0)
                     && env.tables.mcdoc.contains_key("::java::util::text::Text")
@@ -166,6 +170,17 @@ pub fn complete(text: &str, utf16_offset: usize, check: &CheckOutput, env: &Chec
                 let items = complete_values(&info.type_def, env, typed, !unquoted, unquoted, doc_symbols);
                 let slot_has_choices =
                     !items.is_empty() || (!typed.is_empty() && !complete_values(&info.type_def, env, "", !unquoted, unquoted, doc_symbols).is_empty());
+                let mut result = CompletionResult::new(text, s.map.content_start, pos, content_end, items, !unquoted);
+                result.slot_has_choices = slot_has_choices;
+                return result;
+            }
+            if in_untyped_subtree(check, target_id)
+                && let Some(inferred) = infer_untyped_value_type(&check.arena, target_id)
+            {
+                let doc_symbols = DocSymbols::default();
+                let items = complete_values(&inferred, env, typed, !unquoted, unquoted, doc_symbols);
+                let slot_has_choices =
+                    !items.is_empty() || (!typed.is_empty() && !complete_values(&inferred, env, "", !unquoted, unquoted, doc_symbols).is_empty());
                 let mut result = CompletionResult::new(text, s.map.content_start, pos, content_end, items, !unquoted);
                 result.slot_has_choices = slot_has_choices;
                 return result;
@@ -219,11 +234,172 @@ pub fn complete(text: &str, utf16_offset: usize, check: &CheckOutput, env: &Chec
     }
 
     // 4. Inside an array between elements, or on an unattached bare primitive token.
-    if matches!(node.kind, ArenaKind::Array(_)) || check.attached.contains_key(&target_id) {
+    if matches!(node.kind, ArenaKind::Array(_)) || check.attached.contains_key(&target_id) || in_untyped_subtree(check, target_id) {
         return complete_bare_value(text, word_start, pos, word_end, array_trailing_comma, env, opts);
     }
 
     empty
+}
+
+/// Returns true when `node_id` sits inside a schemaless `any` subtree (for example a modded recipe
+/// serializer not present in `minecraft:recipe_serializer`, or a custom loader ingredient body).
+fn in_untyped_subtree(check: &CheckOutput, node_id: JsonId) -> bool {
+    let mut cur = Some(node_id);
+    while let Some(id) = cur {
+        if let Some(info) = check.attached.get(&id) {
+            return matches!(info.type_def, McdocType::Any { .. });
+        }
+        cur = check.arena.get(id).parent;
+    }
+    false
+}
+
+fn ancestor_keys(arena: &JsonArena, start: JsonId) -> Vec<&str> {
+    let mut keys = Vec::new();
+    let mut cur = start;
+    while let Some(parent_id) = arena.get(cur).parent {
+        if let ArenaKind::Object(pairs) = &arena.get(parent_id).kind
+            && let Some((kid, _)) = pairs.iter().find(|(_, vid)| *vid == Some(cur))
+            && let ArenaKind::String(ks) = &arena.get(*kid).kind
+        {
+            keys.push(ks.value.as_str());
+        }
+        cur = parent_id;
+    }
+    keys
+}
+
+/// Completion-only registry heuristic for string values inside schemaless modded objects.
+/// Never used for diagnostics, so non-standard modded keys can't produce false warnings.
+fn infer_untyped_value_type(arena: &JsonArena, target_id: JsonId) -> Option<McdocType> {
+    let parent_id = arena.get(target_id).parent?;
+    match &arena.get(parent_id).kind {
+        ArenaKind::Object(pairs) => {
+            let (kid, _) = pairs.iter().find(|(_, vid)| *vid == Some(target_id))?;
+            let ArenaKind::String(ks) = &arena.get(*kid).kind else { return None };
+            let key = ks.value.to_ascii_lowercase();
+            let ancestors: Vec<String> = ancestor_keys(arena, parent_id).into_iter().map(|s| s.to_ascii_lowercase()).collect();
+            let has_ancestor_substr = |needle: &str| ancestors.iter().any(|k| k.contains(needle));
+            let has_sibling = |name: &str| {
+                pairs.iter().any(|(other_kid, _)| {
+                    *other_kid != *kid
+                        && matches!(&arena.get(*other_kid).kind, ArenaKind::String(s) if s.value.eq_ignore_ascii_case(name))
+                })
+            };
+
+            match key.as_str() {
+                "item" | "item_id" => Some(McdocType::id_string("item", None)),
+                "items" => Some(McdocType::id_string("item", Some("allowed"))),
+                "fluid" | "fluid_id" => Some(McdocType::id_string("fluid", None)),
+                "fluidtag" | "fluid_tag" => Some(McdocType::id_string("fluid", Some("implicit"))),
+                "block" | "block_id" => Some(McdocType::id_string("block", None)),
+                "blocktag" | "block_tag" => Some(McdocType::id_string("block", Some("implicit"))),
+                "entity" | "entity_type" | "entitytype" => Some(McdocType::id_string("entity_type", None)),
+                "effect" | "mob_effect" => Some(McdocType::id_string("mob_effect", None)),
+                "potion" => Some(McdocType::id_string("potion", None)),
+                "enchantment" => Some(McdocType::id_string("enchantment", None)),
+                "biome" => Some(McdocType::id_string("worldgen/biome", None)),
+                "dimension" => Some(McdocType::id_string("dimension", None)),
+                "sound" | "sound_event" => Some(McdocType::id_string("sound_event", None)),
+                "loot_table" => Some(McdocType::id_string("loot_table", None)),
+                "tag" => {
+                    let reg = if has_ancestor_substr("fluid") {
+                        "fluid"
+                    } else if has_ancestor_substr("block") {
+                        "block"
+                    } else if has_ancestor_substr("entity") {
+                        "entity_type"
+                    } else if has_ancestor_substr("biome") {
+                        "worldgen/biome"
+                    } else {
+                        "item"
+                    };
+                    Some(McdocType::id_string(reg, Some("implicit")))
+                }
+                "id" => {
+                    if has_ancestor_substr("fluid") {
+                        return Some(McdocType::id_string("fluid", None));
+                    }
+                    if has_ancestor_substr("block") {
+                        return Some(McdocType::id_string("block", None));
+                    }
+                    if has_ancestor_substr("entity") {
+                        return Some(McdocType::id_string("entity_type", None));
+                    }
+                    if has_ancestor_substr("effect") {
+                        return Some(McdocType::id_string("mob_effect", None));
+                    }
+                    let item_container = ancestors.iter().any(|k| {
+                        matches!(
+                            k.as_str(),
+                            "result"
+                                | "results"
+                                | "output"
+                                | "outputs"
+                                | "ingredient"
+                                | "ingredients"
+                                | "input"
+                                | "inputs"
+                                | "item"
+                                | "items"
+                                | "item_inputs"
+                                | "item_outputs"
+                                | "stack"
+                                | "stacks"
+                                | "base"
+                                | "addition"
+                                | "template"
+                                | "catalyst"
+                                | "reagent"
+                                | "override"
+                                | "overrides"
+                                | "byproduct"
+                                | "byproducts"
+                                | "extra"
+                                | "extras"
+                                | "drop"
+                                | "drops"
+                                | "reward"
+                                | "rewards"
+                                | "icon"
+                                | "transitional_item"
+                                | "transitionalitem"
+                                | "tool"
+                                | "tools"
+                                | "fuel"
+                                | "fuels"
+                                | "container"
+                        )
+                    });
+                    let item_sibling = has_sibling("count") || has_sibling("components") || has_sibling("nbt") || has_sibling("chance");
+                    (item_container || item_sibling).then(|| McdocType::id_string("item", None))
+                }
+                "ingredient" | "input" | "base" | "addition" | "template" | "catalyst" | "reagent" => {
+                    Some(McdocType::id_string("item", Some("allowed")))
+                }
+                "result" | "output" => Some(McdocType::id_string("item", None)),
+                "fluid_input" | "fluid_ingredient" => Some(McdocType::id_string("fluid", Some("allowed"))),
+                "fluid_output" | "fluid_result" => Some(McdocType::id_string("fluid", None)),
+                _ => None,
+            }
+        }
+        ArenaKind::Array(_) => {
+            let grand_id = arena.get(parent_id).parent?;
+            let ArenaKind::Object(pairs) = &arena.get(grand_id).kind else { return None };
+            let (kid, _) = pairs.iter().find(|(_, vid)| *vid == Some(parent_id))?;
+            let ArenaKind::String(ks) = &arena.get(*kid).kind else { return None };
+            match ks.value.to_ascii_lowercase().as_str() {
+                "ingredients" | "inputs" | "items" | "item_inputs" => Some(McdocType::id_string("item", Some("allowed"))),
+                "results" | "outputs" | "item_outputs" => Some(McdocType::id_string("item", None)),
+                "fluids" | "fluid_inputs" | "fluid_outputs" => Some(McdocType::id_string("fluid", Some("allowed"))),
+                "blocks" => Some(McdocType::id_string("block", Some("allowed"))),
+                "entities" | "entity_types" => Some(McdocType::id_string("entity_type", Some("allowed"))),
+                "biomes" => Some(McdocType::id_string("worldgen/biome", Some("allowed"))),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 // The key you're still typing is already in the document, and the checker narrows unions by it: a
@@ -282,11 +458,19 @@ fn complete_bare_value(
             if !matches!(node.kind, ArenaKind::String(_)) || node.parent.is_some_and(|p| is_object_key(&probe_check.arena, p, id)) {
                 return None;
             }
-            let info = probe_check.attached.get(&id)?;
-            let criteria = super::checker::defined_criteria(&probe_check);
-            let texture_slots = super::checker::defined_texture_slots(&probe_check, env);
-            let doc_symbols = DocSymbols { criteria: &criteria, texture_slots: &texture_slots };
-            Some(complete_values(&info.type_def, env, typed, false, true, doc_symbols))
+            let attached = probe_check.attached.get(&id);
+            if let Some(info) = attached.filter(|i| !matches!(i.type_def, McdocType::Any { .. })) {
+                let criteria = super::checker::defined_criteria(&probe_check);
+                let texture_slots = super::checker::defined_texture_slots(&probe_check, env);
+                let doc_symbols = DocSymbols { criteria: &criteria, texture_slots: &texture_slots };
+                return Some(complete_values(&info.type_def, env, typed, false, true, doc_symbols));
+            }
+            if in_untyped_subtree(&probe_check, id)
+                && let Some(inferred) = infer_untyped_value_type(&probe_check.arena, id)
+            {
+                return Some(complete_values(&inferred, env, typed, false, true, DocSymbols::default()));
+            }
+            None
         })
         .unwrap_or_default();
     if trailing_comma {
@@ -2235,5 +2419,141 @@ dispatch minecraft:recipe_serializer["minecraft:crafting_shapeless"] to struct S
         let esc_check = check_json_with_type(json_parser::parse(esc_src, false).root.as_ref().unwrap(), &wrap_root, &env);
         let esc_comp = complete(esc_src, esc_src.find("go").unwrap() + 2, &esc_check, &env, &opts_wrap);
         assert_eq!(esc_comp.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["gold"]);
+    }
+
+    #[test]
+    fn completes_registry_fields_in_schemaless_and_create_recipes() {
+        let mut tables = SymbolTables::default();
+        parse_and_bind(
+            r#"
+            dispatch minecraft:resource["recipe"] to struct Recipe {
+                type: #[id="recipe_serializer"] string,
+                ...minecraft:recipe_serializer[[type]],
+            }
+            dispatch minecraft:recipe_serializer["minecraft:crafting_shaped"] to struct Shaped {
+                pattern: [string],
+            }
+            "#,
+            "::java::data::recipe",
+            &mut tables,
+        )
+        .unwrap();
+        parse_and_bind(
+            r#"
+            type ItemWithCount = struct {
+                #[until="1.21.1"] item: string,
+                #[since="1.21.1"] id: string,
+                count?: int @ 0..,
+            }
+            type ItemOrTag = (struct { item: string } | struct { tag: string })
+            type MixingResult = struct { id: string, count?: int, amount?: int }
+            dispatch create:recipes[create:haunting] to struct {
+                ingredients: [ItemOrTag] @ 1,
+                results: [ItemWithCount] @ 1..,
+            }
+            dispatch create:recipes[create:mixing] to struct {
+                ingredients: [ItemOrTag] @ 1..,
+                results: [MixingResult] @ 1,
+            }
+            "#,
+            "::partner::create",
+            &mut tables,
+        )
+        .unwrap();
+        crate::mcdoc::fetch::bridge_partner_dispatchers(&mut tables, &[]);
+
+        let mut regs = RegistryIndex::default();
+        regs.insert_entries("recipe_serializer", [
+            "minecraft:crafting_shaped".into(),
+            "ad_astra:compressing".into(),
+            "ad_astra:alloying".into(),
+            "alloy_forgery:forging".into(),
+            "modern_industrialization:assembler".into(),
+            "create:haunting".into(),
+            "create:mixing".into(),
+        ]);
+        regs.insert_entries("item", [
+            "ad_astra:etrium_ingot".into(),
+            "ad_astra:etrium_plate".into(),
+            "ad_astra:ice_shard".into(),
+            "ad_astra:calorite_block".into(),
+            "minecraft:stone".into(),
+        ]);
+        regs.insert_entries("tag/item", ["ad_astra:desh_ingots".into(), "c:iron_ingots".into()]);
+        regs.insert_entries("fluid", ["minecraft:water".into(), "ad_astra:oil".into()]);
+        regs.insert_entries("tag/fluid", ["c:oil".into()]);
+        regs.insert_entries("block", ["minecraft:stone".into()]);
+        regs.finalize();
+
+        let run_ver = |mc: &str, src: &str, pos: usize| -> CompletionResult {
+            let version = VersionContext { minecraft: Some(mc.into()), neoforge: None };
+            let env = CheckEnv {
+                tables: &tables,
+                registries: &regs,
+                version: &version,
+                require_canonical: false,
+                allow_missing_keys: false,
+                primitives_read_as_strings: false,
+                ignored_loaders: &[],
+            };
+            let root_type = resource_root_type("recipe", &tables).unwrap();
+            let check = check_json_with_type(json_parser::parse(src, false).root.as_ref().unwrap(), &root_type, &env);
+            let recheck = |edited: &str| json_parser::parse(edited, false).root.map(|r| check_json_with_type(&r, &root_type, &env));
+            let opts = CompleteOptions { recheck: &recheck, ignored_loaders: &[] };
+            complete(src, pos, &check, &env, &opts)
+        };
+
+        // 1. Schemaless `ad_astra:compressing`: ingredient.item and result.id both complete items.
+        let comp_src = r#"{"type": "ad_astra:compressing", "ingredient": {"item": "ad_astra:et"}, "result": {"count": 1, "id": "ad_astra:et"}}"#;
+        let ing_pos = comp_src.find("ad_astra:et").unwrap() + "ad_astra:et".len();
+        let ing_res = run_ver("1.20.1", comp_src, ing_pos);
+        assert!(ing_res.slot_has_choices);
+        assert_eq!(ing_res.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["ad_astra:etrium_ingot", "ad_astra:etrium_plate"]);
+
+        let res_pos = comp_src.rfind("ad_astra:et").unwrap() + "ad_astra:et".len();
+        let out_res = run_ver("1.20.1", comp_src, res_pos);
+        assert!(out_res.slot_has_choices);
+        assert_eq!(out_res.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["ad_astra:etrium_ingot", "ad_astra:etrium_plate"]);
+
+        // Bare value position after colon inside schemaless recipe (`"item": |`).
+        let bare_src = r#"{"type": "ad_astra:compressing", "ingredient": {"item": }}"#;
+        let bare_res = run_ver("1.20.1", bare_src, bare_src.find("}}").unwrap());
+        assert!(bare_res.items.iter().any(|i| i.label == "ad_astra:etrium_ingot"));
+
+        // 2. Schemaless `ad_astra:alloying`: array ingredient with `tag` completes implicit item tags.
+        let alloy_src = r#"{"type": "ad_astra:alloying", "ingredients": [{"item": "ad_astra:ice"}, {"tag": "ad_astra:"}]}"#;
+        let tag_pos = alloy_src.rfind("ad_astra:").unwrap() + "ad_astra:".len();
+        let tag_res = run_ver("1.20.1", alloy_src, tag_pos);
+        assert_eq!(tag_res.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["ad_astra:desh_ingots"]);
+
+        // 3. Schemaless `alloy_forgery:forging`: nested `overrides["2+"].id` with sibling `count` completes items.
+        let forge_src = r#"{"type": "alloy_forgery:forging", "overrides": {"2+": {"id": "ad_astra:cal", "count": 4}}}"#;
+        let forge_res = run_ver("1.20.1", forge_src, forge_src.find("ad_astra:cal").unwrap() + "ad_astra:cal".len());
+        assert_eq!(forge_res.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["ad_astra:calorite_block"]);
+
+        // 4. Schemaless `modern_industrialization:assembler`: `amount` on item_inputs stays item; fluid_inputs uses fluid / fluid tag.
+        let mi_src = r#"{"type": "modern_industrialization:assembler", "item_inputs": [{"amount": 2, "item": "minecraft:"}], "fluid_inputs": [{"amount": 100, "fluid": "ad_astra:", "tag": "c:"}]}"#;
+        let mi_item = run_ver("1.20.1", mi_src, mi_src.find("minecraft:").unwrap() + "minecraft:".len());
+        assert_eq!(mi_item.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["minecraft:stone"]);
+        let mi_fluid = run_ver("1.20.1", mi_src, mi_src.find("ad_astra:").unwrap() + "ad_astra:".len());
+        assert_eq!(mi_fluid.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["ad_astra:oil"]);
+        let mi_ftag = run_ver("1.20.1", mi_src, mi_src.find("c:").unwrap() + "c:".len());
+        assert_eq!(mi_ftag.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["c:oil"]);
+
+        // 5. Strict vanilla serializer does NOT trigger the untyped heuristic on an unknown key.
+        let strict_src = r#"{"type": "minecraft:crafting_shaped", "block": "minecraft:"}"#;
+        let strict_res = run_ver("1.20.1", strict_src, strict_src.find("minecraft:\"").unwrap() + "minecraft:".len());
+        assert!(strict_res.items.is_empty(), "strict schema should not run untyped fallback: {:?}", strict_res.items);
+
+        // 6. Create partner schema now autocompletes items, tags, and MixingResult (items + fluids).
+        let create_120 = r#"{"type": "create:haunting", "ingredients": [{"tag": "c:"}], "results": [{"item": "ad_astra:ice"}]}"#;
+        let c_tag = run_ver("1.20.1", create_120, create_120.find("c:").unwrap() + 2);
+        assert_eq!(c_tag.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["c:iron_ingots"]);
+        let c_item = run_ver("1.20.1", create_120, create_120.find("ad_astra:ice").unwrap() + "ad_astra:ice".len());
+        assert_eq!(c_item.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["ad_astra:ice_shard"]);
+
+        let create_121 = r#"{"type": "create:mixing", "ingredients": [{"item": "minecraft:"}], "results": [{"id": "ad_astra:o", "amount": 250}]}"#;
+        let c_mix = run_ver("1.21.1", create_121, create_121.find("ad_astra:o").unwrap() + "ad_astra:o".len());
+        assert_eq!(c_mix.items.iter().map(|i| i.label.as_str()).collect::<Vec<_>>(), ["ad_astra:oil"]);
     }
 }

@@ -425,6 +425,8 @@ pub fn bridge_partner_dispatchers(tables: &mut SymbolTables, extra_bridges: &[St
         }
     }
 
+    annotate_partner_id_fields(tables);
+
     // Allow Forge/NeoForge and Fabric (`{ "fabric:type": ... }`) custom ingredients inside vanilla and Create recipes.
     let version_attr = |name: &str, version: &str| super::types::Attribute {
         name: name.into(),
@@ -507,6 +509,78 @@ pub fn bridge_partner_dispatchers(tables: &mut SymbolTables, extra_bridges: &[St
                 attributes: Vec::new(),
             };
         }
+    }
+}
+
+/// Adds missing `#[id]` attributes to misode partner schemas that declare registry ID fields as
+/// bare `string` (notably `create.mcdoc` and one condition in `lychee.mcdoc`). Only touches fields
+/// that are still plain strings without an `id` attribute, so upstream fixes pass through cleanly.
+/// Pending a PR and merge. //TODO: pr for these
+fn annotate_partner_id_fields(tables: &mut SymbolTables) {
+    use super::types::{McdocType, StructField, StructKey};
+
+    fn annotate_field(ty: &mut McdocType, field_name: &str, replacement: &dyn Fn() -> McdocType) {
+        match ty {
+            McdocType::Struct { fields, .. } => {
+                for field in fields {
+                    if let StructField::Pair { key: StructKey::Literal(k), field_type, .. } = field
+                        && k == field_name
+                        && matches!(field_type, McdocType::String { attributes, .. } if !attributes.iter().any(|a| a.name == "id"))
+                    {
+                        *field_type = replacement();
+                    }
+                }
+            }
+            McdocType::Union { members, .. } => {
+                for member in members {
+                    annotate_field(member, field_name, replacement);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let item_id = || McdocType::id_string("item", None);
+    let item_tag = || McdocType::id_string("item", Some("implicit"));
+    let fluid_id = || McdocType::id_string("fluid", None);
+    let fluid_tag = || McdocType::id_string("fluid", Some("implicit"));
+    let potion_id = || McdocType::id_string("potion", None);
+    let item_or_fluid_id = || McdocType::Union {
+        members: vec![McdocType::id_string("item", None), McdocType::id_string("fluid", None)],
+        attributes: Vec::new(),
+    };
+
+    for sym in ["::partner::create::Item", "::partner::create::ItemWithCount", "::partner::create::SimpleItem"] {
+        if let Some(ty) = tables.mcdoc.get_mut(sym) {
+            annotate_field(ty, "item", &item_id);
+            annotate_field(ty, "id", &item_id);
+        }
+    }
+    for sym in ["::partner::create::ItemOrTag", "::partner::create::ItemOrTagWithCount"] {
+        if let Some(ty) = tables.mcdoc.get_mut(sym) {
+            annotate_field(ty, "item", &item_id);
+            annotate_field(ty, "tag", &item_tag);
+        }
+    }
+    if let Some(ty) = tables.mcdoc.get_mut("::partner::create::Fluid") {
+        annotate_field(ty, "fluid", &fluid_id);
+        annotate_field(ty, "id", &fluid_id);
+    }
+    if let Some(ty) = tables.mcdoc.get_mut("::partner::create::FluidOrTag") {
+        annotate_field(ty, "fluid", &fluid_id);
+        annotate_field(ty, "fluidTag", &fluid_tag);
+        annotate_field(ty, "fluid_tag", &fluid_tag);
+    }
+    if let Some(ty) = tables.mcdoc.get_mut("::partner::create::MixingResult") {
+        annotate_field(ty, "id", &item_or_fluid_id);
+    }
+    if let Some(ty) = tables.mcdoc.get_mut("::partner::create::NBT") {
+        annotate_field(ty, "Potion", &potion_id);
+    }
+    if let Some(conditions) = tables.dispatchers.get_mut("lychee:conditions")
+        && let Some(ty) = conditions.get_mut("is_off_item_cooldown")
+    {
+        annotate_field(ty, "item", &item_id);
     }
 }
 
@@ -1074,6 +1148,87 @@ mod tests {
         assert!(patched.contains("\tstep: CarveStep,"), "add_carvers keeps its required single step");
         assert!(patched.contains("\t#[until=\"1.21.2\"]\n\tsteps?: (CarveStep | [CarveStep]),"));
         assert_eq!(patch_partner_mcdoc("create", src.into()), src);
+    }
+
+    #[test]
+    fn annotates_create_and_lychee_partner_id_fields() {
+        let mut tables = SymbolTables::default();
+        super::super::parser::parse_and_bind(
+            r#"
+            struct NBT { Bottle?: string, Potion?: string }
+            type Item = struct { #[until="1.21.1"] item: string, #[since="1.21.1"] id: string }
+            type ItemOrTag = (struct { item: string } | struct { tag: string })
+            type Fluid = struct { #[until="1.21.1"] fluid: string, #[since="1.21.1"] id: string, amount: int }
+            type FluidOrTag = (struct { fluid: string } | struct { #[until="1.21.1"] fluidTag: string, #[since="1.21.1"] fluid_tag: string })
+            type MixingResult = struct { id: string, count?: int, amount?: int }
+            "#,
+            "::partner::create",
+            &mut tables,
+        )
+        .unwrap();
+        super::super::parser::parse_and_bind(
+            r#"dispatch lychee:conditions[is_off_item_cooldown] to struct { item: string }"#,
+            "::partner::lychee",
+            &mut tables,
+        )
+        .unwrap();
+
+        bridge_partner_dispatchers(&mut tables, &[]);
+
+        let field_type_of = |ty: &super::super::types::McdocType, name: &str| -> Option<super::super::types::McdocType> {
+            fn find(ty: &super::super::types::McdocType, name: &str) -> Option<super::super::types::McdocType> {
+                match ty {
+                    super::super::types::McdocType::Struct { fields, .. } => fields.iter().find_map(|f| match f {
+                        super::super::types::StructField::Pair { key: super::super::types::StructKey::Literal(k), field_type, .. } if k == name => {
+                            Some(field_type.clone())
+                        }
+                        _ => None,
+                    }),
+                    super::super::types::McdocType::Union { members, .. } => members.iter().find_map(|m| find(m, name)),
+                    _ => None,
+                }
+            }
+            find(ty, name)
+        };
+
+        let check_id = |ty: &super::super::types::McdocType, expected_reg: &str, expected_tags: Option<super::super::version::TagMode>| {
+            let attr = ty.attributes().iter().find(|a| a.name == "id").expect("expected #[id]");
+            let cfg = super::super::version::parse_id_attribute(attr).unwrap();
+            assert_eq!(cfg.registry.as_deref(), Some(expected_reg));
+            assert_eq!(cfg.tags, expected_tags);
+        };
+
+        let item = &tables.mcdoc["::partner::create::Item"];
+        check_id(&field_type_of(item, "item").unwrap(), "item", None);
+        check_id(&field_type_of(item, "id").unwrap(), "item", None);
+
+        let iot = &tables.mcdoc["::partner::create::ItemOrTag"];
+        check_id(&field_type_of(iot, "item").unwrap(), "item", None);
+        check_id(&field_type_of(iot, "tag").unwrap(), "item", Some(super::super::version::TagMode::Implicit));
+
+        let fluid = &tables.mcdoc["::partner::create::Fluid"];
+        check_id(&field_type_of(fluid, "fluid").unwrap(), "fluid", None);
+        check_id(&field_type_of(fluid, "id").unwrap(), "fluid", None);
+
+        let fot = &tables.mcdoc["::partner::create::FluidOrTag"];
+        check_id(&field_type_of(fot, "fluid").unwrap(), "fluid", None);
+        check_id(&field_type_of(fot, "fluidTag").unwrap(), "fluid", Some(super::super::version::TagMode::Implicit));
+        check_id(&field_type_of(fot, "fluid_tag").unwrap(), "fluid", Some(super::super::version::TagMode::Implicit));
+
+        let nbt = &tables.mcdoc["::partner::create::NBT"];
+        check_id(&field_type_of(nbt, "Potion").unwrap(), "potion", None);
+
+        let mixing = &tables.mcdoc["::partner::create::MixingResult"];
+        let mixing_id = field_type_of(mixing, "id").unwrap();
+        let super::super::types::McdocType::Union { members, .. } = mixing_id else {
+            panic!("expected union on MixingResult.id, got {mixing_id:?}");
+        };
+        assert_eq!(members.len(), 2);
+        check_id(&members[0], "item", None);
+        check_id(&members[1], "fluid", None);
+
+        let lychee_cond = &tables.dispatchers["lychee:conditions"]["is_off_item_cooldown"];
+        check_id(&field_type_of(lychee_cond, "item").unwrap(), "item", None);
     }
 
     #[test]

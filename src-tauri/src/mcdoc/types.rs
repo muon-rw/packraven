@@ -569,6 +569,38 @@ pub enum McdocType {
 }
 
 impl McdocType {
+    /// Builds a `#[id=...]` string type for programmatic schema patches and fallback completions.
+    pub fn id_string(registry: &str, tags: Option<&str>) -> Self {
+        let value = match tags {
+            Some(mode) => {
+                let mut values = BTreeMap::new();
+                values.insert(
+                    "registry".into(),
+                    AttributeValue::Type(McdocType::Literal {
+                        value: LiteralValue::String { value: registry.into() },
+                        attributes: Vec::new(),
+                    }),
+                );
+                values.insert(
+                    "tags".into(),
+                    AttributeValue::Type(McdocType::Literal {
+                        value: LiteralValue::String { value: mode.into() },
+                        attributes: Vec::new(),
+                    }),
+                );
+                AttributeValue::Tree(AttributeTree { kind: TreeTag, values })
+            }
+            None => AttributeValue::Type(McdocType::Literal {
+                value: LiteralValue::String { value: registry.into() },
+                attributes: Vec::new(),
+            }),
+        };
+        McdocType::String {
+            length_range: None,
+            attributes: vec![Attribute { name: "id".into(), value: Some(value) }],
+        }
+    }
+
     pub fn empty_union() -> Self {
         Self::Union { members: Vec::new(), attributes: Vec::new() }
     }

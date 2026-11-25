@@ -346,8 +346,10 @@
           ? `${packName} already overrides these ${what}, so we showed its copies.`
           : `Copied ${what} into ${packName}. Minecraft uses these files instead of ${whose}${copied.existing ? `, along with ${plural(copied.existing, 'file')} the pack already had` : ''}.`
       const note = turnOnNote ? `${copiedNote} ${turnOnNote}` : copiedNote
+      // close() clears request, which empties targets synchronously before ondone runs.
+      const firstIsDir = !!targets[0]?.isDir
       close()
-      ondone(copied.paths, !!targets[0]?.isDir, note)
+      ondone(copied.paths, firstIsDir, note)
     } catch (e) {
       error = errorText(e)
     } finally {

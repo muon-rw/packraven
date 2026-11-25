@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
 use futures_util::{stream, StreamExt};
@@ -69,9 +71,41 @@ impl AppState {
     }
 
     pub(crate) fn update_presence(&self) {
+        static PACK_ICONS: LazyLock<Mutex<HashMap<(PathBuf, u64, String), Option<String>>>> = LazyLock::new(Default::default);
+        static ICON_GENERATION: AtomicU64 = AtomicU64::new(0);
+
         let settings = self.settings();
-        let pack = settings.discord_shows_pack.then(|| Pack::open(&settings.instance_dir).ok()).flatten();
-        crate::presence::set_pack(pack.map(|pack| pack.name()));
+        crate::presence::set_settings(settings.discord_presence, settings.discord_shows_pack);
+        let Some(pack) = Pack::open(&settings.instance_dir).ok() else {
+            ICON_GENERATION.fetch_add(1, Ordering::SeqCst);
+            crate::presence::set_pack(None);
+            return;
+        };
+        let name = pack.name();
+        let local_icon = crate::instance::Instance::read(&pack.dir).ok().and_then(|instance| instance.thumbnail_url);
+        if local_icon.is_some() {
+            ICON_GENERATION.fetch_add(1, Ordering::SeqCst);
+            crate::presence::set_pack(Some(crate::presence::PackPresence { name, icon_url: local_icon }));
+            return;
+        }
+        let key = (pack.dir.clone(), pack.config.curseforge.project_id, pack.config.modrinth.project_id.trim().to_string());
+        if let Some(cached) = PACK_ICONS.lock().unwrap().get(&key).cloned() {
+            ICON_GENERATION.fetch_add(1, Ordering::SeqCst);
+            crate::presence::set_pack(Some(crate::presence::PackPresence { name, icon_url: cached }));
+            return;
+        }
+        crate::presence::set_pack(Some(crate::presence::PackPresence { name: name.clone(), icon_url: None }));
+        if !settings.discord_presence || !settings.discord_shows_pack || (!pack.config.targets_curseforge() && !pack.config.targets_modrinth()) {
+            return;
+        }
+        let generation = ICON_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+        tauri::async_runtime::spawn(async move {
+            let icon = crate::discord::pack_project(&pack).await.logo;
+            PACK_ICONS.lock().unwrap().insert(key, icon.clone());
+            if ICON_GENERATION.load(Ordering::SeqCst) == generation {
+                crate::presence::set_pack_icon(&name, icon);
+            }
+        });
     }
 
     pub(crate) fn data_dir(&self) -> PathBuf {
@@ -369,7 +403,9 @@ pub fn get_pack_config(state: State<'_, AppState>) -> CmdResult<PackConfig> {
 pub fn save_pack_config(state: State<'_, AppState>, config: PackConfig) -> CmdResult<()> {
     let mut pack = state.pack().map_err(err)?;
     pack.config = config;
-    pack.save_config().map_err(err)
+    pack.save_config().map_err(err)?;
+    state.update_presence();
+    Ok(())
 }
 
 // Publish commits whatever is on disk after its uploads, so a version changed mid-publish would

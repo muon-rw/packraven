@@ -394,49 +394,50 @@
 
   let autoUpdateError: string | null = $state(null)
   let checkingUpdate = $state(false)
-
-  async function toggleAutoUpdate() {
-    if (!settings) return
-    const wanted = !settings.autoUpdate
-    settings.autoUpdate = wanted
-    savedField = 'auto-update'
-    saveState = 'saving'
-    try {
-      autoUpdateError = null
-      await api.setAutoUpdate(wanted)
-      if (savedSettings) savedSettings.autoUpdate = wanted
-      if (savedField === 'auto-update') {
-        saveTick += 1
-        saveState = 'saved'
-      }
-    } catch (error) {
-      settings.autoUpdate = !wanted
-      if (savedField === 'auto-update') saveState = 'failed'
-      autoUpdateError = `Couldn't change the update setting: ${errorText(error)}`
-    }
-  }
-
+  let discordPresenceError: string | null = $state(null)
   let discordShowsPackError: string | null = $state(null)
 
-  async function toggleDiscordShowsPack() {
+  function toggleSettingSwitch(
+    field: string,
+    key: 'autoUpdate' | 'discordPresence' | 'discordShowsPack',
+    save: (enabled: boolean) => Promise<void>,
+    setError: (message: string | null) => void,
+    errorPrefix: string,
+  ) {
     if (!settings) return
-    const wanted = !settings.discordShowsPack
-    settings.discordShowsPack = wanted
-    savedField = 'discord-shows-pack'
+    const wanted = !settings[key]
+    settings[key] = wanted
+    savedField = field
     saveState = 'saving'
-    try {
-      discordShowsPackError = null
-      await api.setDiscordShowsPack(wanted)
-      if (savedSettings) savedSettings.discordShowsPack = wanted
-      if (savedField === 'discord-shows-pack') {
-        saveTick += 1
-        saveState = 'saved'
-      }
-    } catch (error) {
-      settings.discordShowsPack = !wanted
-      if (savedField === 'discord-shows-pack') saveState = 'failed'
-      discordShowsPackError = `Couldn't change the Discord setting: ${errorText(error)}`
-    }
+    setError(null)
+    saving = trackSave(
+      saving.then(async () => {
+        try {
+          await save(wanted)
+          if (savedSettings) savedSettings[key] = wanted
+          if (savedField === field) {
+            saveTick += 1
+            saveState = 'saved'
+          }
+        } catch (error) {
+          if (settings) settings[key] = savedSettings ? savedSettings[key] : !wanted
+          if (savedField === field) saveState = 'failed'
+          setError(`${errorPrefix}: ${errorText(error)}`)
+        }
+      }),
+    )
+  }
+
+  function toggleAutoUpdate() {
+    toggleSettingSwitch('auto-update', 'autoUpdate', (enabled) => api.setAutoUpdate(enabled), (e) => (autoUpdateError = e), "Couldn't change the update setting")
+  }
+
+  function toggleDiscordPresence() {
+    toggleSettingSwitch('discord-presence', 'discordPresence', (enabled) => api.setDiscordPresence(enabled), (e) => (discordPresenceError = e), "Couldn't change the Discord setting")
+  }
+
+  function toggleDiscordShowsPack() {
+    toggleSettingSwitch('discord-shows-pack', 'discordShowsPack', (enabled) => api.setDiscordShowsPack(enabled), (e) => (discordShowsPackError = e), "Couldn't change the Discord setting")
   }
 
   async function checkForUpdate() {
@@ -630,50 +631,75 @@
   <div class="switch-row">
     <div>
       <div class="switch-label">
-        <span id="autostart-label">Start in the tray when I sign in to this computer</span>
+        <label for="autostart-switch" id="autostart-label">Start in the tray when I sign in to this computer</label>
         {@render badge('autostart')}
       </div>
       <p class="muted" id="autostart-hint">Keep packraven running so builds and test servers are a click away.</p>
-      {#if autostartError}<p class="failed" role="alert">{autostartError}</p>{/if}
+      {#if autostartError}<p class="failed" id="autostart-error" role="alert">{autostartError}</p>{/if}
     </div>
     <button
+      id="autostart-switch"
       type="button"
       role="switch"
       class="switch"
       aria-checked={autostart}
       aria-labelledby="autostart-label"
-      aria-describedby="autostart-hint"
+      aria-describedby={autostartError ? 'autostart-error autostart-hint' : 'autostart-hint'}
       onclick={toggleAutostart}
     ><span></span></button>
   </div>
 
-  <div class="switch-row">
-    <div>
-      <div class="switch-label">
-        <span id="discord-shows-pack-label">Show the pack I'm working on in my Discord status</span>
-        {@render badge('discord-shows-pack')}
+  <div class="switch-group" role="group" aria-labelledby="discord-presence-label">
+    <div class="switch-row">
+      <div>
+        <div class="switch-label">
+          <label for="discord-presence-switch" id="discord-presence-label">Show packraven in my Discord status</label>
+          {@render badge('discord-presence')}
+        </div>
+        <p class="muted" id="discord-presence-hint">Share what you're doing in packraven while the window is open.</p>
+        {#if discordPresenceError}<p class="failed" id="discord-presence-error" role="alert">{discordPresenceError}</p>{/if}
       </div>
-      <p class="muted" id="discord-shows-pack-hint">Turn this off to keep unannounced packs private. Discord still shows that you're using packraven.</p>
-      {#if discordShowsPackError}<p class="failed" role="alert">{discordShowsPackError}</p>{/if}
+      <button
+        id="discord-presence-switch"
+        type="button"
+        role="switch"
+        class="switch"
+        aria-checked={settings.discordPresence}
+        aria-labelledby="discord-presence-label"
+        aria-describedby={discordPresenceError ? 'discord-presence-error discord-presence-hint' : 'discord-presence-hint'}
+        onclick={toggleDiscordPresence}
+      ><span></span></button>
     </div>
-    <button
-      type="button"
-      role="switch"
-      class="switch"
-      aria-checked={settings.discordShowsPack}
-      aria-labelledby="discord-shows-pack-label"
-      aria-describedby="discord-shows-pack-hint"
-      onclick={toggleDiscordShowsPack}
-    ><span></span></button>
+
+    <div class="switch-row sub-switch" class:inactive={!settings.discordPresence}>
+      <div>
+        <div class="switch-label">
+          <label for="discord-shows-pack-switch" id="discord-shows-pack-label">Show the pack I'm working on</label>
+          {@render badge('discord-shows-pack')}
+        </div>
+        <p class="muted" id="discord-shows-pack-hint">Turn this off to keep unannounced packs private. Discord still shows that you're using packraven, without the pack's name, icon, or file and mod names.</p>
+        {#if discordShowsPackError}<p class="failed" id="discord-shows-pack-error" role="alert">{discordShowsPackError}</p>{/if}
+      </div>
+      <button
+        id="discord-shows-pack-switch"
+        type="button"
+        role="switch"
+        class="switch"
+        aria-checked={settings.discordShowsPack}
+        aria-labelledby="discord-shows-pack-label"
+        aria-describedby={discordShowsPackError ? 'discord-shows-pack-error discord-shows-pack-hint' : 'discord-shows-pack-hint'}
+        onclick={toggleDiscordShowsPack}
+      ><span></span></button>
+    </div>
   </div>
 
   <div class="switch-row" id="updates">
     <div class="updates">
       <div class="switch-label">
-        <span id="auto-update-label">Keep packraven up to date automatically</span>
+        <label for="auto-update-switch" id="auto-update-label">Keep packraven up to date automatically</label>
         {@render badge('auto-update')}
       </div>
-      {#if autoUpdateError}<p class="failed" role="alert">{autoUpdateError}</p>{/if}
+      {#if autoUpdateError}<p class="failed" id="auto-update-error" role="alert">{autoUpdateError}</p>{/if}
       {#if selfUpdate.view}
         {@const view = selfUpdate.view}
         {@const installFailed = view.status.phase === 'failed' && view.status.stage === 'install'}
@@ -704,11 +730,13 @@
       {/if}
     </div>
     <button
+      id="auto-update-switch"
       type="button"
       role="switch"
       class="switch"
       aria-checked={settings.autoUpdate}
       aria-labelledby="auto-update-label"
+      aria-describedby={autoUpdateError ? 'auto-update-error' : undefined}
       onclick={toggleAutoUpdate}
     ><span></span></button>
   </div>
@@ -1042,11 +1070,26 @@
     border-bottom: 1px solid var(--line);
   }
 
+  .switch-group {
+    display: grid;
+    gap: 14px;
+  }
+
   .switch-row {
     display: flex;
     justify-content: space-between;
-    align-items: center;
+    align-items: start;
     gap: 24px;
+  }
+
+  .sub-switch {
+    margin-left: 16px;
+    padding-left: 16px;
+    border-left: 2px solid var(--line-strong);
+  }
+
+  .sub-switch.inactive {
+    opacity: 0.72;
   }
 
   .switch-label {
@@ -1056,9 +1099,10 @@
     gap: 6px 10px;
   }
 
-  /* The status and buttons below the label would otherwise pull the switch down, away from it. */
-  #updates {
-    align-items: start;
+  .switch-label label {
+    color: var(--text);
+    font-size: var(--step-0);
+    cursor: pointer;
   }
 
   .updates {
@@ -1117,6 +1161,11 @@
   .switch[aria-checked='true'] {
     background: var(--forest);
     border-color: var(--forest);
+  }
+
+  .switch[aria-checked='true']:hover {
+    background: var(--forest-hi);
+    border-color: var(--forest-hi);
   }
 
   .switch[aria-checked='true'] span {

@@ -27,6 +27,7 @@
   import { StoredSplit, clamp } from '../lib/storedSplit.svelte'
   import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
+  import { presenceContext } from '../lib/presence.svelte'
 
   let { pack, onchange }: { pack: string | null; onchange: () => void } = $props()
 
@@ -609,6 +610,15 @@
     return () => (stale = true)
   })
   let gitJob = $derived(job('git'))
+
+  $effect(() => {
+    presenceContext.gitFile = selected?.path ?? null
+    presenceContext.gitConflicts = !!conflicts
+    return () => {
+      presenceContext.gitFile = null
+      presenceContext.gitConflicts = false
+    }
+  })
 </script>
 
 {#snippet changeRow(group: Group, row: ChangeRow)}

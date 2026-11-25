@@ -13,6 +13,7 @@
   import { browse, cancelChange, changeFor, flashCopyNote, modUpdates, point, projectKey, queuedButton } from '../lib/modUpdates.svelte'
   import { BACK_PRIORITY, useBack } from '../lib/back.svelte'
   import { paneFocus } from '../lib/panes.svelte'
+  import { presenceContext } from '../lib/presence.svelte'
   import { commandKey, isMac, shortcut } from '../lib/platform'
 
   let {
@@ -64,6 +65,13 @@
 
   let resultsRegion: HTMLElement | undefined = $state()
   let name = $derived(NAME[platform])
+
+  $effect(() => {
+    presenceContext.browseModName = reading ? (results.find((r) => r.key === reading)?.name ?? null) : null
+    return () => {
+      presenceContext.browseModName = null
+    }
+  })
 
   let latestSearch = 0
   let timer: ReturnType<typeof setTimeout> | undefined

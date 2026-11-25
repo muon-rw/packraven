@@ -272,8 +272,21 @@ pub fn set_auto_update(app: AppHandle, state: State<'_, AppState>, enabled: bool
 }
 
 #[tauri::command]
+pub fn set_discord_presence(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
+    state.update_settings(|s| s.discord_presence = enabled).map_err(|e| format!("{e:#}"))?;
+    state.update_presence();
+    Ok(())
+}
+
+#[tauri::command]
 pub fn set_discord_shows_pack(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
     state.update_settings(|s| s.discord_shows_pack = enabled).map_err(|e| format!("{e:#}"))?;
     state.update_presence();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_discord_activity(specific: Option<String>, generic: Option<String>) -> CmdResult<()> {
+    crate::presence::set_activity(crate::presence::ActivityDetail { specific, generic });
     Ok(())
 }

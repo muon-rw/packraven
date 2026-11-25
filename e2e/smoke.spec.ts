@@ -824,6 +824,7 @@ test('a file in a mod jar can be overridden in a new data pack after adding Paxi
   await expect(page.getByRole('status').filter({ hasText: 'Copied into Overrides.' })).toBeAttached()
   await expect(tree.locator('[data-path="config/paxi/datapacks/Overrides/data/example/recipe/fire_charge.json"]')).toHaveAttribute('aria-selected', 'true')
   await expect(page.getByRole('button', { name: /^Saved/ })).toBeVisible()
+  await expect(page.getByRole('navigation', { name: 'Pack' }).getByRole('button', { name: /^Mods/ })).not.toContainText('Updating')
 
   await tree.locator(`[data-path="${jar}/data/example/recipe/fire_charge.json"]`).click()
   await tree.locator(`[data-path="${jar}/data/example/recipe/stone_bricks.json"]`).click({ modifiers: ['Shift'] })
@@ -838,6 +839,21 @@ test('a file in a mod jar can be overridden in a new data pack after adding Paxi
   await expect(tree.locator('[data-path="config/paxi/datapacks/Overrides/data/example/recipe/fire_charge.json"]')).toHaveAttribute('aria-selected', 'true')
   await expect(tree.locator('[data-path="config/paxi/datapacks/Overrides/data/example/recipe/stone_bricks.json"]')).toHaveAttribute('aria-selected', 'true')
   await expect(tree).toContainText("Copied 2 files into Overrides. Minecraft uses these files instead of example-mod.jar's, along with 1 file the pack already had.")
+
+  // Overriding a folder expands and focuses it in the tree without trying to open it as a file.
+  const recipeDir = tree.locator(`[data-path="${jar}/data/example/recipe"]`)
+  await recipeDir.evaluate((el) => el.scrollIntoView({ block: 'center' }))
+  await recipeDir.click({ button: 'right' })
+  await page.getByRole('menuitem', { name: 'Override in a data pack…' }).click()
+  await dialog.getByRole('button', { name: 'Show the override' }).click()
+
+  await expect(dialog).toBeHidden()
+  const overriddenDir = tree.locator('[data-path="config/paxi/datapacks/Overrides/data/example/recipe"]')
+  await expect(overriddenDir).toHaveAttribute('aria-selected', 'true')
+  await expect(overriddenDir).toHaveAttribute('aria-expanded', 'true')
+  await expect(overriddenDir).toBeFocused()
+  await expect(page.getByRole('tab', { name: 'recipe', exact: true })).toHaveCount(0)
+  await expect(tree).toContainText('Overrides already overrides this folder, so we showed its copy.')
 })
 
 test('one override choice can cover every version of a file', async ({ page }) => {

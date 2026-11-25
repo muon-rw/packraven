@@ -18,6 +18,7 @@ pub struct Instance {
     pub loader: Option<Loader>,
     /// The launcher's name for the loader's version profile, which launching reads.
     pub version_id: Option<String>,
+    pub thumbnail_url: Option<String>,
     pub addon_count: usize,
     /// Names of the files the launcher installed, including their disabled forms.
     pub installed_names: HashSet<String>,
@@ -35,8 +36,15 @@ struct RawInstance {
     name: Option<String>,
     game_version: Option<String>,
     base_mod_loader: Option<RawModLoader>,
+    installed_modpack: Option<RawInstalledModpack>,
     #[serde(default)]
     installed_addons: Vec<RawAddon>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawInstalledModpack {
+    thumbnail_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -139,16 +147,46 @@ impl Instance {
             .and_then(|l| l.version_json.as_deref())
             .and_then(|json| serde_json::from_str::<RawProfile>(json).ok())
             .and_then(|profile| profile.id);
+        let thumbnail_url = raw
+            .installed_modpack
+            .and_then(|modpack| modpack.thumbnail_url)
+            .map(|u| u.trim().to_string())
+            .filter(|u| u.starts_with("https://") || u.starts_with("http://"));
         let parsed = Self {
             name: raw.name,
             minecraft: raw.game_version,
             loader: loader_name.and_then(Loader::from_curseforge),
             version_id: profile_id.or(loader_name.map(String::from)),
+            thumbnail_url,
             addon_count: raw.installed_addons.len(),
             installed_names,
             sources_by_sha1,
         };
         cache.lock().unwrap().insert(path, CachedInstance { stamp, instance: parsed.clone() });
         Ok(parsed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_installed_modpack_thumbnail_url() {
+        let dir = std::env::temp_dir().join(format!("packraven-instance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = serde_json::json!({
+            "name": "Demo Pack",
+            "gameVersion": "1.21.1",
+            "installedModpack": {
+                "thumbnailUrl": "https://media.forgecdn.net/avatars/thumbnails/1/2/256/256/pack.png"
+            },
+            "installedAddons": []
+        });
+        std::fs::write(dir.join(CURSEFORGE_INSTANCE), raw.to_string()).unwrap();
+        let instance = Instance::read(&dir).unwrap();
+        assert_eq!(instance.thumbnail_url.as_deref(), Some("https://media.forgecdn.net/avatars/thumbnails/1/2/256/256/pack.png"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

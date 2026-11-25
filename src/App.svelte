@@ -49,6 +49,7 @@
   import type { MenuItem } from './lib/menu'
   import { clamp } from './lib/storedSplit.svelte'
   import { canGoBack, canGoForward, closePane, focusedView, goBack, goForward, isSplit, layout, only, openBeside, paneSplit, placeInPane, recordHistory, resetHistory, show, showFrom, splitCompanion, swapPanes, titles, toggleSplit, views, type View } from './lib/panes.svelte'
+  import { cancelPendingPresence, describePresence, syncPresence } from './lib/presence.svelte'
 
   type Tone = 'ok' | 'warn' | 'bad' | 'busy' | 'idle'
   type NavItem = { id: View; title: string; key?: string; alias?: string; status?: string; tone?: Tone; count?: number; countText?: string }
@@ -208,6 +209,7 @@
     document.addEventListener('visibilitychange', returned)
     resync()
     return () => {
+      cancelPendingPresence()
       stopSelfUpdates()
       clearInterval(timer)
       if (pending) clearTimeout(pending)
@@ -221,6 +223,10 @@
   $effect(() => {
     for (const name in jobs) void jobs[name].phase
     refresh()
+  })
+
+  $effect(() => {
+    syncPresence(describePresence(overview))
   })
 
   function killWarning(server: boolean, clients: number) {

@@ -929,7 +929,9 @@ function mockMemoryWarning(server: boolean, clients: MockSlot[]) {
   return { available: 11.4 * GIB, needed: launches.reduce((sum, l) => sum + l.heap + GIB, 0), launches }
 }
 let autoUpdate = true
+let discordPresence = true
 let discordShowsPack = true
+let discordActivity: { specific: string | null; generic: string | null } = { specific: null, generic: null }
 let pickedImages = 0
 let pendingAnnouncementImages: string[] = []
 // The ready scenario's changelog is too long with its links, so Publish and Releases show the note about it.
@@ -1337,7 +1339,7 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
   minecraft_sign_out: ({ slot }) => {
     minecraftAccounts[slot as MockSlot] = null
   },
-  get_settings: () => ({ instanceDir: pack.dir, packs: [pack.dir], installDir: 'C:/curseforge/minecraft/Install', javaByMajor: { ...javaByMajor }, defenderExcluded: [], defenderDismissed: false, minecraftEulaAccepted: eulaAccepted, editorAskMb: 50, editorMaxMb: 100, gitName: '', gitEmail: '', autoUpdate, discordShowsPack, runArgs: appRunArgs }),
+  get_settings: () => ({ instanceDir: pack.dir, packs: [pack.dir], installDir: 'C:/curseforge/minecraft/Install', javaByMajor: { ...javaByMajor }, defenderExcluded: [], defenderDismissed: false, minecraftEulaAccepted: eulaAccepted, editorAskMb: 50, editorMaxMb: 100, gitName: '', gitEmail: '', autoUpdate, discordPresence, discordShowsPack, runArgs: appRunArgs }),
   save_settings: (a) => {
     const saved = a.settings as { runArgs: typeof appRunArgs; javaByMajor: Record<string, string> }
     appRunArgs = saved.runArgs
@@ -1361,8 +1363,15 @@ const handlers: Record<string, (args: Record<string, unknown>) => unknown> = {
       }, percent * 30)
     }
   },
+  set_discord_presence: ({ enabled }) => {
+    discordPresence = enabled as boolean
+  },
   set_discord_shows_pack: ({ enabled }) => {
     discordShowsPack = enabled as boolean
+  },
+  set_discord_activity: ({ specific, generic }) => {
+    discordActivity = { specific: (specific as string | null) ?? null, generic: (generic as string | null) ?? null }
+    void discordActivity
   },
   set_auto_update: ({ enabled }) => {
     autoUpdate = enabled as boolean
@@ -2123,6 +2132,7 @@ export function installMock() {
   const w = window as unknown as Record<string, unknown>
   w.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} }
   w.__mockEmit = emit
+  w.__mockDiscordActivity = () => discordActivity
   w.__TAURI_INTERNALS__ = {
     metadata: { currentWindow: { label: 'main' }, currentWebview: { windowLabel: 'main', label: 'main' } },
     transformCallback: (callback: (message: unknown) => void) => {

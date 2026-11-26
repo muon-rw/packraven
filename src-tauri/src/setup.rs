@@ -44,6 +44,15 @@ pub enum HooksState {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PackSummary {
+    pub dir: PathBuf,
+    pub name: String,
+    pub minecraft: Option<String>,
+    pub loader: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InstanceInfo {
     pub dir: PathBuf,
     pub name: String,
@@ -127,8 +136,18 @@ fn tracked_binaries(dir: &Path, instance: &Instance) -> Vec<TrackedBinary> {
         .collect()
 }
 
+pub fn summarize(dir: &Path) -> Result<PackSummary> {
+    let instance = Instance::read_shared(dir)?;
+    Ok(PackSummary {
+        dir: dir.to_path_buf(),
+        name: instance.name.clone().unwrap_or_else(|| dir.file_name().unwrap_or_default().to_string_lossy().into_owned()),
+        minecraft: instance.minecraft.clone(),
+        loader: instance.loader.as_ref().map(ToString::to_string),
+    })
+}
+
 pub fn inspect(dir: &Path, added: &[PathBuf]) -> Result<InstanceInfo> {
-    let instance = Instance::read(dir)?;
+    let instance = Instance::read_shared(dir)?;
     let has_git = dir.join(".git").exists();
     Ok(InstanceInfo {
         dir: dir.to_path_buf(),

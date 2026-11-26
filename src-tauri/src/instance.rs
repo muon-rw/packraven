@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -90,7 +90,7 @@ type FileStamp = (u64, Option<SystemTime>);
 
 struct CachedInstance {
     stamp: FileStamp,
-    instance: Instance,
+    instance: Arc<Instance>,
 }
 
 static INSTANCE_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedInstance>>> = OnceLock::new();
@@ -102,13 +102,17 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
 
 impl Instance {
     pub fn read(dir: &Path) -> Result<Self> {
+        Self::read_shared(dir).map(|instance| (*instance).clone())
+    }
+
+    pub fn read_shared(dir: &Path) -> Result<Arc<Self>> {
         let path = dir.join(CURSEFORGE_INSTANCE);
         let stamp = file_stamp(&path).with_context(|| format!("{} is not a CurseForge instance (no {CURSEFORGE_INSTANCE})", dir.display()))?;
         let cache = INSTANCE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         if let Some(entry) = cache.lock().unwrap().get(&path)
             && entry.stamp == stamp
         {
-            return Ok(entry.instance.clone());
+            return Ok(Arc::clone(&entry.instance));
         }
         let raw: RawInstance = std::fs::read_to_string(&path)
             .ok()
@@ -152,7 +156,7 @@ impl Instance {
             .and_then(|modpack| modpack.thumbnail_url)
             .map(|u| u.trim().to_string())
             .filter(|u| u.starts_with("https://") || u.starts_with("http://"));
-        let parsed = Self {
+        let parsed = Arc::new(Self {
             name: raw.name,
             minecraft: raw.game_version,
             loader: loader_name.and_then(Loader::from_curseforge),
@@ -161,8 +165,8 @@ impl Instance {
             addon_count: raw.installed_addons.len(),
             installed_names,
             sources_by_sha1,
-        };
-        cache.lock().unwrap().insert(path, CachedInstance { stamp, instance: parsed.clone() });
+        });
+        cache.lock().unwrap().insert(path, CachedInstance { stamp, instance: Arc::clone(&parsed) });
         Ok(parsed)
     }
 }

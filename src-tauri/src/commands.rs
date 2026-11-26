@@ -82,7 +82,7 @@ impl AppState {
             return;
         };
         let name = pack.name();
-        let local_icon = crate::instance::Instance::read(&pack.dir).ok().and_then(|instance| instance.thumbnail_url);
+        let local_icon = crate::instance::Instance::read_shared(&pack.dir).ok().and_then(|instance| instance.thumbnail_url.clone());
         if local_icon.is_some() {
             ICON_GENERATION.fetch_add(1, Ordering::SeqCst);
             crate::presence::set_pack(Some(crate::presence::PackPresence { name, icon_url: local_icon }));

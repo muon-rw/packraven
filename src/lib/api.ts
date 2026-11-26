@@ -545,9 +545,16 @@ export interface InstanceInfo {
   added: boolean
 }
 
+export interface PackSummary {
+  dir: string
+  name: string
+  minecraft: string | null
+  loader: string | null
+}
+
 export interface PackList {
   active: string | null
-  packs: InstanceInfo[]
+  packs: PackSummary[]
   instancesRoot: string
 }
 

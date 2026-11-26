@@ -9,7 +9,7 @@ use crate::join;
 use crate::pack::{DEFAULT_SERVER_README, SERVER_ICON, SERVER_README};
 use crate::server_icon;
 use crate::settings::RunArgs;
-use crate::setup::{self, InstanceInfo, SetupOptions};
+use crate::setup::{self, InstanceInfo, PackSummary, SetupOptions};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -21,27 +21,37 @@ fn err(error: anyhow::Error) -> String {
 #[serde(rename_all = "camelCase")]
 pub struct PackList {
     active: Option<PathBuf>,
-    packs: Vec<InstanceInfo>,
+    packs: Vec<PackSummary>,
     instances_root: PathBuf,
 }
 
 #[tauri::command]
-pub fn list_packs(state: State<'_, AppState>) -> PackList {
+pub async fn list_packs(state: State<'_, AppState>) -> CmdResult<PackList> {
     let settings = state.settings();
-    let packs = settings.packs.iter().filter_map(|dir| setup::inspect(dir, &settings.packs).ok()).collect();
-    let active = settings.packs.iter().find(|p| setup::same_dir(p, &settings.instance_dir)).cloned();
-    PackList { active, packs, instances_root: settings.instances_root() }
+    tauri::async_runtime::spawn_blocking(move || {
+        let packs = settings.packs.iter().filter_map(|dir| setup::summarize(dir).ok()).collect();
+        let active = settings.packs.iter().find(|p| setup::same_dir(p, &settings.instance_dir)).cloned();
+        PackList { active, packs, instances_root: settings.instances_root() }
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn discover_instances(state: State<'_, AppState>, root: Option<PathBuf>) -> Vec<InstanceInfo> {
+pub async fn discover_instances(state: State<'_, AppState>, root: Option<PathBuf>) -> CmdResult<Vec<InstanceInfo>> {
     let settings = state.settings();
-    setup::discover(&root.unwrap_or_else(|| settings.instances_root()), &settings.packs)
+    tauri::async_runtime::spawn_blocking(move || setup::discover(&root.unwrap_or_else(|| settings.instances_root()), &settings.packs))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-pub fn inspect_instance(state: State<'_, AppState>, dir: PathBuf) -> CmdResult<InstanceInfo> {
-    setup::inspect(&dir, &state.settings().packs).map_err(err)
+pub async fn inspect_instance(state: State<'_, AppState>, dir: PathBuf) -> CmdResult<InstanceInfo> {
+    let packs = state.settings().packs;
+    tauri::async_runtime::spawn_blocking(move || setup::inspect(&dir, &packs))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(err)
 }
 
 fn activate(app: &AppHandle, dir: &Path) -> anyhow::Result<()> {
